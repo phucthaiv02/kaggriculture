@@ -1,0 +1,32 @@
+[pipeline]
+expert_manifest = "data/raw/expert/manifest.json"
+dataset_dir = "data/shards"
+bc_checkpoint = "checkpoints/agent_h100.pt"
+bc_anchor = "checkpoints/agent_bc_anchor.pt"
+best_checkpoint = "checkpoints/agent_best.pt"
+league = "configs/opponent_league.json"
+awr_iterations = 2
+ppo_iterations = 10
+nproc_per_node = 1
+package_output = "submissions/dynamic_agent.tar.gz"
+
+[expert]
+top_teams = 10
+episodes_per_team = 200
+max_discovery_queries = 1000
+
+[awr]
+seeds = 500
+temperature = 0.8
+opponents = ["self", "starter"]
+
+[ppo]
+rollout_seeds = 250
+rollout_workers = 16
+rollout_temperature = 1.0
+margin_scale = 50000.0
+win_bonus = 0.25
+promotion_seeds = 50
+minimum_win_rate = 0.52
+minimum_mean_margin = 0.0
+minimum_p10_margin = -25000.0

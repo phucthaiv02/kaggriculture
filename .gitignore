@@ -216,3 +216,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Kaggriculture generated data and training artifacts
+data/raw/*
+data/shards/*
+!data/raw/.gitkeep
+!data/shards/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+runs/*
+!runs/.gitkeep
+replays/*
+!replays/.gitkeep
+submissions/*
+!submissions/.gitkeep
+
+*.pt
+*.safetensors
+*.tar.gz
+events.out.tfevents.*
