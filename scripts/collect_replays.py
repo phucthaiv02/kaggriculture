@@ -56,11 +56,12 @@ def load_environment_file(path: str | Path) -> bool:
 def authenticated_session(
     environment: Mapping[str, str] | None = None, request_interval: float = 0.0
 ) -> requests.Session:
-    """Build a Kaggle session exclusively from KAGGLE_API_TOKEN.
+    """Build a Kaggle session exclusively from environment variables.
 
-    The token may already exist in the process or have been loaded from a
-    dotenv file. This function deliberately never reads ~/.kaggle, ~/.config,
-    or any other credential source.
+    Bearer KAGGLE_API_TOKEN is preferred. The standard Kaggle
+    KAGGLE_USERNAME/KAGGLE_KEY pair is used as a fallback. Values may already
+    exist in the process or have been loaded from a dotenv file. This function
+    deliberately never reads ~/.kaggle, ~/.config, or another credential file.
     """
     environment = os.environ if environment is None else environment
     session = RateLimitedSession(request_interval=request_interval)
@@ -68,9 +69,15 @@ def authenticated_session(
     if token:
         session.headers["Authorization"] = f"Bearer {token}"
         return session
+    username = environment.get("KAGGLE_USERNAME", "").strip()
+    key = environment.get("KAGGLE_KEY", "").strip()
+    if username and key:
+        session.auth = (username, key)
+        return session
     raise RuntimeError(
-        "Kaggle credentials are missing. Set KAGGLE_API_TOKEN in .env or the process "
-        "environment. No other authentication source is used."
+        "Kaggle credentials are missing. Set KAGGLE_API_TOKEN, or set both "
+        "KAGGLE_USERNAME and KAGGLE_KEY in .env/process environment. "
+        "No home-directory credential source is used."
     )
 
 

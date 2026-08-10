@@ -40,6 +40,13 @@ cp .env.example .env
 # Sau đó sửa KAGGLE_API_TOKEN trong .env.
 ```
 
+Hoặc dùng credential chuẩn của Kaggle trong `.env`:
+
+```dotenv
+KAGGLE_USERNAME=your-username
+KAGGLE_KEY=your-api-key
+```
+
 `.env` đã nằm trong `.gitignore`. Biến được `export` trực tiếp luôn có ưu tiên
 cao hơn giá trị trong file. Dùng file khác với `--env-file /path/to/credentials.env`.
 

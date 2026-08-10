@@ -79,16 +79,17 @@ def test_authenticated_session_uses_bearer_environment_without_home(monkeypatch)
     assert session.auth is None
 
 
-def test_authenticated_session_ignores_legacy_environment_pair(monkeypatch) -> None:
+def test_authenticated_session_supports_username_key_environment_pair(monkeypatch) -> None:
     monkeypatch.setattr("pathlib.Path.home", lambda: (_ for _ in ()).throw(AssertionError("home")))
-    with pytest.raises(RuntimeError, match="KAGGLE_API_TOKEN"):
-        authenticated_session({"KAGGLE_USERNAME": "user", "KAGGLE_KEY": "key"})
+    session = authenticated_session({"KAGGLE_USERNAME": "user", "KAGGLE_KEY": "key"})
+    assert session.auth == ("user", "key")
+    assert "Authorization" not in session.headers
 
 
 def test_authenticated_session_rejects_missing_or_partial_environment() -> None:
     with pytest.raises(RuntimeError, match="KAGGLE_API_TOKEN"):
         authenticated_session({})
-    with pytest.raises(RuntimeError, match="KAGGLE_API_TOKEN"):
+    with pytest.raises(RuntimeError, match="KAGGLE_KEY"):
         authenticated_session({"KAGGLE_USERNAME": "user"})
 
 
