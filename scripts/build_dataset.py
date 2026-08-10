@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import random
+import sys
 import tomllib
 from collections import defaultdict
 from pathlib import Path
@@ -17,13 +18,17 @@ import torch
 from safetensors.torch import save_file
 from tqdm import tqdm
 
-from kaggriculture_agent.codec import (
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+
+from kaggriculture_agent.codec import (  # noqa: E402
     encode_action,
     encode_observation,
     legal_market_ops,
     legal_unit_op_matrix,
 )
-from kaggriculture_agent.constants import MAX_MARKET_ORDERS
+from kaggriculture_agent.constants import MAX_MARKET_ORDERS  # noqa: E402
 
 
 def episode_split(episode_id: int, validation_fraction: float, seed: int) -> str:

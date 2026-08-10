@@ -31,6 +31,11 @@ def main() -> None:
     parser.add_argument("--train-config", default="configs/awr_h100.toml")
     parser.add_argument("--shards", default="data/shards")
     parser.add_argument("--nproc-per-node", type=int, default=1)
+    parser.add_argument(
+        "--auto-hardware",
+        action="store_true",
+        help="Use train_auto.py to derive a safe AWR batch for the current machine.",
+    )
     args = parser.parse_args()
 
     if args.iteration < 1:
@@ -91,20 +96,34 @@ def main() -> None:
             args.shards,
         ]
     )
-    run(
-        [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            f"--nproc_per_node={args.nproc_per_node}",
-            "scripts/train_bc.py",
-            "--config",
-            args.train_config,
-            "--init",
-            str(checkpoint),
-        ]
-    )
+    if args.auto_hardware:
+        run(
+            [
+                sys.executable,
+                "scripts/train_auto.py",
+                "--base-config",
+                args.train_config,
+                "--init",
+                str(checkpoint),
+                "--output",
+                str(checkpoint),
+            ]
+        )
+    else:
+        run(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                f"--nproc_per_node={args.nproc_per_node}",
+                "scripts/train_bc.py",
+                "--config",
+                args.train_config,
+                "--init",
+                str(checkpoint),
+            ]
+        )
     print(f"Completed self-play iteration {args.iteration}: {merged_manifest}")
 
 

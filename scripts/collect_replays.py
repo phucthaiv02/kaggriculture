@@ -6,38 +6,76 @@ from __future__ import annotations
 import argparse
 import csv
 import heapq
+import io
 import json
+import os
 import time
-import tempfile
 import zipfile
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import requests
-from kaggle.api.kaggle_api_extended import KaggleApi
+from dotenv import load_dotenv
 
 
 EPISODES_URL = "https://www.kaggle.com/api/i/competitions.EpisodeService/ListEpisodes"
 REPLAY_URL = "https://www.kaggle.com/api/v1/competitions/episodes/{episode_id}/replay"
+LEADERBOARD_URL = "https://www.kaggle.com/api/v1/competitions/{competition}/leaderboard/download"
+SUBMISSIONS_URL = "https://www.kaggle.com/api/v1/competitions/submissions/list/{competition}"
 
 
-def authenticated_session() -> requests.Session:
-    session = requests.Session()
-    token_path = Path.home() / ".kaggle/access_token"
-    if token_path.exists():
-        session.headers["Authorization"] = f"Bearer {token_path.read_text(encoding='utf-8').strip()}"
+class RateLimitedSession(requests.Session):
+    """Requests session with a minimum start-to-start interval."""
+
+    def __init__(self, request_interval: float = 0.0) -> None:
+        super().__init__()
+        self.request_interval = max(0.0, float(request_interval))
+        self._last_request_started: float | None = None
+
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        now = time.monotonic()
+        if self._last_request_started is not None:
+            remaining = self.request_interval - (now - self._last_request_started)
+            if remaining > 0:
+                time.sleep(remaining)
+        self._last_request_started = time.monotonic()
+        return super().request(method, url, **kwargs)
+
+
+def load_environment_file(path: str | Path) -> bool:
+    """Load a dotenv file without replacing variables already in the process."""
+    dotenv_path = Path(path)
+    if not dotenv_path.is_file():
+        return False
+    load_dotenv(dotenv_path=dotenv_path, override=False)
+    return True
+
+
+def authenticated_session(
+    environment: Mapping[str, str] | None = None, request_interval: float = 0.0
+) -> requests.Session:
+    """Build a Kaggle session exclusively from KAGGLE_API_TOKEN.
+
+    The token may already exist in the process or have been loaded from a
+    dotenv file. This function deliberately never reads ~/.kaggle, ~/.config,
+    or any other credential source.
+    """
+    environment = os.environ if environment is None else environment
+    session = RateLimitedSession(request_interval=request_interval)
+    token = environment.get("KAGGLE_API_TOKEN", "").strip()
+    if token:
+        session.headers["Authorization"] = f"Bearer {token}"
         return session
-    for path in (Path.home() / ".config/kaggle/kaggle.json", Path.home() / ".kaggle/kaggle.json"):
-        if path.exists():
-            credentials = json.loads(path.read_text(encoding="utf-8"))
-            session.auth = (credentials["username"], credentials["key"])
-            return session
-    raise FileNotFoundError("Use `kaggle auth login` or create ~/.kaggle/access_token")
+    raise RuntimeError(
+        "Kaggle credentials are missing. Set KAGGLE_API_TOKEN in .env or the process "
+        "environment. No other authentication source is used."
+    )
 
 
 def request_with_retry(
-    session: requests.Session, method: str, url: str, *, attempts: int = 6, **kwargs: Any
+    session: requests.Session, method: str, url: str, *, attempts: int = 8, **kwargs: Any
 ) -> requests.Response:
     for attempt in range(attempts):
         response = session.request(method, url, timeout=60, **kwargs)
@@ -45,7 +83,17 @@ def request_with_retry(
             response.raise_for_status()
             return response
         if attempt + 1 < attempts:
-            time.sleep(min(30.0, 2.0**attempt))
+            retry_after = getattr(response, "headers", {}).get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after is not None else 2.0 ** (attempt + 1)
+            except ValueError:
+                delay = 2.0 ** (attempt + 1)
+            delay = min(120.0, max(1.0, delay))
+            print(
+                f"HTTP {response.status_code} for {url}; retry "
+                f"{attempt + 2}/{attempts} in {delay:.1f}s"
+            )
+            time.sleep(delay)
     response.raise_for_status()
     return response
 
@@ -61,14 +109,18 @@ def list_episodes(session: requests.Session, submission_id: int) -> list[dict[st
     return list(response.json().get("episodes", []))
 
 
-def top_teams(api: KaggleApi, competition: str, count: int) -> list[dict[str, Any]]:
-    with tempfile.TemporaryDirectory(prefix="kaggriculture-leaderboard-") as temporary:
-        api.competition_leaderboard_download(competition, temporary, quiet=True)
-        archive_path = Path(temporary) / f"{competition}.zip"
-        with zipfile.ZipFile(archive_path) as archive:
-            csv_name = next(name for name in archive.namelist() if name.endswith(".csv"))
-            with archive.open(csv_name) as raw:
-                rows = list(csv.DictReader(line.decode("utf-8-sig") for line in raw))
+def http_error_status(error: requests.HTTPError) -> int | None:
+    return error.response.status_code if error.response is not None else None
+
+
+def top_teams(session: requests.Session, competition: str, count: int) -> list[dict[str, Any]]:
+    response = request_with_retry(
+        session, "GET", LEADERBOARD_URL.format(competition=competition)
+    )
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        csv_name = next(name for name in archive.namelist() if name.endswith(".csv"))
+        with archive.open(csv_name) as raw:
+            rows = list(csv.DictReader(line.decode("utf-8-sig") for line in raw))
     return [
         {
             "rank": int(row["Rank"]),
@@ -78,6 +130,24 @@ def top_teams(api: KaggleApi, competition: str, count: int) -> list[dict[str, An
         }
         for row in rows[:count]
     ]
+
+
+def own_submission_ids(session: requests.Session, competition: str) -> list[int]:
+    response = request_with_retry(
+        session,
+        "GET",
+        SUBMISSIONS_URL.format(competition=competition),
+        params={"pageSize": 100},
+        headers={"Accept": "application/json"},
+    )
+    payload = response.json()
+    rows = payload.get("submissions", []) if isinstance(payload, dict) else payload
+    result = []
+    for row in rows or []:
+        reference = row.get("ref", row.get("id"))
+        if reference is not None:
+            result.append(int(reference))
+    return result
 
 
 def agent_index(agent: dict[str, Any], fallback: int) -> int:
@@ -99,7 +169,16 @@ def discover_submissions(
         _, submission_id = heapq.heappop(queue)
         if submission_id in episode_cache:
             continue
-        episodes = list_episodes(session, submission_id)
+        try:
+            episodes = list_episodes(session, submission_id)
+        except requests.HTTPError as error:
+            if http_error_status(error) == 429:
+                print(
+                    "Kaggle rate limit persisted after retries; stop discovery cleanly. "
+                    "Run the same command again to continue."
+                )
+                break
+            raise
         episode_cache[submission_id] = episodes
         for episode in episodes:
             for agent in episode.get("agents", []):
@@ -128,6 +207,7 @@ def replay_candidates(
     episode_cache: dict[int, list[dict[str, Any]]],
     per_team: int,
     preferred_submissions: set[int] | None = None,
+    max_submission_queries_per_team: int = 3,
 ) -> dict[int, dict[str, Any]]:
     preferred_submissions = preferred_submissions or set()
     selected: dict[int, dict[str, Any]] = {}
@@ -140,28 +220,49 @@ def replay_candidates(
             for episode in episodes
             if episode.get("id")
         }
-        for submission_id in team_submissions.get(team_id, set()):
-            if submission_id not in episode_cache:
-                episode_cache[submission_id] = list_episodes(session, submission_id)
-            episode_pool.update(
-                {
-                    int(episode["id"]): episode
-                    for episode in episode_cache[submission_id]
-                    if episode.get("id")
-                }
-            )
-        for episode in episode_pool.values():
-            matching = [
-                (agent_index(agent, index), int(agent.get("submissionId") or -1))
-                for index, agent in enumerate(episode.get("agents", []))
-                if int(agent.get("teamId") or -1) == team_id
-            ]
-            if matching and episode.get("state") == "COMPLETED":
-                candidates[int(episode["id"])] = {
-                    "episode": episode,
-                    "indices": [index for index, _ in matching],
-                    "submission_id": matching[0][1],
-                }
+        def add_team_candidates(episodes: Any) -> None:
+            for episode in episodes:
+                matching = [
+                    (agent_index(agent, index), int(agent.get("submissionId") or -1))
+                    for index, agent in enumerate(episode.get("agents", []))
+                    if int(agent.get("teamId") or -1) == team_id
+                ]
+                if matching and episode.get("state") == "COMPLETED":
+                    candidates[int(episode["id"])] = {
+                        "episode": episode,
+                        "indices": [index for index, _ in matching],
+                        "submission_id": matching[0][1],
+                    }
+
+        add_team_candidates(episode_pool.values())
+        # Discovery already gives us a cross-team episode pool. Only query a
+        # few uncached top-team submissions when that pool is insufficient;
+        # the old exhaustive loop could burst through hundreds of requests.
+        uncached = sorted(
+            (
+                submission_id
+                for submission_id in team_submissions.get(team_id, set())
+                if submission_id not in episode_cache
+            ),
+            reverse=True,
+        )
+        extra_queries = 0
+        for submission_id in uncached:
+            if len(candidates) >= per_team or extra_queries >= max_submission_queries_per_team:
+                break
+            extra_queries += 1
+            try:
+                episodes = list_episodes(session, submission_id)
+            except requests.HTTPError as error:
+                status = http_error_status(error)
+                if status in (401, 403, 404, 429):
+                    print(f"skip metadata submission={submission_id} status={status}")
+                    if status == 429:
+                        break
+                    continue
+                raise
+            episode_cache[submission_id] = episodes
+            add_team_candidates(episodes)
         ordered = sorted(
             candidates.values(),
             key=lambda row: (
@@ -209,7 +310,24 @@ def main() -> None:
     parser.add_argument("--max-discovery-queries", type=int, default=500)
     parser.add_argument("--submission-id", type=int, action="append", default=[])
     parser.add_argument("--output", default="data/raw/top")
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Dotenv file containing Kaggle credentials (default: .env). Existing env wins.",
+    )
     parser.add_argument("--request-delay", type=float, default=0.2)
+    parser.add_argument(
+        "--api-request-interval",
+        type=float,
+        default=1.0,
+        help="Minimum seconds between Kaggle API requests (default: 1.0).",
+    )
+    parser.add_argument(
+        "--max-submission-queries-per-team",
+        type=int,
+        default=3,
+        help="Bound extra metadata lookups after graph discovery (default: 3).",
+    )
     parser.add_argument(
         "--max-replay-attempts",
         type=int,
@@ -217,16 +335,16 @@ def main() -> None:
         help="Stop probing inaccessible replays after this many GETs (0 = automatic limit).",
     )
     args = parser.parse_args()
-    api = KaggleApi()
-    api.authenticate()
-    targets = top_teams(api, args.competition, args.top_teams)
+    if load_environment_file(args.env_file):
+        print(f"loaded environment from {Path(args.env_file).resolve()}")
+    session = authenticated_session(request_interval=args.api_request_interval)
+    targets = top_teams(session, args.competition, args.top_teams)
     roots = list(args.submission_id)
     if not roots:
-        roots = [int(submission.ref) for submission in api.competition_submissions(args.competition)]
+        roots = own_submission_ids(session, args.competition)
     if not roots:
         raise SystemExit("No root submissions. Pass at least one --submission-id.")
     print("targets:", ", ".join(f"#{row['rank']} {row['team_name']}" for row in targets))
-    session = authenticated_session()
     target_ids = {int(row["team_id"]) for row in targets}
     team_submissions, episode_cache = discover_submissions(
         session, roots, target_ids, args.max_discovery_queries
@@ -242,6 +360,7 @@ def main() -> None:
         episode_cache,
         args.episodes_per_team,
         preferred_submissions=set(roots),
+        max_submission_queries_per_team=args.max_submission_queries_per_team,
     )
     output = Path(args.output)
     replay_dir = output / "replays"
@@ -255,6 +374,7 @@ def main() -> None:
     )
     max_attempts = args.max_replay_attempts or max(200, args.top_teams * args.episodes_per_team * 20)
     attempts = 0
+    rate_limited = False
     for number, entry in enumerate(ordered_entries, start=1):
         needed_teams = [
             team_id
@@ -275,12 +395,20 @@ def main() -> None:
                     session, "GET", REPLAY_URL.format(episode_id=episode_id)
                 )
             except requests.HTTPError as error:
-                if error.response is not None and error.response.status_code in (401, 403, 404):
+                status = http_error_status(error)
+                if status in (401, 403, 404):
                     print(
                         f"skipped episode={episode_id} "
-                        f"status={error.response.status_code} (replay is not accessible to this account)"
+                        f"status={status} (replay is not accessible to this account)"
                     )
                     continue
+                if status == 429:
+                    print(
+                        "Kaggle rate limit persisted after retries; stop replay downloads cleanly. "
+                        "Downloaded files and manifest progress are retained."
+                    )
+                    rate_limited = True
+                    break
                 raise
             replay_path.write_bytes(response.content)
             time.sleep(max(0.0, args.request_delay))
@@ -312,9 +440,13 @@ def main() -> None:
     if incomplete:
         print(f"warning: replay quota incomplete for team IDs {incomplete} (Kaggle denied access)")
     if not entries:
+        if rate_limited:
+            raise SystemExit(
+                "No replay completed before the Kaggle rate limit. Wait and rerun the same command."
+            )
         raise SystemExit(
-            "No top replay is accessible. Authenticate with `kaggle auth login` or "
-            "~/.kaggle/access_token and verify that the competition exposes opponent replays."
+            "No top replay is accessible. Verify KAGGLE_API_TOKEN and that the competition "
+            "exposes opponent replays."
         )
 
 

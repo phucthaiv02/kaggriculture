@@ -32,13 +32,16 @@ Kiểm tra H100/BF16:
 python -c "import torch; print(torch.cuda.get_device_name()); print(torch.cuda.is_bf16_supported())"
 ```
 
-Đăng nhập Kaggle trước khi thu expert replay:
+Tạo `.env` tại thư mục gốc repo từ file mẫu. Collector tự đọc file này nhưng
+không đọc token hoặc `kaggle.json` từ home:
 
 ```bash
-kaggle auth login
+cp .env.example .env
+# Sau đó sửa KAGGLE_API_TOKEN trong .env.
 ```
 
-Hoặc đặt token tại `~/.kaggle/access_token`.
+`.env` đã nằm trong `.gitignore`. Biến được `export` trực tiếp luôn có ưu tiên
+cao hơn giá trị trong file. Dùng file khác với `--env-file /path/to/credentials.env`.
 
 ### 2. Chỉnh cấu hình
 
@@ -65,6 +68,12 @@ Từ thư mục gốc repo:
 
 ```bash
 python scripts/run_full_pipeline.py --config configs/pipeline.toml
+```
+
+Hoặc dùng wrapper ngắn gọn (mọi option `--skip-*` được chuyển tiếp):
+
+```bash
+./train_full.sh
 ```
 
 Lệnh trên tự động:
@@ -185,12 +194,39 @@ python scripts/build_dataset.py \
   --manifest data/raw/expert/manifest.json
 ```
 
+Collector mặc định giãn mọi Kaggle API request ít nhất 1 giây, tôn trọng
+`Retry-After` khi gặp HTTP 429 và chỉ query bổ sung tối đa 3 submissions/team
+sau discovery. Có thể giảm tải thêm bằng `--api-request-interval 2` hoặc chỉnh
+giới hạn bằng `--max-submission-queries-per-team`.
+
 ### BC
 
 ```bash
 torchrun --standalone --nproc_per_node=1 \
   scripts/train_bc.py --config configs/bc_h100.toml
 ```
+
+Trên máy local hoặc GPU khác H100, dùng launcher tự nhận diện VRAM/RAM và chọn
+batch size an toàn:
+
+```bash
+python scripts/train_auto.py
+```
+
+Xem cấu hình mà không bắt đầu train:
+
+```bash
+python scripts/train_auto.py --dry-run
+```
+
+Máy CPU yếu có thể dùng model debug nhỏ:
+
+```bash
+python scripts/train_auto.py --small --max-steps 100
+```
+
+Có thể override tự động bằng `--batch-size`, `--gradient-accumulation`,
+`--workers`, `--epochs`, `--resume` hoặc `--init`.
 
 ### Một vòng AWR
 

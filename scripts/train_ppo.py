@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 import tomllib
 from pathlib import Path
 
@@ -12,8 +13,16 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from kaggriculture_agent.model import DynamicPolicy, ModelConfig
-from kaggriculture_agent.ppo import PPORolloutDataset, model_targets, ppo_loss
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+
+from kaggriculture_agent.model import DynamicPolicy, ModelConfig  # noqa: E402
+from kaggriculture_agent.ppo import (  # noqa: E402
+    PPORolloutDataset,
+    model_targets,
+    ppo_loss,
+)
 
 
 def load_model(checkpoint_path: str | Path, device: torch.device) -> tuple[DynamicPolicy, dict]:
@@ -57,10 +66,21 @@ def main() -> None:
     parser.add_argument("--reference", required=True, help="Frozen BC checkpoint used as a KL anchor.")
     parser.add_argument("--rollouts", help="Override train.rollout_dir from config.")
     parser.add_argument("--output", help="Override train.output from config.")
+    parser.add_argument("--batch-size", type=int, help="Override train.batch_size.")
+    parser.add_argument("--workers", type=int, help="Override train.workers.")
+    parser.add_argument("--epochs", type=int, help="Override train.epochs.")
     args = parser.parse_args()
 
     with Path(args.config).open("rb") as config_file:
         config = tomllib.load(config_file)["train"]
+    if args.batch_size is not None:
+        config["batch_size"] = args.batch_size
+    if args.workers is not None:
+        config["workers"] = args.workers
+    if args.epochs is not None:
+        config["epochs"] = args.epochs
+    if int(config["batch_size"]) < 1 or int(config["workers"]) < 0 or int(config["epochs"]) < 1:
+        raise SystemExit("batch-size/epochs must be positive and workers cannot be negative")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     bf16 = bool(config.get("bf16", True) and device.type == "cuda")
     if device.type == "cuda":

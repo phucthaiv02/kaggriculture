@@ -9,12 +9,29 @@ import shutil
 import subprocess
 import sys
 import tomllib
+import os
 from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def run(command: list[str]) -> None:
     print("+", " ".join(command), flush=True)
-    subprocess.run(command, check=True)
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(ROOT / "src"), str(ROOT), environment.get("PYTHONPATH", ""))
+    ).rstrip(os.pathsep)
+    subprocess.run(command, cwd=ROOT, env=environment, check=True)
+
+
+def cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except ImportError:
+        return False
 
 
 def snapshot(source: str | Path, destination: str | Path) -> None:
@@ -57,6 +74,8 @@ def main() -> None:
     expert = config["expert"]
     awr = config["awr"]
     ppo = config["ppo"]
+    auto_hardware = bool(pipeline.get("auto_hardware", True))
+    has_cuda = cuda_available()
     manifest = Path(pipeline["expert_manifest"])
     checkpoint = Path(pipeline["bc_checkpoint"])
     anchor = Path(pipeline["bc_anchor"])
@@ -76,6 +95,12 @@ def main() -> None:
                 str(expert["episodes_per_team"]),
                 "--max-discovery-queries",
                 str(expert["max_discovery_queries"]),
+                "--env-file",
+                str(expert.get("env_file", ".env")),
+                "--api-request-interval",
+                str(expert.get("api_request_interval", 1.0)),
+                "--max-submission-queries-per-team",
+                str(expert.get("max_submission_queries_per_team", 3)),
                 "--output",
                 str(manifest.parent),
             ]
@@ -96,18 +121,30 @@ def main() -> None:
                 str(pipeline["dataset_dir"]),
             ]
         )
-        run(
-            [
-                python,
-                "-m",
-                "torch.distributed.run",
-                "--standalone",
-                f"--nproc_per_node={pipeline['nproc_per_node']}",
-                "scripts/train_bc.py",
-                "--config",
-                "configs/bc_h100.toml",
-            ]
-        )
+        if auto_hardware and int(pipeline["nproc_per_node"]) == 1:
+            run(
+                [
+                    python,
+                    "scripts/train_auto.py",
+                    "--base-config",
+                    "configs/bc_h100.toml",
+                    "--output",
+                    str(checkpoint),
+                ]
+            )
+        else:
+            run(
+                [
+                    python,
+                    "-m",
+                    "torch.distributed.run",
+                    "--standalone",
+                    f"--nproc_per_node={pipeline['nproc_per_node']}",
+                    "scripts/train_bc.py",
+                    "--config",
+                    "configs/bc_h100.toml",
+                ]
+            )
         snapshot(checkpoint, anchor)
     if (not args.skip_awr or not args.skip_ppo) and (not checkpoint.exists() or not anchor.exists()):
         raise SystemExit("BC checkpoint/anchor missing; run BC or provide both configured files")
@@ -133,6 +170,8 @@ def main() -> None:
             ]
             for opponent in awr["opponents"]:
                 command.extend(("--opponent", str(opponent)))
+            if auto_hardware and int(pipeline["nproc_per_node"]) == 1:
+                command.append("--auto-hardware")
             run(command)
             base_manifest = Path("data/raw/selfplay") / f"iteration-{iteration:02d}" / "merged-manifest.json"
 
@@ -147,6 +186,9 @@ def main() -> None:
             candidate = Path("checkpoints/candidates") / f"ppo-iteration-{iteration:03d}.pt"
             incumbent = Path("checkpoints/incumbents") / f"before-iteration-{iteration:03d}.pt"
             snapshot(best, incumbent)
+            rollout_workers = int(ppo["rollout_workers"])
+            if auto_hardware and not has_cuda:
+                rollout_workers = 1
             run(
                 [
                     python,
@@ -162,7 +204,7 @@ def main() -> None:
                     "--temperature",
                     str(ppo["rollout_temperature"]),
                     "--workers",
-                    str(ppo["rollout_workers"]),
+                    str(rollout_workers),
                     "--margin-scale",
                     str(ppo["margin_scale"]),
                     "--win-bonus",
@@ -171,8 +213,7 @@ def main() -> None:
                     str(rollout_dir),
                 ]
             )
-            run(
-                [
+            ppo_train_command = [
                     python,
                     "scripts/train_ppo.py",
                     "--config",
@@ -186,7 +227,9 @@ def main() -> None:
                     "--output",
                     str(candidate),
                 ]
-            )
+            if auto_hardware and not has_cuda:
+                ppo_train_command.extend(("--batch-size", "1", "--workers", "0"))
+            run(ppo_train_command)
             run(
                 [
                     python,

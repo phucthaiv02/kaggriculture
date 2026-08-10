@@ -19,7 +19,7 @@ train = [
   "torch>=2.8",
   "tqdm>=4.67",
 ]
-collect = ["kaggle>=2.2", "requests>=2.32"]
+collect = ["python-dotenv>=1.0", "requests>=2.32"]
 dev = ["pytest>=8.3", "ruff>=0.9"]
 
 [tool.setuptools]
