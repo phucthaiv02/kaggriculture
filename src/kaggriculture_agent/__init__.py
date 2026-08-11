@@ -1,5 +1,5 @@
-"""Dynamic Kaggriculture agent package."""
+"""Deterministic Kaggriculture heuristic agent."""
 
-from .model import DynamicPolicy, ModelConfig
+from .heuristic import HeuristicAgent
 
-__all__ = ["DynamicPolicy", "ModelConfig"]
+__all__ = ["HeuristicAgent"]

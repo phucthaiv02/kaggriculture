@@ -1,9 +1,0 @@
-{
-  "image": "gcr.io/kaggle-images/python:v163",
-  "python": "3.12.12",
-  "allowed_third_party_imports": [
-    "numpy",
-    "torch"
-  ],
-  "checkpoint_format": "pytorch-state-dict-v1"
-}

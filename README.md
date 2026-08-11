@@ -1,324 +1,172 @@
-# Kaggriculture Dynamic Agent
+# Kaggriculture Expanding Heuristic
 
-Agent neural observation-conditioned cho Kaggriculture, được huấn luyện theo pipeline:
+Agent deterministic dùng để kiểm tra chính xác toàn bộ lifecycle trồng trọt và
+chăn nuôi trước khi thêm strategic policy.
 
-```text
-Expert replays
-    → Behavior Cloning
-    → self-play recovery + AWR
-    → league self-play + PPO
-    → paired-seed promotion
-    → package và runtime audit
-```
+## Phạm vi hiện tại
 
-Agent dùng residual CNN cho hai farm board, Transformer để kết hợp board/global/unit state và hai GRU autoregressive decoder cho unit actions và market orders. Legal masks cùng reservation state được dùng giống nhau trong inference, rollout và PPO.
+- Bắt đầu sản xuất trong quadrant `NW`; sau khi thanh toán nhu cầu vận hành,
+  bán sản phẩm và mở quadrant 5×5 kế tiếp (`NE`, giá `$1,000`) ngay khi số dư
+  trong cùng market turn đủ tiền. Toàn bộ 25 ô NE sau đó trở thành một cohort
+  crop mới, được chọn theo profit/day và khả năng mua đủ seed + farmhand.
+- Layout khởi đầu là `12 MELON`, `9 WHEAT`, `2 COW`, `2 SHEEP`; crop thu hoạch
+  xong được thay bằng loại có projected profit/day cao nhất.
+- Số farm hand được suy ra từ số route tối thiểu có thể hoàn thành trong 24
+  turn. Animal có route riêng để bảo đảm `FEED + COLLECT_FERTILIZER` mỗi ngày;
+  các crop route được phân hoạch độc lập.
+- Tự mua seed/con giống/thức ăn, xây chuồng, trồng, tưới, cho ăn, chăm sóc,
+  thu hoạch, thu fertilizer và bán sản phẩm.
+- Không có model, checkpoint hoặc dependency ML.
 
-## Chạy toàn bộ pipeline
-
-### 1. Cài môi trường
-
-Yêu cầu Python 3.11/3.12 và PyTorch phù hợp CUDA trên máy train:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -e '.[train,collect,dev]'
-```
-
-Kiểm tra H100/BF16:
-
-```bash
-python -c "import torch; print(torch.cuda.get_device_name()); print(torch.cuda.is_bf16_supported())"
-```
-
-Tạo `.env` tại thư mục gốc repo từ file mẫu. Collector tự đọc file này nhưng
-không đọc token hoặc `kaggle.json` từ home:
-
-```bash
-cp .env.example .env
-# Sau đó sửa KAGGLE_API_TOKEN trong .env.
-```
-
-Hoặc dùng credential chuẩn của Kaggle trong `.env`:
-
-```dotenv
-KAGGLE_USERNAME=your-username
-KAGGLE_KEY=your-api-key
-```
-
-`.env` đã nằm trong `.gitignore`. Biến được `export` trực tiếp luôn có ưu tiên
-cao hơn giá trị trong file. Dùng file khác với `--env-file /path/to/credentials.env`.
-
-### 2. Chỉnh cấu hình
-
-Cấu hình cấp cao nằm tại [configs/pipeline.toml](configs/pipeline.toml). Mặc định pipeline chạy:
-
-- top 10 teams × tối đa 200 replay/team;
-- BC 30 epochs;
-- 2 vòng AWR, mỗi vòng 500 seeds × hai vị trí;
-- 10 vòng PPO, mỗi vòng 250 rollout seeds × hai vị trí trên 16 CPU workers;
-- 50 paired promotion seeds × hai vị trí;
-- một GPU; đặt `nproc_per_node = 8` để train BC/AWR bằng 8 H100.
-
-Các hyperparameter chi tiết nằm tại:
-
-- [configs/dataset.toml](configs/dataset.toml): sharding và relative value target;
-- [configs/bc_h100.toml](configs/bc_h100.toml): Behavior Cloning;
-- [configs/awr_h100.toml](configs/awr_h100.toml): AWR recovery;
-- [configs/ppo_h100.toml](configs/ppo_h100.toml): PPO/GAE/KL;
-- [configs/opponent_league.json](configs/opponent_league.json): opponent snapshot pool.
-
-### 3. Chạy một lệnh
-
-Từ thư mục gốc repo:
-
-```bash
-python scripts/run_full_pipeline.py --config configs/pipeline.toml
-```
-
-Hoặc dùng wrapper ngắn gọn (mọi option `--skip-*` được chuyển tiếp):
-
-```bash
-./train_full.sh
-```
-
-Lệnh trên tự động:
-
-1. Thu expert replay nếu `data/raw/expert/manifest.json` chưa tồn tại.
-2. Encode replay và tạo episode-split safetensors shards.
-3. Train BC thành `checkpoints/agent_h100.pt`.
-4. Đóng băng BC anchor tại `checkpoints/agent_bc_anchor.pt`.
-5. Chạy các vòng stochastic self-play + AWR.
-6. Khởi tạo `checkpoints/agent_best.pt` và opponent league.
-7. Thu on-policy PPO trajectories, train candidate và đánh giá head-to-head.
-8. Chỉ promote candidate vượt đủ win-rate, mean-margin và P10-margin gates.
-9. Đóng gói `submissions/dynamic_agent.tar.gz` và audit archive.
-
-Pipeline không ghi đè best checkpoint bằng PPO candidate chưa vượt promotion gate. Mỗi incumbent/candidate/promoted snapshot được giữ trong `checkpoints/` để có thể audit hoặc rollback.
-
-### Tiếp tục một pipeline đã chạy
-
-Nếu expert corpus và BC/AWR đã hoàn thành, tiếp tục từ PPO hiện có:
-
-```bash
-python scripts/run_full_pipeline.py \
-  --skip-expert-collection \
-  --skip-bc \
-  --skip-awr
-```
-
-Chỉ đóng gói checkpoint best hiện tại:
-
-```bash
-python scripts/run_full_pipeline.py \
-  --skip-expert-collection \
-  --skip-bc \
-  --skip-awr \
-  --skip-ppo
-```
-
-Có thể thêm `--skip-package` khi chỉ muốn train.
-
-## Pipeline học
-
-### Behavior Cloning
-
-Mỗi expert turn được encode thành:
-
-- board `44 × 10 × 10` dạng `uint8`;
-- global vector 70 chiều;
-- tối đa 32 unit tokens;
-- action operation/item/quantity targets;
-- legal masks;
-- relative value target.
-
-Train/validation được split bằng hash của episode ID, nên turn của cùng một trận không rò rỉ sang cả hai split. Production value target là:
+Layout cố định (`W/S` là ô Wheat đồng thời tiếp cận shed):
 
 ```text
-clip((my_score - opponent_score) / 50000 + 0.25 × result, -5, 5)
+       x=0  x=1  x=2  x=3  x=4
+y=0     M    M    M    M    M
+y=1     M    M    M    M    M
+y=2     M    M    W    W   Sheep
+y=3     W    W    W   Cow  Sheep
+y=4     W    W    W   Cow   W/S
 ```
 
-Trong đó `result ∈ {-1, 0, 1}`. BC loss gồm action cross-entropy, value Smooth-L1 và illegal-probability penalties.
+Wheat và vật nuôi ban đầu nằm gần shed vì cần phục vụ thường xuyên; Melon có chu
+kỳ dài nằm ở hai hàng xa. Sau harvest, loại crop trên từng vị trí có thể đổi.
+Các route NE dùng cửa shed `(5,4)` và được phân hoạch riêng với NW để tránh hành
+trình xuyên quadrant và giữ thời gian lập kế hoạch ổn định.
+Chi phí thuê và buffer thức ăn hai ngày được giữ trước khi mua thêm seed/con
+giống để tài sản đang sống không chết vì cạn vốn vận hành.
 
-### Self-play recovery và AWR
+Luật game đầy đủ nằm trong [docs/README.md](docs/README.md), hướng dẫn chạy và
+submit nằm trong [docs/AGENTS.md](docs/AGENTS.md).
 
-BC policy được decode stochastic để đi vào các state không xuất hiện trong expert demonstrations. Expert và recovery replay được merge thành replay buffer tích lũy. AWR dùng:
+## Chạy kiểm tra
+
+```bash
+python -m pytest
+```
+
+Chạy một season local:
+
+```bash
+PYTHONPATH=src python scripts/smoke_game.py
+```
+
+Đóng gói submission thuần Python:
+
+```bash
+python scripts/package_submission.py
+```
+
+Archive được tạo tại `submissions/heuristic_agent.tar.gz`.
+
+## Dynamic crop selection
+
+Ở `hour=0` của ngày một cohort one-time crop đến hạn thu hoạch, policy dự phóng
+từng loại crop trên window `[day, 29]`, giả sử toàn bộ ô vừa thu hoạch chỉ lặp
+lại loại đó và giá bán giữ ở snapshot hiện tại:
 
 ```text
-advantage = relative_final_target - V(state)
-weight = min(exp(advantage / temperature), max_weight)
+profit/day = (projected sale revenue - all seed costs) / remaining days
 ```
 
-Pha này giúp policy học lại những trajectory recovery tốt trước khi bắt đầu PPO.
+- One-time crop lặp chu kỳ theo `Time to Max Yield` và yield tối đa khi tưới,
+  không tính fertilizer: Wheat 4, Carrot 3, Melon 6.
+- Ongoing crop dùng lịch yield Tomato `8,9,10,11` và Strawberry `10,12,14,16`,
+  mỗi lần yield 1 vì crop planner hiện chưa fertilize.
+- Chỉ tính cycle/yield có ngày harvest `<= 29`. Crop không kịp harvest nhận 0.
+- Nếu không crop nào có projected profit dương, cohort được thu hoạch rồi để
+  trống; không mua seed vô ích ở cuối season.
 
-### League PPO
+Các loại được xếp hạng theo profit/day, nhưng planner chỉ chọn loại mà toàn bộ
+lệnh mua seed cho cohort còn đủ tiền sau khi giữ trước chi phí farmhand dự kiến
+và thức ăn cho hai ngày. `BUY_SEED` đủ số lượng được phát ngay trong market
+orders của hour 0. Route sau đó chạy chuỗi
+`WATER → HARVEST → PLANT replacement → WATER`. Ràng buộc mua đủ cả cohort ngăn
+trường hợp chỉ một phần tile được trồng lại vì hết tiền giữa chừng.
 
-Mỗi PPO turn lưu:
+## Dynamic route planner
 
-- encoded observation;
-- autoregressive action tokens;
-- component activity masks;
-- legal masks tại đúng thời điểm decode;
-- joint old log-probability;
-- old value, terminal reward và done.
-
-Terminal reward dùng score margin cộng win/loss bonus. Trainer tính GAE rồi tối ưu clipped PPO objective cùng value loss, entropy bonus và KL penalty về frozen BC anchor:
+`generate_unit_clusters()` không chứa danh sách cluster viết tay. Với tối đa 12
+target, planner xét các tập route khả thi và chọn partition có ít route nhất;
+tie-break bằng tổng số turn. Mỗi route phải thỏa:
 
 ```text
-L = Lppo + value_coef × Lvalue - entropy_coef × entropy + kl_coef × KL(policy || BC)
+shortest travel từ shed + PICKUP dùng chung + service actions <= 24 - hour
 ```
 
-Joint log-probability là tổng log-probability của các token thực sự tham gia action: unit op/item/quantity và market op/item/quantity, kể cả token `NONE` kết thúc market sequence.
+Đường đi trong một route là shortest open path: unit xuất phát gần shed nhưng
+không phải quay lại vì inventory được tự chuyển vào shed cuối ngày. Bốn animal
+gần shed dùng một route riêng và một manifest Wheat/con giống dùng chung.
+Layout crop lớn hơn 12 target dùng phép gộp gần nhất rồi tái phân phối asset để
+loại các route thừa mà vẫn giữ ngân sách.
 
-Opponent được lấy có trọng số từ:
+Mỗi turn, observation được chuyển lại thành các task hiện hành. Unit chọn task
+trong route dựa trên deadline priority, quãng đường và inventory đang mang. Vì
+vậy sau `WATER`, `FEED` hoặc `HARVEST`, công việc kế tiếp được lập lại từ state
+thật thay vì tiếp tục một kế hoạch đã lỗi thời.
 
-- policy hiện tại (`self`);
-- built-in `starter`;
-- các promoted historical snapshots.
+Planner cũng tạo action chain khi nhiều unit có thể đứng chung một tile. Thứ tự
+unit trong action được dùng để chạy `PLANT → WATER`, `FEED +
+COLLECT_FERTILIZER + CARE`, hoặc `WATER → HARVEST → PLANT → WATER` ngay trong cùng
+turn. Đây là tối ưu cơ hội giữa các unit đã đứng sẵn cùng ô; planner không kéo
+unit rời route để hội quân và không dùng độ rộng chain để tăng số hand. Các
+deadline `WATER → HARVEST` và `FEED → COLLECT_FERTILIZER` đứng trước CARE.
 
-Candidate được đánh giá trên cùng seeds ở cả player position 0 và 1. Mặc định chỉ promote nếu:
+Deadline lifecycle được áp dụng như sau:
 
-- win rate ≥ 52%;
-- mean score margin ≥ 0;
-- P10 score margin ≥ -25.000.
+- One-time crop trồng ngày `N` phải chạy `WATER → HARVEST` đúng ngày
+  `N + Time to Max Yield`; sau đó mới `PLANT → WATER` cây thay thế.
+- Ongoing crop phát `WATER → HARVEST` ngay trong ngày đầu tiên trạng thái
+  `yield_units > 0`, không đợi đến max-yield day.
+- Animal đặt ngày `N` phải `COLLECT_FERTILIZER` mỗi ngày kể từ `N + 1` khi
+  `fertilizer_available`; thao tác này có priority 0 và đứng trước CARE.
 
-Các threshold nằm trong `configs/pipeline.toml` và nên tăng số promotion seeds trước khi chọn submission cuối.
+Workload mỗi crop được ước lượng theo phase: 2 action khi khởi tạo, 1 action
+trong ngày chỉ cần tưới, 4 action khi thu hoạch và trồng lại. Animal setup được
+tính 4 service action (`PICKUP animal + BUILD + PLACE + FEED`) và một lần
+`PICKUP WHEAT` dùng chung cho route. Animal đang sống tính đủ `FEED`, `HARVEST`,
+`CARE` và `COLLECT_FERTILIZER` theo state hiện tại.
 
-## Chạy từng stage thủ công
+Trước khi rời shed, animal hand tạo manifest cho toàn route và thực hiện các
+`PICKUP` liên tiếp: mọi con giống còn thiếu trước, sau đó lấy một lần đủ Wheat
+cho các animal trong route. Khi crop one-time được thu hoạch, tile trống có mức
+ưu tiên cao nhất; nếu không có unit nối tiếp thì chính crop owner lập tức
+`PLANT`, rồi `WATER`, trước khi đi sang tile khác.
 
-### Expert collection và dataset
+Chỉ trong ba ngày cuối mùa (day 27–29), sau khi hoàn tất mọi task priority 0/1
+của route, worker đang mang nông sản quay về cửa shed gần nhất và `DROP` ngay.
+Market planner nhìn thấy hàng ở observation kế tiếp và phát `SELL`. Các ngày
+trước đó giữ lịch route bình thường. WATER/HARVEST/PLANT deadline vẫn đứng trước
+chuyến về shed; Wheat đang được animal route mang đi FEED không bị nhận nhầm là
+hàng cần bán.
 
-```bash
-python scripts/collect_replays.py \
-  --top-teams 10 \
-  --episodes-per-team 200 \
-  --max-discovery-queries 1000 \
-  --output data/raw/expert
+Khi strategic policy thêm nhiều target vào layout, planner tự sinh thêm route
+và market planner thuê thêm đúng số hand tương ứng.
 
-python scripts/build_dataset.py \
-  --config configs/dataset.toml \
-  --manifest data/raw/expert/manifest.json
-```
+## Kết quả smoke season
 
-Collector mặc định giãn mọi Kaggle API request ít nhất 1 giây, tôn trọng
-`Retry-After` khi gặp HTTP 429 và chỉ query bổ sung tối đa 3 submissions/team
-sau discovery. Có thể giảm tải thêm bằng `--api-request-interval 2` hoặc chỉnh
-giới hạn bằng `--max-submission-queries-per-team`.
-
-### BC
-
-```bash
-torchrun --standalone --nproc_per_node=1 \
-  scripts/train_bc.py --config configs/bc_h100.toml
-```
-
-Trên máy local hoặc GPU khác H100, dùng launcher tự nhận diện VRAM/RAM và chọn
-batch size an toàn:
-
-```bash
-python scripts/train_auto.py
-```
-
-Xem cấu hình mà không bắt đầu train:
-
-```bash
-python scripts/train_auto.py --dry-run
-```
-
-Máy CPU yếu có thể dùng model debug nhỏ:
-
-```bash
-python scripts/train_auto.py --small --max-steps 100
-```
-
-Có thể override tự động bằng `--batch-size`, `--gradient-accumulation`,
-`--workers`, `--epochs`, `--resume` hoặc `--init`.
-
-### Một vòng AWR
-
-```bash
-python scripts/run_selfplay_iteration.py \
-  --checkpoint checkpoints/agent_h100.pt \
-  --iteration 1 \
-  --base-manifest data/raw/expert/manifest.json \
-  --seeds 500 \
-  --opponent self \
-  --opponent starter
-```
-
-### Một vòng PPO
-
-```bash
-python scripts/collect_ppo_rollouts.py \
-  --checkpoint checkpoints/agent_best.pt \
-  --league configs/opponent_league.json \
-  --seeds 250 \
-  --output data/ppo/iteration-001
-
-python scripts/train_ppo.py \
-  --config configs/ppo_h100.toml \
-  --checkpoint checkpoints/agent_best.pt \
-  --reference checkpoints/agent_bc_anchor.pt \
-  --rollouts data/ppo/iteration-001 \
-  --output checkpoints/candidates/ppo-iteration-001.pt
-
-python scripts/promote_candidate.py \
-  --candidate checkpoints/candidates/ppo-iteration-001.pt \
-  --incumbent checkpoints/agent_best.pt \
-  --best checkpoints/agent_best.pt \
-  --league configs/opponent_league.json \
-  --iteration 1
-```
-
-Khi chạy promotion thủ công, nên giữ một bản incumbent riêng nếu `--best` và `--incumbent` cùng đường dẫn. Full-pipeline orchestrator tự snapshot incumbent trước khi evaluation.
-
-## Kiểm tra code
-
-```bash
-PYTHONPATH=src:. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
-ruff check .
-```
-
-## Evaluation và đóng gói
-
-Complete-game evaluation với built-in opponent:
-
-```bash
-python scripts/evaluate.py \
-  --checkpoint checkpoints/agent_best.pt \
-  --opponent starter \
-  --seed-count 100 \
-  --save-worst-replay
-```
-
-Đóng gói và kiểm tra Kaggle runtime:
-
-```bash
-python scripts/package_submission.py \
-  --checkpoint checkpoints/agent_best.pt \
-  --output submissions/dynamic_agent.tar.gz
-
-python scripts/audit_submission.py submissions/dynamic_agent.tar.gz
-python scripts/test_runtime_image.py submissions/dynamic_agent.tar.gz
-```
-
-Submission archive bị từ chối nếu vượt 100 MiB. Runtime inference chỉ phụ thuộc Python standard library, NumPy và PyTorch có sẵn trong `gcr.io/kaggle-images/python:v163`.
-
-## Artifact layout
+Với seed `42`, `episodeSteps=720`, `weedSpawnChance=0` và đối thủ `pass`, crop
+policy chọn:
 
 ```text
-data/raw/expert/              expert replays và manifest
-data/raw/selfplay/            AWR recovery replays
-data/shards/                  BC/AWR safetensors
-data/ppo/                     on-policy PPO trajectories
-checkpoints/agent_bc_anchor.pt frozen BC KL anchor
-checkpoints/agent_best.pt      checkpoint đã qua promotion
-checkpoints/candidates/        PPO candidates
-checkpoints/incumbents/        pre-update snapshots
-checkpoints/league/            promoted historical opponents
-runs/                          TensorBoard, evaluation và promotion reports
-submissions/                   packaged Kaggle agent
+day 4                 -> CARROT
+day 6, NE 25 tiles    -> CARROT
+day 7,9,10,17,19      -> MELON
+day 20,24             -> WHEAT
+day 27,28,29          -> không trồng lại các cohort đã hết window
 ```
 
-Chi tiết model và quyết định thiết kế nằm tại [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); luật game nằm tại [docs/README.md](docs/README.md).
+Ngày 4, Melon có profit/day cao hơn nhưng không đủ tiền mua cho cả 9 tile nên
+planner chọn Carrot. Planner mở `NE` ở ngày 5, mua và trồng đủ 25 Carrot ở ngày
+6, rồi duy trì liên tục đủ `21 NW + 25 NE = 46` crop tile từ đầu ngày 7 đến hết
+ngày 27 mà không có WEED. Các cohort NW trống cuối season là chủ ý khi không
+còn bất kỳ loại crop nào kịp thu hoạch; planner không mua seed và không PLANT
+trên các tile đó. NE vẫn đủ 25 tile đến ngày 29. Với DROP nhanh chỉ trong ba
+ngày cuối, reward của replay hiện tại là `$89,307`.
+
+- Farm hand tối đa trong một ngày: 13, chỉ ở các ngày setup/harvest nặng.
+- Route được tách theo quadrant và dùng buffer 6 turn để không trồng cây mới ở
+  hour 23 mà chưa kịp WATER.
+- Full-season test audit tuổi của từng lệnh HARVEST và từng cặp
+  `(day, animal tile)` bắt buộc COLLECT_FERTILIZER; smoke test còn kiểm tra đủ
+  cả 46 crop tile trong production window mở rộng.
