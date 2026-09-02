@@ -1,0 +1,139 @@
+"""Hand-specified opening allocation for NW, used instead of the ROI planner
+(agents/planner.py) until the first land purchase succeeds.
+
+Mirrors why day16_allocation.py's fixed-genome policies (e.g. the historical
+"2 COW, 12 MELON, 2 SHEEP, 9 WHEAT" opening) outperformed anything the
+from-scratch ROI planner found on its own for a 25-tile board in isolated
+testing: commit to a known-good starting allocation and a known-good early
+cash-flow sequence (sell FERTILIZER to fund feed), then hand off to
+price-reactive planning once another quadrant unlocks. New land and every
+later replant decision goes through the dynamic planner from that point on.
+"""
+
+from __future__ import annotations
+
+from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
+
+LAND_ORDER = official_game.LAND_ORDER
+
+# 12 MELON + 9 WHEAT + 2 COW + 2 SHEEP = 25 (NW's whole board). Wheat is
+# funded ahead of each animal's verified age-relative FEED schedule. In
+# particular, placement is age 0: SHEEP feeds/cares then, while COW starts at
+# age 1 (experiments/animal_yields.py).
+OPENING_COUNTS = {"MELON": 12, "WHEAT": 9, "COW": 2, "SHEEP": 2}
+OPENING_SIZE = sum(OPENING_COUNTS.values())
+
+# Temporarily buy exactly one quadrant on engine/UI day 7 so the expansion
+# path can be inspected in isolation.
+LAND_BUY_DAYS = (7,)
+
+# Convert two of the initial WHEAT targets to one COW and one SHEEP together
+# on day 2 (the UI's Day 3). Their two harvested WHEAT units can then feed
+# the newly placed animals without buying feed from the market.
+# farm_tasks.build_tasks deliberately supports harvesting a one-time crop
+# early when its target changes, so each conversion can start as soon as the
+# opening has generated some WHEAT instead of waiting for the full cycle.
+CONVERSION_START_DAY = 2
+CONVERSIONS = ("COW", "SHEEP")
+
+
+def should_buy_land_on_schedule(obs, farm):
+    """Submit one land order at hour 0 on the scheduled day, if available.
+
+    Affordability itself is left to the engine (BUY_LAND is simply a no-op if
+    the farm cannot cover the cost at that instant).
+    """
+    n_extra = len(farm["unlocked_quadrants"]) - 1
+    return (
+        obs["day"] in LAND_BUY_DAYS
+        and obs.get("hour", 0) == 0
+        and n_extra < len(LAND_ORDER)
+    )
+
+
+def build_opening_targets(positions):
+    """The fixed day-0 allocation for exactly `positions` (must be NW's 25
+    tiles). Fertilize is never committed here -- selling FERTILIZER outright
+    for the day-2 cash-flow trick is the point, not spending it on crops."""
+    if len(positions) != OPENING_SIZE:
+        raise ValueError(
+            f"opening book requires exactly {OPENING_SIZE} active positions, got {len(positions)}"
+        )
+
+    order = []
+    for name, count in OPENING_COUNTS.items():
+        order += [name] * count
+    return {position: (name, False) for position, name in zip(positions, order)}
+
+
+def make_opening_controller():
+    """Returns a callable `governs(obs, targets, active_positions) -> bool`
+    that applies the opening book in place on `targets` for as long as it
+    should still be in charge (True -- the caller should skip the dynamic
+    planner that call), or hands off permanently once the first additional
+    quadrant is unlocked (False from then on)."""
+    book = {
+        "applied": False,
+        "handed_off": False,
+        "melon_positions": (),
+        "wheat_positions": (),
+        "next_conversion": 0,
+    }
+
+    def governs(obs, targets, active_positions):
+        day = obs["day"]
+        farm = obs["farms"][obs["player"]]
+        tiles = farm["tiles"]
+
+        if book["handed_off"]:
+            return False
+
+        if len(farm["unlocked_quadrants"]) > 1:
+            book["handed_off"] = True
+            return False
+
+        if not book["applied"]:
+            opening = build_opening_targets(active_positions)
+            targets.update(opening)
+            book["melon_positions"] = tuple(p for p, v in opening.items() if v[0] == "MELON")
+            # Converted animals produce every few days (and fertilizer every
+            # day), so keep their recurring HARVEST/COLLECT/DROP route short.
+            # `active_positions` is row-major; taking its first WHEAT entries
+            # would unnecessarily turn the farther northern tiles into pens.
+            shed = (len(tiles[0]) // 2 - 1, len(tiles) // 2 - 1)
+            book["wheat_positions"] = tuple(
+                sorted(
+                    (p for p, v in opening.items() if v[0] == "WHEAT"),
+                    key=lambda p: (
+                        abs(p[0] - shed[0]) + abs(p[1] - shed[1]),
+                        -p[1],
+                        -p[0],
+                    ),
+                )
+            )
+            book["applied"] = True
+            return True
+
+        if day >= CONVERSION_START_DAY:
+            while book["next_conversion"] < len(CONVERSIONS):
+                position = next(
+                    (
+                        (x, y)
+                        for x, y in book["wheat_positions"]
+                        if targets.get((x, y), (None, False))[0] == "WHEAT"
+                        and isinstance(tiles[y][x], dict)
+                        and tiles[y][x].get("kind") == "PLANT"
+                        and tiles[y][x].get("crop") == "WHEAT"
+                        and tiles[y][x].get("yield_units", 0) > 0
+                    ),
+                    None,
+                )
+                if position is None:
+                    break
+                index = book["next_conversion"]
+                targets[position] = (CONVERSIONS[index], False)
+                book["next_conversion"] += 1
+
+        return True
+
+    return governs
