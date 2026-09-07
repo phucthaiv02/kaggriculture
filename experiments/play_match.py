@@ -22,7 +22,7 @@ END_DAY = 30
 
 def configuration(seed):
     return {
-        "episodeSteps": (END_DAY + 1) * 24,
+        "episodeSteps": END_DAY * 24,
         "boardSize": 10,
         "startingMoney": 3000.0,
         "maxMarketOrdersPerTurn": 10,
