@@ -42,8 +42,10 @@ Thumbs.db
 *.log
 *.sqlite3
 
-# Project-generated simulation artifacts
+# Project-generated simulation and analysis artifacts
 replays/
-agent_replay_opening_book.html
-farm_schedule_replay.html
 shop_price_monte_carlo.html
+experiments/hands_capacity_by_producer.png
+experiments/hands_breakeven_by_producer.png
+experiments/hands_net_by_producer.png
+experiments/hands_net_by_producer.csv
