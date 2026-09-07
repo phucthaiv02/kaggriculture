@@ -89,10 +89,9 @@ def test_animal_onto_existing_empty_structure_skips_redundant_build():
     assert task.actions == [["PLACE", "SHEEP"], ["FEED"], ["CARE"]]
 
 
-def test_animal_onto_wrong_structure_digs_and_rebuilds():
+def test_animal_onto_wrong_structure_is_not_scheduled():
     obs = make_obs(day=5, tiles={(0, 0): {"kind": "COOP"}}, shed={"SHEEP": 1, "WHEAT": 1})
-    task = one_task(build_tasks(obs, {(0, 0): ("SHEEP", False)}))
-    assert task.actions == [["DIG"], ["BUILD_PASTURE"], ["PLACE", "SHEEP"], ["FEED"], ["CARE"]]
+    assert build_tasks(obs, {(0, 0): ("SHEEP", False)}) == []
 
 
 def test_live_animal_fed_when_wheat_available():
@@ -133,8 +132,8 @@ def test_live_animal_harvests_urgently_even_outside_maintenance_schedule():
     assert task.animal_harvest
 
 
-def test_live_animal_collects_fertilizer_without_prioritized_drop_when_no_wheat():
-    obs = make_obs(day=3, tiles={(0, 0): animal_tile("SHEEP", placed_day=0, fertilizer_available=True)}, shed={})
+def test_live_animal_collects_fertilizer_without_prioritized_drop_when_no_cash_or_wheat():
+    obs = make_obs(day=3, tiles={(0, 0): animal_tile("SHEEP", placed_day=0, fertilizer_available=True)}, shed={}, money=0)
     task = one_task(build_tasks(obs, {(0, 0): ("SHEEP", False)}))
     assert task.actions == [["COLLECT_FERTILIZER"]]
     assert task.sells == {"FERTILIZER": 1}
@@ -465,3 +464,17 @@ if __name__ == "__main__":
                 print(f"FAIL {name}: {exc}")
     print(f"{'ALL PASSED' if not failures else f'{failures} FAILED'}")
     sys.exit(1 if failures else 0)
+
+
+def test_affordable_feed_is_scheduled_before_waiting_for_fertilizer_sale():
+    obs = make_obs(day=3, tiles={(0, 0): animal_tile("SHEEP", 0, fertilizer_available=True)}, shed={}, money=100)
+    task = one_task(build_tasks(obs, {(0, 0): ("SHEEP", False)}))
+    assert task.actions == [["FEED"], ["CARE"], ["COLLECT_FERTILIZER"]]
+    assert task.needs["WHEAT"] == 1
+
+
+def test_stale_target_never_digs_animal_structures():
+    for name in ("WHEAT", "COW"):
+        obs = make_obs(day=7, tiles={(0, 0): {"kind": "COOP"}},
+                       seeds={"WHEAT": 1}, shed={"COW": 1, "WHEAT": 1})
+        assert build_tasks(obs, {(0, 0): (name, False)}) == []

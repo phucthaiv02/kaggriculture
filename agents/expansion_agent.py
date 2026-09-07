@@ -1,11 +1,9 @@
 """Function 5: wire functions 1-4 into one per-turn agent.
 
-Per turn: replan targets only when something changed (a tile freed up), list
-today's tasks once at the start of the day, size hands to that day's real
-workload, lay out routes once, then every turn just pop the next op per
-worker and sell whatever the shed can spare. Route/queue state is cached for
-the day (not recomputed every turn) -- see agents/scheduler.py's module
-docstring for why revisiting a committed route mid-day is not worth it.
+Morning planning establishes maintenance routes and the opening portfolio.
+Each later observation also discovers newly unlocked land and newly vacant
+tiles. Intraday scheduling preserves committed routes, replants in place
+where possible, and uses remaining time and cash for additional work/hires.
 
 Hour 0 is unavoidably orders-only: movement is applied *before* market orders
 each turn (see kaggriculture's interpreter), so at hour 0 (a) a hand just
@@ -22,6 +20,8 @@ truncated.
 
 from __future__ import annotations
 
+from collections import Counter
+
 from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 
 from agents.farm_tasks import (
@@ -33,10 +33,28 @@ from agents.farm_tasks import (
     reserved_items,
 )
 from agents.opening_book import make_opening_controller, should_buy_land_on_schedule
-from agents.planner import plan_targets
-from agents.scheduler import build_queues, hands_needed
+from agents.intraday import queue_commitments, schedule_open_tiles
+from agents.planner import SEASON_END_DAY, plan_targets
+from agents.scheduler import MAX_HANDS, build_queues, hands_needed
 from agents.schedules import is_maintenance_day, should_care_animal, should_feed_animal
 from agents.selling import sell_orders
+
+def _protect_animal_structures(farm, operations):
+    """Discard stale DIG/PLANT commands on permanent animal structures."""
+    operations = list(operations)
+    positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
+    protected = {p for p in positions
+                 if isinstance(farm["tiles"][p[1]][p[0]], dict)
+                 and (farm["tiles"][p[1]][p[0]].get("animal")
+                      or farm["tiles"][p[1]][p[0]].get("kind") in ("COOP", "PASTURE"))}
+    for index, position in enumerate(positions[:len(operations)]):
+        operation = operations[index]
+        if operation and operation[0] in ("BUILD_COOP", "BUILD_PASTURE", "PLACE"):
+            protected.add(position)
+        if operation and operation[0] in ("DIG", "PLANT") and position in protected:
+            operations[index] = ["PASS"]
+    return operations
+
 
 BOARD_SIZE = 10
 
@@ -74,13 +92,15 @@ def _affordable_hires(farm, desired, money):
 
 def _sale_revenue(obs, sales):
     """Exact same-turn proceeds before subsequent BUY orders execute."""
-    inventory = obs["market"]["inventory"]
+    inventory = dict(obs["market"]["inventory"])
+    params = obs["market"].get("params")
     revenue = 0
     for _op, item, quantity in sales:
-        revenue += sum(
-            market_price(item, inventory.get(item, 0) + offset)
-            for offset in range(int(quantity))
-        )
+        for _ in range(int(quantity)):
+            stock = inventory.get(item, 0)
+            price = market_price(item, stock, params)
+            revenue += price
+            inventory[item] = stock + int(price > 1)
     return revenue
 
 
@@ -181,7 +201,7 @@ def _hire_and_buy_orders(
     return orders
 
 
-def make_agent(end_day, seed=0):
+def make_agent(end_day=SEASON_END_DAY, seed=0):
     del seed  # every decision reacts to live prices/shed state; nothing to seed
     targets = {}
     state = {
@@ -192,7 +212,7 @@ def make_agent(end_day, seed=0):
     }
     opening_governs = make_opening_controller()
 
-    def _validate_predicted_hands(farm):
+    def _validate_predicted_hands(farm, hour):
         """Discard a plan built for a hand hired mid-day once that hand
         actually spawns somewhere other than predicted.
 
@@ -218,12 +238,17 @@ def make_agent(end_day, seed=0):
         for index in state["unverified_hand_indices"]:
             hand_index = index - 1
             if hand_index >= len(hands):
-                still_unverified.add(index)
+                if hour == 1:
+                    still_unverified.add(index)
                 continue
             plan = state["plans"][index] if index < len(state["plans"]) else None
             if plan is not None and plan.start != hands[hand_index]:
                 plan.queue = []
         state["unverified_hand_indices"] = still_unverified
+        if hour >= 2:
+            # Morning HIRE orders have resolved. Failed/truncated purchases
+            # must release their tasks and inputs for intraday scheduling.
+            del state["plans"][len(hands) + 1:]
 
     def _animal_still_needs_attention(tile, name, day):
         """True if a *placed* animal still has real, unfulfilled survival
@@ -315,11 +340,14 @@ def make_agent(end_day, seed=0):
             if not (
                 isinstance(farm["tiles"][position[1]][position[0]], dict)
                 and farm["tiles"][position[1]][position[0]].get("animal")
-                == targets.get(position, (None, False))[0]
+                == (targets.get(position) or (None, False))[0]
             )
         }
+        committed = queue_commitments(worker_positions, state["plans"])[1]
         for position, target in targets.items():
             if not target:
+                continue
+            if position in committed:
                 continue
             x, y = position
             tile = farm["tiles"][y][x]
@@ -406,10 +434,9 @@ def make_agent(end_day, seed=0):
         day, hour = obs["day"], obs["hour"]
         farm = obs["farms"][obs["player"]]
 
-        # BUY_LAND submitted at hour 0 is visible from hour 1 onward. End the
-        # opening immediately when that first purchase actually succeeds and
-        # claim the newly unlocked tiles in the same hour-1 planning pass.
-        if hour > 0 and state["opening_active"] and len(farm["unlocked_quadrants"]) > 1:
+        # React to every successful land purchase, including one submitted
+        # mid-day or after the opening has already handed off.
+        if hour > 0 and any(position not in targets for position in _active_positions(farm)):
             positions = _active_positions(farm)
             state["deferred_expansion_positions"].update(
                 position for position in positions if position not in targets
@@ -533,8 +560,21 @@ def make_agent(end_day, seed=0):
             }
 
         if state["unverified_hand_indices"]:
-            _validate_predicted_hands(farm)
+            _validate_predicted_hands(farm, hour)
+        # Morning hires already have pending orders/plans. Extra hires here
+        # are only for newly available work after that pass has settled.
+        hire_costs = (
+            [_hire_costs(farm, count) for count in range(1, MAX_HANDS - len(farm["hands"]) + 1)]
+            if hour >= 2 and not state["unverified_hand_indices"] else []
+        )
+        purchase_targets, expansion_hires = schedule_open_tiles(
+            obs, targets, state["plans"], _open_shed_access(farm), hire_costs,
+        )
         _schedule_late_placements(obs, farm, day, hour)
+        # Remaining PICKUPs, including newly appended work, must be protected
+        # from the same turn's sales.
+        positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
+        state["reserved"] = queue_commitments(positions, state["plans"])[3]
 
         plans = state["plans"]
         farmer_plan = plans[0] if plans else None
@@ -549,7 +589,19 @@ def make_agent(end_day, seed=0):
         # seed exists; hold it at the front of that worker's queue instead.
         worker_ops = [farmer_op, *hand_ops]
         seeds_available = dict(obs["private"]["seeds"])
+        shed_available = Counter(obs["private"]["shed"])
         for index, operation in enumerate(worker_ops):
+            if operation and operation[0] == "PICKUP":
+                item = operation[1]
+                requested = operation[2] if len(operation) > 2 else 1
+                taken = min(requested, shed_available[item])
+                shed_available[item] -= taken
+                if taken < requested:
+                    plan = plans[index] if index < len(plans) else None
+                    if plan is not None:
+                        plan.queue.insert(0, ["PICKUP", item, requested - taken])
+                    worker_ops[index] = ["PICKUP", item, taken] if taken else ["PASS"]
+                continue
             if not operation or operation[0] != "PLANT":
                 continue
             crop = operation[1]
@@ -586,23 +638,17 @@ def make_agent(end_day, seed=0):
                 worker_ops[index] = ["HARVEST"]
             harvested_positions.add(position)
 
+        worker_ops = _protect_animal_structures(farm, worker_ops)
+
         farmer_op, hand_ops = worker_ops[0], worker_ops[1:]
 
-        # Sell first, buy second, every turn: COLLECT_FERTILIZER -> shed ->
-        # DROP -> SELL only happens once a task queue runs it (hour 2+), so
-        # the cash to fund *this same day's* feed purchase may not exist
-        # until partway through the day -- checking (and re-checking) every
-        # turn is what lets that sale fund this same day's wheat instead of
-        # only the next one. The bigger seed/animal purchases stay hour-1-
-        # only (not this time-sensitive, and shouldn't be resubmitted every
-        # turn); feed_wheat_order is cheap and idempotent so it's safe to
-        # call constantly.
+        # Sell and buy every turn so harvests and fertilizer can fund new
+        # production immediately. Vacant-tile purchases are restricted to
+        # the capacity admitted by the intraday scheduler.
         market = sell_orders(obs, state["reserved"])
         if hour == 1:
-            # Capital inputs bought now arrive only after this turn's worker
-            # actions, but today's queues have already been built from the
-            # pre-purchase shed. Defer them to the next hour-0 planning pass
-            # instead of buying animals that cannot be PLACEd today.
+            # Morning top-up hires retain their existing sizing. Input
+            # shopping below also covers feasible newly unlocked tiles.
             market += _hire_and_buy_orders(
                 obs,
                 farm,
@@ -617,7 +663,7 @@ def make_agent(end_day, seed=0):
         # proceeds are therefore available to BUY_ANIMAL later in this same
         # market pass; the animal is observed and scheduled for PLACE on a
         # subsequent turn once the morning work queues are idle.
-        if hour >= 2:
+        if hour >= 1:
             wheat_sold = sum(
                 int(order[2]) for order in market
                 if order[0] == "SELL" and order[1] == "WHEAT"
@@ -626,10 +672,12 @@ def make_agent(end_day, seed=0):
             # BUY_PRODUCT feed order; treating that as sale revenue would
             # make an animal look affordable before it really is.
             sales = [order for order in market if order[0] == "SELL"]
-            available_money = _maximum_cash_after_sales(obs, farm, sales, 0)
+            available_money = _maximum_cash_after_sales(
+                obs, farm, sales, expansion_hires + sum(order[0] == "HIRE" for order in market)
+            )
             late_orders = purchase_orders(
                 obs,
-                targets,
+                purchase_targets,
                 _active_positions(farm),
                 available_money=available_money,
                 available_wheat=max(
@@ -650,6 +698,9 @@ def make_agent(end_day, seed=0):
                     market.append(order)
                     existing_feed_buy = True
 
+        # Inputs precede optional expansion hires. If the ten-order cap cuts
+        # off some hires, the next observation schedules only real workers.
+        market += [["HIRE"] for _ in range(expansion_hires)]
         return {"farmer": farmer_op, "hands": hand_ops, "market": market[:10]}
 
     return agent

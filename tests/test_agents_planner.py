@@ -55,6 +55,35 @@ def test_best_target_returns_something_with_a_full_season_left():
     assert isinstance(fertilize, bool)
 
 
+def test_profitable_alternatives_survive_category_concentration():
+    # At equal crop/animal capital, the old hard cutoff erased MELON's
+    # 182/day score while preserving WHEAT's 22.5/day score.
+    choice = best_target(
+        end_day=30, day=7, inventory=BASE_INVENTORY, wheat_price=25,
+        committed_units=Counter(),
+        category_capital={"CROP": 500, "ANIMAL": 500}, total_capital=1000,
+    )
+    assert choice[0] != "WHEAT", choice
+
+
+def test_crop_rotation_values_additional_complete_cycles():
+    from agents.planner import _score
+
+    committed = Counter({"WHEAT": 100})
+    near = _score("WHEAT", 11, 7, BASE_INVENTORY, 25, committed)
+    far = _score("WHEAT", 30, 7, BASE_INVENTORY, 25, committed)
+    assert far[0] > near[0]
+
+
+def test_unprofitable_candidates_are_rejected():
+    choice = best_target(
+        end_day=30, day=27, inventory={p: 100000 for p in PRODUCTS}, wheat_price=1,
+        committed_units=Counter(), category_capital={"CROP": 1000},
+        total_capital=1000,
+    )
+    assert choice is None
+
+
 def test_plan_targets_diversifies_across_many_tiles_in_one_pass():
     """Regression test for the concentration bug found via full-pipeline
     testing: a whole freshly-claimed quadrant (or a fresh 25-tile board)
@@ -69,8 +98,8 @@ def test_plan_targets_diversifies_across_many_tiles_in_one_pass():
     assert len(targets) == 25
     names = Counter(value[0] for value in targets.values() if value is not None)
     assert len(names) >= 2, f"collapsed onto a single type: {names}"
-    # No single crop/animal should dominate essentially the whole board.
-    assert max(names.values()) <= 20, names
+    # Do not impose a fixed quota when marginal profit still favors a crop.
+    assert names["WHEAT"] < len(targets), names
 
 
 def test_plan_targets_does_not_touch_a_tile_mid_growth():
@@ -138,3 +167,31 @@ if __name__ == "__main__":
                 print(f"FAIL {name}: {exc}")
     print(f"{'ALL PASSED' if not failures else f'{failures} FAILED'}")
     sys.exit(1 if failures else 0)
+
+
+def test_finished_wheat_has_no_fallback_when_no_profitable_cycle_fits():
+    from agents.farm_tasks import build_tasks
+    tile = {"kind": "PLANT", "crop": "WHEAT", "planted_day": 25,
+            "yield_units": 4, "watered_today": True}
+    obs = make_obs(day=29, tiles={(0, 0): tile})
+    targets = {(0, 0): ("WHEAT", False)}
+    plan_targets(obs, targets, [(0, 0)], end_day=29)
+    assert targets[(0, 0)] is None
+    tasks = build_tasks(obs, targets)
+    assert any(["HARVEST"] in task.actions for task in tasks)
+    assert not any(action[0] == "PLANT" for task in tasks for action in task.actions)
+
+
+def test_idle_tile_is_reconsidered_when_market_recovers():
+    obs = make_obs(day=7)
+    targets = {(0, 0): None}
+    plan_targets(obs, targets, [(0, 0)], end_day=29)
+    assert targets[(0, 0)] is not None
+
+
+def test_empty_animal_structures_only_get_compatible_targets():
+    for structure, names in (("COOP", {"GOOSE"}), ("PASTURE", {"COW", "SHEEP"})):
+        obs = make_obs(day=7, tiles={(0, 0): {"kind": structure}})
+        targets = {(0, 0): ("WHEAT", False)}
+        plan_targets(obs, targets, [(0, 0)], end_day=29)
+        assert targets[(0, 0)] is None or targets[(0, 0)][0] in names

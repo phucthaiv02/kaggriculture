@@ -250,6 +250,70 @@ def test_farmer_far_from_shed_is_charged_the_approach_distance():
     assert count2 >= 1
 
 
+def test_nearby_tasks_share_worker_to_reduce_total_travel():
+    tasks = [
+        Task((4, 3), [["WATER"]] * 3),
+        Task((4, 2), [["HARVEST"]] * 3),
+    ]
+    plans, unassigned = build_queues(
+        tasks, farmer_start=SHED, hand_count=1, hand_starts=((5, 4),),
+        existing_hand_budget=8,
+    )
+    assert unassigned == []
+    assert sum(len(plan.queue) for plan in plans) == 8
+    assert plans[1].queue == []
+
+
+def test_supplies_for_later_work_stay_in_shed_until_after_drop():
+    fertilizer = Task(
+        (4, 3), [["COLLECT_FERTILIZER"]],
+        sells=Counter({"FERTILIZER": 1}), immediate_drop=True,
+    )
+    placement = Task(
+        (4, 2), [["PLACE", "COW"]], needs=Counter({"COW": 1}),
+    )
+    plans, unassigned = build_queues(
+        [fertilizer, placement], farmer_start=SHED, hand_count=0,
+        existing_hand_budget=8,
+    )
+    assert unassigned == []
+    queue = plans[0].queue
+    assert len(queue) == 8
+    assert queue.count(["PICKUP", "COW", 1]) == 1
+    assert queue.index(["DROP"]) < queue.index(["PICKUP", "COW", 1])
+
+
+def test_multiple_drops_pick_up_only_each_segments_feed():
+    tasks = [
+        Task((4, 3), [["FEED"]], needs=Counter({"WHEAT": 1}),
+             urgent=True, immediate_drop=True),
+        Task((4, 2), [["FEED"]], needs=Counter({"WHEAT": 2}),
+             urgent=True, immediate_drop=True),
+        Task((4, 1), [["FEED"]], needs=Counter({"WHEAT": 3}), urgent=True),
+    ]
+    plans, unassigned = build_queues(tasks, farmer_start=SHED, hand_count=0)
+    assert unassigned == []
+    queue = plans[0].queue
+    pickups = [op for op in queue if op[0] == "PICKUP"]
+    assert sorted(op[2] for op in pickups) == [1, 2, 3]
+    assert pickups[-1] == ["PICKUP", "WHEAT", 3]
+    assert queue.count(["DROP"]) == 2
+    assert len(plans[0].queue) <= FARMER_BUDGET
+
+
+def test_urgent_tasks_finish_early_even_when_sharing_worker_saves_travel():
+    tasks = [
+        Task((4, 3), [["FEED"], ["CARE"]], urgent=True),
+        Task((4, 2), [["FEED"], ["CARE"]], urgent=True),
+    ]
+    plans, unassigned = build_queues(
+        tasks, farmer_start=SHED, hand_count=1, hand_starts=((5, 4),),
+    )
+    assert unassigned == []
+    assert all(plan.queue.count(["FEED"]) == 1 for plan in plans)
+    assert max(len(plan.queue) for plan in plans) == 5
+
+
 if __name__ == "__main__":
     import sys
     failures = 0

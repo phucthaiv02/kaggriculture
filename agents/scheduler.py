@@ -66,6 +66,41 @@ class WorkerPlan:
     queue: list  # ops to pop one per turn
 
 
+def _task_queue(start, bucket, shed_access):
+    """Build the mandatory route, sharing execution and packing accounting.
+
+    DROP empties the worker's inventory. Only collect supplies through the
+    next DROP, so later supplies stay available in the shed in the meantime.
+    """
+    queue, current = [], start
+    pickup_needed = True
+    for task_index, task in enumerate(bucket):
+        if pickup_needed:
+            needs = Counter()
+            for later in bucket[task_index:]:
+                needs.update(later.needs)
+                if later.immediate_drop:
+                    break
+            if needs:
+                shed = nearest_shed(current, shed_access)
+                queue += route(current, shed)
+                queue += [["PICKUP", item, amount] for item, amount in needs.items() if amount > 0]
+                current = shed
+            pickup_needed = False
+        queue += route(current, task.position) + task.actions
+        current = task.position
+        if task.immediate_drop:
+            shed = nearest_shed(current, shed_access)
+            queue += route(current, shed) + [["DROP"]]
+            current = shed
+            if task.refinance_feed:
+                queue += [["PASS"], ["PICKUP", "WHEAT", 1]]
+                queue += route(current, task.position) + [["FEED"], ["CARE"]]
+                current = task.position
+            pickup_needed = True
+    return queue, current
+
+
 def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
     """Greedy bin-pack using each candidate worker's exact queue length.
 
@@ -76,44 +111,13 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
     buckets = [[] for _ in worker_starts]
 
     def work_length(start, bucket):
-        """Exact queue length before the optional end-of-day DROP trip."""
-        needs = sum((task.needs for task in bucket), Counter())
-        current = start
-        length = 0
-        if needs:
-            shed = nearest_shed(current, shed_access)
-            length += abs(current[0] - shed[0]) + abs(current[1] - shed[1])
-            # build_queues emits one PICKUP operation per distinct item.
-            length += sum(1 for amount in needs.values() if amount)
-            current = shed
-        for task_index, task in enumerate(bucket):
-            length += abs(current[0] - task.position[0]) + abs(current[1] - task.position[1])
-            length += len(task.actions)
-            current = task.position
-            if task.immediate_drop:
-                shed = nearest_shed(current, shed_access)
-                length += abs(current[0] - shed[0]) + abs(current[1] - shed[1]) + 1
-                current = shed
-                if task.refinance_feed:
-                    length += 2  # PASS, PICKUP
-                    length += abs(current[0] - task.position[0]) + abs(current[1] - task.position[1])
-                    length += 2  # FEED, CARE
-                    current = task.position
-                remaining_needs = sum(
-                    (later.needs for later in bucket[task_index + 1:]), Counter()
-                )
-                if remaining_needs:
-                    shed = nearest_shed(current, shed_access)
-                    length += abs(current[0] - shed[0]) + abs(current[1] - shed[1])
-                    length += sum(1 for amount in remaining_needs.values() if amount)
-                    current = shed
-        return length
+        return len(_task_queue(start, bucket, shed_access)[0])
 
     # Visit nearby work first within each priority class. The previous
     # action-length ordering put long/far tasks at the front (notably the
     # top rows of NW), so a worker crossed the farm and then doubled back to
     # perform work beside the shed. Distance is measured from the closest
-    # real worker start; `_pack` then preserves this order in each bucket.
+    # real worker start; insertion then optimizes each worker's own route.
     ordered = sorted(
         tasks,
         key=lambda task: (
@@ -134,6 +138,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
         ),
     )
     unassigned = []
+    lengths = [0] * len(worker_starts)
     for task in ordered:
         candidates = []
         for worker, bucket in enumerate(buckets):
@@ -159,14 +164,22 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
                     for index in range(len(candidate) - 1)
                 ):
                     continue
-                candidates.append(
-                    (work_length(worker_starts[worker], candidate), worker, insertion)
-                )
+                projected = work_length(worker_starts[worker], candidate)
+                if projected <= budgets[worker]:
+                    # Time-sensitive work must finish early for survival,
+                    # crop expiry and same-day sales. For ordinary work,
+                    # minimize extra travel and pickups instead.
+                    time_sensitive = (
+                        task.urgent or task.animal_harvest
+                        or task.deadline is not None or task.immediate_drop
+                    )
+                    cost = projected if time_sensitive else projected - lengths[worker]
+                    candidates.append((cost, projected, worker, insertion))
         candidates.sort()
-        for projected, worker, insertion in candidates:
-            if projected <= budgets[worker]:
-                buckets[worker].insert(insertion, task)
-                break
+        for _, projected, worker, insertion in candidates:
+            buckets[worker].insert(insertion, task)
+            lengths[worker] = projected
+            break
         else:
             unassigned.append(task)
     return buckets, unassigned
@@ -222,8 +235,12 @@ def build_queues(
     shed_access=SHED_ACCESS,
     pending_hand_budget=HAND_BUDGET,
     existing_hand_budget=None,
+    worker_budgets=None,
 ):
     """Assign tasks to farmer + hand_count hands and lay out each one's route.
+
+    `worker_budgets` overrides all budgets when appending work after existing
+    queues: each worker can have a different number of turns left.
 
     A worker returns to the shed to DROP mid-day only if it both carries a
     sellable item *and* has spare turns left after its assigned tasks --
@@ -258,6 +275,10 @@ def build_queues(
     budgets = [farmer_budget]
     budgets += [existing_budget] * min(hand_count, len(hand_starts))
     budgets += [pending_hand_budget] * max(0, hand_count - len(hand_starts))
+    if worker_budgets is not None:
+        if len(worker_budgets) != len(starts):
+            raise ValueError("worker_budgets must contain one budget per worker")
+        budgets = list(worker_budgets)
     buckets, unassigned = _pack(tasks, starts, budgets, shed_access)
 
     plans = []
@@ -265,37 +286,8 @@ def build_queues(
         if not bucket:
             plans.append(WorkerPlan(start, []))
             continue
-        needs = sum((task.needs for task in bucket), Counter())
+        queue, current = _task_queue(start, bucket, shed_access)
         carries_sellable = any(task.sells and not task.immediate_drop for task in bucket)
-        queue, current = [], start
-        if needs:
-            shed = nearest_shed(current, shed_access)
-            queue += route(current, shed)
-            queue += [["PICKUP", item, amount] for item, amount in needs.items() if amount]
-            current = shed
-        for task_index, task in enumerate(bucket):
-            queue += route(current, task.position) + task.actions
-            current = task.position
-            if task.immediate_drop:
-                shed = nearest_shed(current, shed_access)
-                queue += route(current, shed) + [["DROP"]]
-                current = shed
-                if task.refinance_feed:
-                    queue += [["PASS"], ["PICKUP", "WHEAT", 1]]
-                    queue += route(current, task.position) + [["FEED"], ["CARE"]]
-                    current = task.position
-                remaining_needs = sum(
-                    (later.needs for later in bucket[task_index + 1:]), Counter()
-                )
-                if remaining_needs:
-                    shed = nearest_shed(current, shed_access)
-                    queue += route(current, shed)
-                    queue += [
-                        ["PICKUP", item, amount]
-                        for item, amount in remaining_needs.items()
-                        if amount
-                    ]
-                    current = shed
         if carries_sellable:
             shed = nearest_shed(current, shed_access)
             trip_home = route(current, shed) + [["DROP"]]

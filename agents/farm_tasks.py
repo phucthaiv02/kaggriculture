@@ -122,6 +122,18 @@ def build_tasks(
 
     for position, target in targets.items():
         if target is None:
+            # An idle target must not abandon already-grown output or buy a
+            # fallback seed just to trigger a harvest.
+            x, y = position
+            tile = farm["tiles"][y][x]
+            if isinstance(tile, dict) and tile.get("kind") == "PLANT":
+                crop = tile["crop"]
+                if tile.get("yield_units", 0) > 0:
+                    actions = [] if tile.get("watered_today") else [["WATER"]]
+                    tasks.append(Task(position, actions + [["HARVEST"]], urgent=True,
+                                      sells=Counter({crop: tile["yield_units"]})))
+                elif cycle_finished(crop, day - tile["planted_day"], tile):
+                    tasks.append(Task(position, [["DIG"]], ends_cycle=True))
             continue
         name, fertilize_commit = target
         x, y = position
@@ -161,7 +173,9 @@ def build_tasks(
                 actions.append(["FEED"])
                 if care_today:
                     actions.append(["CARE"])
-            elif feed_today and tile.get("fertilizer_available"):
+            elif feed_today and tile.get("fertilizer_available") and (
+                prioritize_fertilizer_drop or farm.get("money", 0) < prices["WHEAT"]
+            ):
                 # No feed on hand: collect the fertilizer, but do not force
                 # an immediate SHED trip. It will be dropped after the
                 # worker's route if that fits, otherwise automatically at
@@ -265,6 +279,9 @@ def build_tasks(
                     needs += new_needs
 
         elif name in ANIMALS:
+            if (isinstance(tile, dict) and tile.get("kind") in ("COOP", "PASTURE")
+                    and tile["kind"] != ANIMAL_STRUCTURE[name]):
+                continue  # A stale target cannot convert a permanent structure.
             available = animals_left[name] if name in ANIMALS else 0
             already_built = isinstance(tile, dict) and tile.get("kind") == ANIMAL_STRUCTURE[name]
             new_actions, new_needs = _new_planting_actions(
@@ -279,7 +296,9 @@ def build_tasks(
                 actions += new_actions
                 needs += new_needs
 
-        elif name in CROPS and seeds_left[name]:
+        elif name in CROPS and seeds_left[name] and not (
+            isinstance(tile, dict) and tile.get("kind") in ("COOP", "PASTURE")
+        ):
             new_actions, new_needs = _new_planting_actions(
                 name, fertilize_commit, seeds_left[name], 0, 0, isinstance(tile, dict),
             )
@@ -458,7 +477,8 @@ def purchase_orders(
 
     def wheat_cost(quantity, offset=0):
         return sum(
-            market_price("WHEAT", max(0, wheat_inventory - offset - unit))
+            market_price("WHEAT", wheat_inventory - offset - unit - 1,
+                         obs["market"].get("params"))
             for unit in range(quantity)
         )
 
