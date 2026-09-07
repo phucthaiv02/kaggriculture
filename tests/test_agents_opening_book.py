@@ -1,4 +1,4 @@
-"""Isolated tests for agents/opening_book.py -- no environment, hand-built obs."""
+"""Isolated tests for agents/opening_book.py using hand-built observations."""
 
 from collections import Counter
 
@@ -12,6 +12,7 @@ from agents.opening_book import (
     should_buy_land_on_schedule,
 )
 
+
 NW_POSITIONS = [(x, y) for y in range(5) for x in range(5)]
 
 
@@ -23,15 +24,24 @@ def make_obs(day, tiles=()):
     return {"day": day, "player": 0, "farms": [farm, farm]}
 
 
-def wheat_tile(planted_day, day, yield_units=None):
+def wheat_tile(planted_day, yield_units=1):
     return {
-        "kind": "PLANT", "crop": "WHEAT", "planted_day": planted_day,
-        "yield_units": (1 if yield_units is None else yield_units), "watered_today": True,
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "planted_day": planted_day,
+        "yield_units": yield_units,
+        "watered_today": True,
     }
 
 
-def melon_tile(planted_day, day, yield_units=0):
-    return {"kind": "PLANT", "crop": "MELON", "planted_day": planted_day, "yield_units": yield_units, "watered_today": True}
+def melon_tile(planted_day, yield_units=0):
+    return {
+        "kind": "PLANT",
+        "crop": "MELON",
+        "planted_day": planted_day,
+        "yield_units": yield_units,
+        "watered_today": True,
+    }
 
 
 def test_build_opening_targets_matches_counts_and_fills_the_board():
@@ -72,9 +82,13 @@ def test_still_governs_while_melon_is_growing():
     governs = make_opening_controller()
     targets = {}
     governs(make_obs(day=0), targets, NW_POSITIONS)
-    melon_position = next(p for p, v in targets.items() if v[0] == "MELON")
-    x, y = melon_position
-    obs = make_obs(day=5, tiles={melon_position: melon_tile(planted_day=0, day=5, yield_units=0)})
+    melon_position = next(
+        position for position, target in targets.items() if target[0] == "MELON"
+    )
+    obs = make_obs(
+        day=5,
+        tiles={melon_position: melon_tile(planted_day=0, yield_units=0)},
+    )
     assert governs(obs, targets, NW_POSITIONS) is True
 
 
@@ -102,10 +116,17 @@ def test_disappearing_melon_does_not_end_six_day_opening_early():
     governs = make_opening_controller()
     targets = {}
     governs(make_obs(day=0), targets, NW_POSITIONS)
-    melon_position = next(p for p, v in targets.items() if v[0] == "MELON")
-    assert governs(
-        make_obs(day=1, tiles={melon_position: melon_tile(0, 1, 1)}), targets, NW_POSITIONS
-    ) is True
+    melon_position = next(
+        position for position, target in targets.items() if target[0] == "MELON"
+    )
+    assert (
+        governs(
+            make_obs(day=1, tiles={melon_position: melon_tile(0, 1)}),
+            targets,
+            NW_POSITIONS,
+        )
+        is True
+    )
     assert governs(make_obs(day=2), targets, NW_POSITIONS) is True
 
 
@@ -120,22 +141,30 @@ def test_converts_two_wheat_targets_to_one_cow_and_one_sheep_together_on_day_two
     governs = make_opening_controller()
     targets = {}
     governs(make_obs(day=0), targets, NW_POSITIONS)
-    wheat_positions = [p for p, value in targets.items() if value[0] == "WHEAT"]
-    melon_position = next(p for p, v in targets.items() if v[0] == "MELON")
+    wheat_positions = [
+        position for position, target in targets.items() if target[0] == "WHEAT"
+    ]
+    melon_position = next(
+        position for position, target in targets.items() if target[0] == "MELON"
+    )
     closest_wheat = sorted(
         wheat_positions,
-        key=lambda p: (abs(p[0] - 4) + abs(p[1] - 4), -p[1], -p[0]),
+        key=lambda position: (
+            abs(position[0] - 4) + abs(position[1] - 4),
+            -position[1],
+            -position[0],
+        ),
     )
     growing = {
-        melon_position: melon_tile(0, 1, 1),
-        closest_wheat[0]: wheat_tile(0, 1),
-        closest_wheat[1]: wheat_tile(0, 1),
+        melon_position: melon_tile(0, 1),
+        closest_wheat[0]: wheat_tile(0),
+        closest_wheat[1]: wheat_tile(0),
     }
 
     assert governs(make_obs(1, growing), targets, NW_POSITIONS) is True
     assert Counter(value[0] for value in targets.values()) == Counter(OPENING_COUNTS)
 
-    growing[melon_position] = melon_tile(0, 2, 1)
+    growing[melon_position] = melon_tile(0, 1)
     assert governs(make_obs(2, growing), targets, NW_POSITIONS) is True
     assert targets[closest_wheat[0]][0] == "COW"
     assert targets[closest_wheat[1]][0] == "SHEEP"
@@ -143,7 +172,7 @@ def test_converts_two_wheat_targets_to_one_cow_and_one_sheep_together_on_day_two
         {"MELON": 12, "WHEAT": 7, "COW": 3, "SHEEP": 3}
     )
 
-    growing[melon_position] = melon_tile(0, 3, 1)
+    growing[melon_position] = melon_tile(0, 1)
     assert governs(make_obs(3, growing), targets, NW_POSITIONS) is True
     assert targets[closest_wheat[0]][0] == "COW"
     assert targets[closest_wheat[1]][0] == "SHEEP"
@@ -153,24 +182,16 @@ def test_conversion_waits_until_a_real_wheat_crop_can_be_harvested():
     governs = make_opening_controller()
     targets = {}
     governs(make_obs(day=0), targets, NW_POSITIONS)
-    melon_position = next(p for p, value in targets.items() if value[0] == "MELON")
+    melon_position = next(
+        position for position, target in targets.items() if target[0] == "MELON"
+    )
 
-    assert governs(
-        make_obs(day=1, tiles={melon_position: melon_tile(0, 1, 1)}), targets, NW_POSITIONS
-    ) is True
+    assert (
+        governs(
+            make_obs(day=1, tiles={melon_position: melon_tile(0, 1)}),
+            targets,
+            NW_POSITIONS,
+        )
+        is True
+    )
     assert Counter(value[0] for value in targets.values()) == Counter(OPENING_COUNTS)
-
-
-if __name__ == "__main__":
-    import sys
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"FAIL {name}: {exc}")
-    print(f"{'ALL PASSED' if not failures else f'{failures} FAILED'}")
-    sys.exit(1 if failures else 0)
