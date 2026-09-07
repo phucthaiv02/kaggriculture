@@ -154,23 +154,9 @@ def test_should_buy_land_ignores_a_target_decision_with_nothing_actually_planted
     assert should_buy_land(farm, positions) is False
 
 
-if __name__ == "__main__":
-    import sys
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"FAIL {name}: {exc}")
-    print(f"{'ALL PASSED' if not failures else f'{failures} FAILED'}")
-    sys.exit(1 if failures else 0)
-
-
 def test_finished_wheat_has_no_fallback_when_no_profitable_cycle_fits():
     from agents.farm_tasks import build_tasks
+
     tile = {"kind": "PLANT", "crop": "WHEAT", "planted_day": 25,
             "yield_units": 4, "watered_today": True}
     obs = make_obs(day=29, tiles={(0, 0): tile})
