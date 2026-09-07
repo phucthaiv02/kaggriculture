@@ -49,25 +49,30 @@ pytest -q
 Run experiment scripts as modules from the repository root so local packages
 resolve consistently.
 
-Render a deterministic replay of the production agent:
+Play the production agent and save an HTML replay plus JSON match data:
 
 ```bash
-python -m experiments.render_opening_book
+# Passive opponent (default)
+python -m experiments.play_match
+
+# Built-in random opponent
+python -m experiments.play_match --opponent random
+
+# Python-file opponent
+python -m experiments.play_match --opponent path/to/agent.py
+
+# Agent embedded in a notebook's %%writefile main.py cell
+python -m experiments.play_match --opponent path/to/notebook.ipynb
 ```
 
-The replay is written under `replays/`.
+The production agent always runs as player 0. Match outputs are written under
+`replays/` by default.
 
 Validate the crop and animal maintenance schedules:
 
 ```bash
 python -m experiments.crop_schedules
 python -m experiments.animal_yields
-```
-
-Compare the current agent with an agent embedded in a Kaggle notebook:
-
-```bash
-python -m experiments.play_public_solution path/to/notebook.ipynb
 ```
 
 Run the larger economics analyses when needed:
