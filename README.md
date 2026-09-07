@@ -1,56 +1,89 @@
 # Kaggriculture Agent
 
-Strategy agents, experiments, and tests for the Kaggle **Kaggriculture** farming simulation.
+Strategy agents, experiments, and regression tests for Kaggle's
+**Kaggriculture** farming simulation.
 
-The goal is to build an agent that manages crops, animals, labor, land expansion, and market orders to maximize end-of-season cash.
+The production agent manages crops, animals, labor, land expansion, and market
+orders to maximize end-of-season cash.
 
 ## Repository layout
 
-- `agents/` — production agent logic: planning, scheduling, forecasting, labor, selling, and farm tasks.
-- `experiments/` — simulations and analysis scripts used to validate strategies and economics.
-- `tests/` — regression and integration tests for the agent logic.
+- `agents/` — production planning, scheduling, forecasting, labor, selling,
+  and farm-task logic.
+- `experiments/` — executable checks and analysis scripts for strategy and
+  game economics.
+- `tests/` — regression and integration tests for production behavior.
 - `docs/README.md` — detailed game rules and mechanics.
 - `docs/AGENTS.md` — agent API, local-running notes, and replay/log commands.
-- `replays/` — local/downloaded replay artifacts; intentionally not tracked by Git.
+- `replays/` — local replay artifacts created by experiments or Kaggle tools;
+  intentionally ignored by Git.
 
 ## Setup
 
-Create a virtual environment and install the runtime dependencies:
+Create a virtual environment and install Kaggriculture plus the test runner:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -r requirements.txt
+python -m pip install -U kaggle-environments pytest
 ```
 
-For development and tests:
+Some standalone analysis scripts also use NumPy or Matplotlib:
 
 ```bash
-python -m pip install -r requirements-dev.txt
+python -m pip install -U numpy matplotlib
 ```
 
-> On Windows, activate the environment with `.venv\\Scripts\\activate`.
+On Windows, activate the environment with `.venv\Scripts\activate`.
 
-## Run the tests
+## Tests
+
+Run the regression suite from the repository root:
 
 ```bash
 pytest -q
 ```
 
-## Try a local simulation
+## Useful experiments
 
-For example, render the opening-book strategy to an HTML replay:
+Run experiment scripts as modules from the repository root so local packages
+resolve consistently.
+
+Render a deterministic replay of the production agent:
 
 ```bash
-python experiments/render_opening_book.py
+python -m experiments.render_opening_book
 ```
 
-Generated replay/analysis HTML files and downloaded replay JSON files are ignored by Git so local experiments do not bloat the repository.
+The replay is written under `replays/`.
+
+Validate the crop and animal maintenance schedules:
+
+```bash
+python -m experiments.crop_schedules
+python -m experiments.animal_yields
+```
+
+Compare the current agent with an agent embedded in a Kaggle notebook:
+
+```bash
+python -m experiments.play_public_solution path/to/notebook.ipynb
+```
+
+Run the larger economics analyses when needed:
+
+```bash
+python -m experiments.hands_by_producer
+python -m experiments.shop_price_monte_carlo
+```
+
+Generated replay and analysis artifacts are ignored so experiments do not
+accidentally bloat the repository.
 
 ## Documentation
 
-Start with [`docs/README.md`](docs/README.md) for the game mechanics, then see [`docs/AGENTS.md`](docs/AGENTS.md) for the agent interface and Kaggle tooling.
+Start with [`docs/README.md`](docs/README.md) for game mechanics, then see
+[`docs/AGENTS.md`](docs/AGENTS.md) for the agent interface and Kaggle tooling.
 
 ## License
 
