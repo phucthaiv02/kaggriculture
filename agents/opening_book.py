@@ -1,13 +1,10 @@
-"""Hand-specified opening allocation for NW, used instead of the ROI planner
-(agents/planner.py) until the first land purchase succeeds.
+"""Fixed opening allocation for the initial NW quadrant.
 
-Mirrors why day16_allocation.py's fixed-genome policies (e.g. the historical
-"2 COW, 12 MELON, 2 SHEEP, 9 WHEAT" opening) outperformed anything the
-from-scratch ROI planner found on its own for a 25-tile board in isolated
-testing: commit to a known-good starting allocation and a known-good early
-cash-flow sequence (sell FERTILIZER to fund feed), then hand off to
-price-reactive planning once another quadrant unlocks. New land and every
-later replant decision goes through the dynamic planner from that point on.
+The opening book is used instead of the ROI planner until the first land
+purchase succeeds. Isolated 25-tile tests consistently favored this fixed
+allocation and its early cash-flow sequence over planning from scratch. Once
+another quadrant unlocks, all new land and later replant decisions hand off to
+the price-reactive planner in ``agents/planner.py``.
 """
 
 from __future__ import annotations
@@ -52,9 +49,11 @@ def should_buy_land_on_schedule(obs, farm):
 
 
 def build_opening_targets(positions):
-    """The fixed day-0 allocation for exactly `positions` (must be NW's 25
-    tiles). Fertilize is never committed here -- selling FERTILIZER outright
-    for the day-2 cash-flow trick is the point, not spending it on crops."""
+    """Return the fixed day-0 allocation for the initial 25 active tiles.
+
+    The opening deliberately does not commit fertilizer; early fertilizer is
+    sold to support the initial cash-flow plan.
+    """
     if len(positions) != OPENING_SIZE:
         raise ValueError(
             f"opening book requires exactly {OPENING_SIZE} active positions, got {len(positions)}"
@@ -67,15 +66,16 @@ def build_opening_targets(positions):
 
 
 def make_opening_controller():
-    """Returns a callable `governs(obs, targets, active_positions) -> bool`
-    that applies the opening book in place on `targets` for as long as it
-    should still be in charge (True -- the caller should skip the dynamic
-    planner that call), or hands off permanently once the first additional
-    quadrant is unlocked (False from then on)."""
+    """Create the stateful opening-book controller.
+
+    The returned callable mutates ``targets`` while the opening book governs
+    the farm and returns ``True`` so the caller skips the dynamic planner.
+    Once the first additional quadrant unlocks, it returns ``False``
+    permanently.
+    """
     book = {
         "applied": False,
         "handed_off": False,
-        "melon_positions": (),
         "wheat_positions": (),
         "next_conversion": 0,
     }
@@ -95,19 +95,20 @@ def make_opening_controller():
         if not book["applied"]:
             opening = build_opening_targets(active_positions)
             targets.update(opening)
-            book["melon_positions"] = tuple(p for p, v in opening.items() if v[0] == "MELON")
             # Converted animals produce every few days (and fertilizer every
             # day), so keep their recurring HARVEST/COLLECT/DROP route short.
-            # `active_positions` is row-major; taking its first WHEAT entries
-            # would unnecessarily turn the farther northern tiles into pens.
             shed = (len(tiles[0]) // 2 - 1, len(tiles) // 2 - 1)
             book["wheat_positions"] = tuple(
                 sorted(
-                    (p for p, v in opening.items() if v[0] == "WHEAT"),
-                    key=lambda p: (
-                        abs(p[0] - shed[0]) + abs(p[1] - shed[1]),
-                        -p[1],
-                        -p[0],
+                    (
+                        position
+                        for position, target in opening.items()
+                        if target[0] == "WHEAT"
+                    ),
+                    key=lambda position: (
+                        abs(position[0] - shed[0]) + abs(position[1] - shed[1]),
+                        -position[1],
+                        -position[0],
                     ),
                 )
             )
