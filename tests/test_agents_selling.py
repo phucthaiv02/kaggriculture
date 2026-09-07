@@ -38,24 +38,23 @@ def test_ignores_non_sellable_items_like_seeds_or_animals():
     assert orders == []
 
 
-if __name__ == "__main__":
-    import sys
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"FAIL {name}: {exc}")
-    print(f"{'ALL PASSED' if not failures else f'{failures} FAILED'}")
-    sys.exit(1 if failures else 0)
-
-
 def test_surplus_sales_keep_two_days_of_animal_feed():
     obs = make_obs({"WHEAT": 10})
-    obs.update(day=4, player=0, farms=[{'tiles': [[{
-        'animal': 'SHEEP', 'placed_day': 0, 'fed_today': False,
-    }]]}])
+    obs.update(
+        day=4,
+        player=0,
+        farms=[
+            {
+                "tiles": [
+                    [
+                        {
+                            "animal": "SHEEP",
+                            "placed_day": 0,
+                            "fed_today": False,
+                        }
+                    ]
+                ]
+            }
+        ],
+    )
     assert sell_orders(obs, {}) == [["SELL", "WHEAT", 8]]
