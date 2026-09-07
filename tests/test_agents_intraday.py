@@ -80,7 +80,7 @@ def test_land_bought_midday_gets_targets_and_production_before_next_dawn():
     from kaggle_environments import make
     from agents.expansion_agent import make_agent
     from experiments.crop_schedules import pass_agent
-    from experiments.render_opening_book import configuration
+    from experiments.play_match import configuration
 
     config = configuration(1)
     config.update(episodeSteps=25, startingMoney=50000)
