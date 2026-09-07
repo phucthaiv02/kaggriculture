@@ -7,6 +7,7 @@ __pycache__/
 .mypy_cache/
 .pytype/
 .hypothesis/
+.cache/
 
 # Coverage and test artifacts
 .coverage
@@ -14,14 +15,17 @@ __pycache__/
 htmlcov/
 coverage.xml
 
-# Virtual environments and local config
+# Virtual environments and local/secrets config
 .venv/
 venv/
 env/
 ENV/
 .env
 .env.*
+.envrc
 !.env.example
+.pypirc
+.streamlit/secrets.toml
 
 # Packaging/build output
 build/
@@ -36,6 +40,7 @@ dist/
 .DS_Store
 Thumbs.db
 *.log
+*.sqlite3
 
 # Project-generated simulation artifacts
 replays/
