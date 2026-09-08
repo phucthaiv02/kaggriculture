@@ -8,16 +8,12 @@ def ripe_wheat(position):
     return Task(
         position,
         [["WATER"], ["HARVEST"], ["PLANT", "WHEAT"], ["WATER"]],
-        needs=Counter({"WHEAT": 1}),
         urgent=True,
         ends_cycle=True,
     )
 
 
 def test_ripe_wheat_wall_packs_every_harvest_before_replant_tails():
-    # From (4, 4), visiting these four top-row tiles costs 8 movement steps.
-    # WATER+HARVEST for all four is another 8 steps and fits a 16-turn budget
-    # exactly. The replacement tails must therefore be dropped, not harvests.
     tasks = [ripe_wheat((x, 0)) for x in range(4)]
 
     hands, dropped = hands_needed(tasks, (4, 4), max_hands=0)
@@ -35,17 +31,32 @@ def test_ripe_wheat_wall_packs_every_harvest_before_replant_tails():
     assert ["PLANT", "WHEAT"] not in plans[0].queue
 
 
-def test_safe_replant_tail_is_restored_when_worker_has_budget():
-    task = ripe_wheat((4, 4))
+def test_retryable_replants_are_only_postlude_after_all_harvests():
+    tasks = [ripe_wheat((4, 4)), ripe_wheat((4, 3))]
     plans, unassigned = build_queues(
-        [task],
+        tasks,
         (4, 4),
         0,
-        worker_budgets=[5],
+        worker_budgets=[23],
+    )
+    assert unassigned == []
+    queue = plans[0].queue
+    harvest_indices = [index for index, op in enumerate(queue) if op == ["HARVEST"]]
+    plant_indices = [index for index, op in enumerate(queue) if op == ["PLANT", "WHEAT"]]
+    assert len(harvest_indices) == 2
+    assert plant_indices
+    assert max(harvest_indices) < min(plant_indices)
+
+
+def test_safe_single_replant_tail_uses_spare_budget_after_harvest():
+    plans, unassigned = build_queues(
+        [ripe_wheat((4, 4))],
+        (4, 4),
+        0,
+        worker_budgets=[4],
     )
     assert unassigned == []
     assert plans[0].queue == [
-        ["PICKUP", "WHEAT", 1],
         ["WATER"],
         ["HARVEST"],
         ["PLANT", "WHEAT"],
