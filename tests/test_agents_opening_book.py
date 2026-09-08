@@ -6,6 +6,9 @@ import pytest
 
 from agents.opening_book import (
     LAND_BUY_DAYS,
+    LAND_FIRST_DAY,
+    LAND_INTERVAL_DAYS,
+    LAND_MAX_EXTRA,
     OPENING_COUNTS,
     build_opening_targets,
     make_opening_controller,
@@ -56,13 +59,30 @@ def test_opening_uses_requested_portfolio():
     assert OPENING_COUNTS == {"MELON": 12, "WHEAT": 9, "COW": 2, "SHEEP": 2}
 
 
-def test_debug_land_purchase_is_only_on_day_seven():
+def test_land_purchase_uses_state_derived_days_six_and_nine():
+    assert LAND_FIRST_DAY == 6
+    assert LAND_INTERVAL_DAYS == 3
+    assert LAND_MAX_EXTRA == 2
+    assert LAND_BUY_DAYS == (6, 9)
+
     farm = {"unlocked_quadrants": ["NW"]}
-    assert LAND_BUY_DAYS == (7,)
-    assert should_buy_land_on_schedule({"day": 6, "hour": 0}, farm) is False
+    assert should_buy_land_on_schedule({"day": 5, "hour": 0}, farm) is False
+    assert should_buy_land_on_schedule({"day": 6, "hour": 0}, farm) is True
+    assert should_buy_land_on_schedule({"day": 6, "hour": 1}, farm) is False
+
+    one_extra = {"unlocked_quadrants": ["NW", "NE"]}
+    assert should_buy_land_on_schedule({"day": 8, "hour": 0}, one_extra) is False
+    assert should_buy_land_on_schedule({"day": 9, "hour": 0}, one_extra) is True
+
+    two_extra = {"unlocked_quadrants": ["NW", "NE", "SW"]}
+    assert should_buy_land_on_schedule({"day": 9, "hour": 0}, two_extra) is False
+
+
+def test_unfunded_land_order_retries_until_unlock_count_changes():
+    farm = {"unlocked_quadrants": ["NW"]}
+    assert should_buy_land_on_schedule({"day": 6, "hour": 0}, farm) is True
     assert should_buy_land_on_schedule({"day": 7, "hour": 0}, farm) is True
-    assert should_buy_land_on_schedule({"day": 7, "hour": 1}, farm) is False
-    assert should_buy_land_on_schedule({"day": 8, "hour": 0}, farm) is False
+    assert should_buy_land_on_schedule({"day": 8, "hour": 0}, farm) is True
 
 
 def test_build_opening_targets_rejects_wrong_board_size():
@@ -96,7 +116,7 @@ def test_hands_off_when_first_extra_quadrant_unlocks():
     governs = make_opening_controller()
     targets = {}
     governs(make_obs(day=0), targets, NW_POSITIONS)
-    obs = make_obs(day=7)
+    obs = make_obs(day=6)
     obs["farms"][0]["unlocked_quadrants"] = ["NW", "NE"]
     assert governs(obs, targets, NW_POSITIONS) is False
 
@@ -106,7 +126,7 @@ def test_land_purchase_handoff_is_permanent():
     targets = {}
 
     governs(make_obs(day=0), targets, NW_POSITIONS)
-    bought = make_obs(day=7)
+    bought = make_obs(day=6)
     bought["farms"][0]["unlocked_quadrants"] = ["NW", "NE"]
     assert governs(bought, targets, NW_POSITIONS) is False
     assert governs(make_obs(day=8), targets, NW_POSITIONS) is False
