@@ -8,20 +8,20 @@ SEASON_END_DAY = 29  # Inclusive day index in a 30-day game.
 TARGET_HORIZON_DAYS = 16
 
 # Fresh-target comparison windows. Crops stop at their max-yield age. Animals
-# stop after the requested number of post-first-yield harvests under the
-# planner's harvest-as-soon-as-ready forecast:
-#   GOOSE: age 4 + six more harvests -> age 15
-#   COW:   age 8 + three more harvests -> age 14
-#   SHEEP: age 6 + two more harvests -> age 12
+# stop at their first harvest, so profit/day compares the time needed to get
+# the initial return rather than bundling later repeat harvests into the score:
+#   GOOSE: first harvest at age 4
+#   SHEEP: first harvest at age 6
+#   COW:   first harvest at age 8
 PLANNER_HORIZON_DAYS = {
     "WHEAT": 4,
     "CARROT": 3,
     "MELON": 10,
     "TOMATO": 11,
     "STRAWBERRY": 16,
-    "GOOSE": 15,
-    "COW": 14,
-    "SHEEP": 12,
+    "GOOSE": 4,
+    "COW": 8,
+    "SHEEP": 6,
 }
 
 
