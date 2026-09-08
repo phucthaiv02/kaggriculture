@@ -1,4 +1,4 @@
-"""Choose the highest marginal net profit after forecast market slippage."""
+"""Choose the highest marginal net profit/day after forecast market slippage."""
 from collections import Counter
 from copy import copy
 from dataclasses import dataclass
@@ -9,7 +9,8 @@ from agents.forecast import MarketForecast, Production, production
 from agents.labor import LaborForecast
 from agents.schedules import CROP_LAST_AGE, ONGOING_CROPS, cycle_finished
 from agents.horizon import (
-    SEASON_END_DAY, TARGET_HORIZON_DAYS, cycle_end as _cycle_end,
+    SEASON_END_DAY, cycle_end as _cycle_end,
+    planner_cycle_end as _planner_cycle_end,
     first_yield_age as _first_yield_age, can_start,
 )
 
@@ -54,6 +55,7 @@ def _rotation(name, fertilize, day, end_day, tile=None):
 
 
 def _candidates(day, end_day):
+    """Legacy shared-window candidates retained for experiments/tests."""
     end_day = _cycle_end(day, end_day)
     for name in sorted((*CROPS, *ANIMALS)):
         first = _first_yield_age(name)
@@ -64,6 +66,18 @@ def _candidates(day, end_day):
             yield (name, fertilize), output, cost
 
 
+def _daily_candidates(day, end_day):
+    """Fresh targets projected only through their own comparison horizon."""
+    for name in sorted((*CROPS, *ANIMALS)):
+        target_end = _planner_cycle_end(name, day, end_day)
+        first = _first_yield_age(name)
+        if day + first > target_end:
+            continue
+        for fertilize in ((False, True) if name in CROPS else (False,)):
+            output, cost = _rotation(name, fertilize, day, target_end)
+            yield (name, fertilize), output, cost
+
+
 @dataclass(frozen=True)
 class TargetProfit:
     choice: tuple
@@ -71,22 +85,22 @@ class TargetProfit:
     market_cash: float
     capital_cost: float
     labor_cost: float
+    days: int = 1
 
     @property
     def profit(self):
-        """Single-cycle added cash, never divided by days, cost or tile share."""
         return self.market_cash - self.capital_cost - self.labor_cost
+
+    @property
+    def profit_per_day(self):
+        return self.profit / max(1, self.days)
 
 
 def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
-    """Compare every target over the same min(16, remaining days) horizon.
+    """Compare every target over the legacy shared min(16, remaining) window.
 
-    market_cash = change in all sales less feed/fertilizer purchases, after
-    per-unit slippage, existing production and SHOP/TOWN demand.
-    capital_cost = all seeds in the window or one animal purchase.
-    labor_cost = additional daily worker cost over the same horizon. A target
-    that cannot fit inside the maximum worker capacity receives infinite labor
-    cost and is therefore rejected by _choose.
+    This path remains available to the analysis helpers and regression tests.
+    Live planner allocation uses ``evaluate_daily_targets`` below.
     """
     labor = labor or LaborForecast()
     results = []
@@ -122,12 +136,65 @@ def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
                 labor.marginal_cost(
                     scoped_baseline, output, position, baseline_cost
                 ),
+                max(1, end - market.day),
+            )
+        )
+    return results
+
+
+def evaluate_daily_targets(market, baseline, candidates, labor=None, position=(4, 4)):
+    """Evaluate fresh targets on per-type horizons and normalize by elapsed day.
+
+    Crops are scoped to their max-yield age. Animal windows are GOOSE=15,
+    COW=14 and SHEEP=12 elapsed days, corresponding to first yield plus the
+    requested six/three/two additional harvests. Near season end the window is
+    truncated to the last playable day, but a target still must reach at least
+    its first yield.
+    """
+    labor = labor or LaborForecast()
+    results = []
+
+    def scoped(flow, end):
+        result = Production()
+        for field in ("sales", "inputs", "visits"):
+            getattr(result, field).update(
+                (d, value)
+                for d, value in getattr(flow, field).items()
+                if market.day <= d <= end
+            )
+        return result
+
+    for choice, output, cost in candidates:
+        name = choice[0]
+        end = _planner_cycle_end(name, market.day, market.end_day)
+        if market.day + _first_yield_age(name) > end:
+            continue
+
+        scoped_market = copy(market)
+        scoped_market.end_day = end
+        scoped_baseline = scoped(baseline, end)
+        scoped_output = scoped(output, end)
+        baseline_cost = labor.cost(scoped_baseline.visits)
+        baseline_value = scoped_market.value(scoped_baseline)
+        results.append(
+            TargetProfit(
+                choice,
+                scoped_output,
+                scoped_market.marginal_profit(
+                    scoped_baseline, scoped_output, 0, baseline_value
+                ),
+                cost,
+                labor.marginal_cost(
+                    scoped_baseline, scoped_output, position, baseline_cost
+                ),
+                max(1, end - market.day),
             )
         )
     return results
 
 
 def _choose(market, baseline, candidates, counts, labor=None, position=(4, 4)):
+    """Legacy absolute-profit selector retained for experiments/tests."""
     profitable = [
         result
         for result in evaluate_targets(
@@ -140,6 +207,29 @@ def _choose(market, baseline, candidates, counts, labor=None, position=(4, 4)):
     result = max(
         profitable,
         key=lambda r: (r.profit, -counts[r.choice[0]], r.choice),
+    )
+    return result.choice, result.output
+
+
+def _choose_daily(market, baseline, candidates, counts, labor=None, position=(4, 4)):
+    """Choose the highest positive marginal net profit per elapsed day."""
+    profitable = [
+        result
+        for result in evaluate_daily_targets(
+            market, baseline, candidates, labor, position
+        )
+        if result.profit > 0
+    ]
+    if not profitable:
+        return None, None
+    result = max(
+        profitable,
+        key=lambda r: (
+            r.profit_per_day,
+            r.profit,
+            -counts[r.choice[0]],
+            r.choice,
+        ),
     )
     return result.choice, result.output
 
@@ -162,7 +252,9 @@ def best_target(end_day, day, inventory, wheat_price, committed_units,
     market = MarketForecast(inventory, unlocked_shops, day, end_day)
     baseline = Production()
     baseline.sales[day].update(committed_units)
-    return _choose(market, baseline, list(_candidates(day, end_day)), Counter())[0]
+    return _choose_daily(
+        market, baseline, list(_daily_candidates(day, end_day)), Counter()
+    )[0]
 
 
 def should_buy_land(farm, active_positions):
@@ -193,16 +285,13 @@ def plan_targets(obs, targets, active_positions, end_day):
 
     Existing crops are forecast from their real age, held yield and watering
     state, including visible opponent crops. Unsown choices are reconsidered
-    each day. No profitable candidate means no planting, with harvest-only
-    cleanup handled by build_tasks.
+    each day. Fresh choices use target-specific horizons and are ranked by
+    marginal net profit/day, while shared baseline saturation and route load
+    are updated after every accepted tile.
 
-    V2 used a fixed 17-fresh-target commitment cap. That was a useful safety
-    valve while the route forecast undercounted fresh crop work, but it became
-    stale once the portfolio changed: one worker can start multiple nearby
-    crops, while a distant or input-heavy producer can consume far more route
-    budget. Capacity now comes from LaborForecast itself. Every accepted target
-    enters the shared baseline, and later candidates are rejected naturally if
-    the combined visits cannot fit the farmer plus maximum hands.
+    Capacity comes from LaborForecast itself. Every accepted target enters the
+    shared baseline, and later candidates are rejected naturally if the
+    combined visits cannot fit the farmer plus maximum hands.
     """
     day = obs["day"]
     end_day = _cycle_end(day, end_day)
@@ -290,7 +379,7 @@ def plan_targets(obs, targets, active_positions, end_day):
         obs["market"].get("params"),
         external,
     )
-    candidates = list(_candidates(day, end_day))
+    candidates = list(_daily_candidates(day, end_day))
     shed_access = ((4, 4), (5, 4), (4, 5), (5, 5))
 
     def distance(p):
@@ -306,9 +395,10 @@ def plan_targets(obs, targets, active_positions, end_day):
     ))
 
     # Assign near the shed first so greedy marginal allocation spends route
-    # capacity on cheaper-to-service positions before distant ones. Unlike the
-    # old fixed slot cap, every accepted target changes market saturation and
-    # labor load for the next position.
+    # capacity on cheaper-to-service positions before distant ones. Every
+    # accepted target changes market saturation and labor load for the next
+    # position; the score itself is marginal net profit/day on that target's
+    # own horizon.
     for position in sorted(
         replanning, key=lambda p: (distance(p), p[1], p[0])
     ):
@@ -323,7 +413,7 @@ def plan_targets(obs, targets, active_positions, end_day):
                 and official_game.ANIMALS[c[0][0]]["structure"] == tile["kind"]
             ]
 
-        choice, output = _choose(
+        choice, output = _choose_daily(
             market, baseline, allowed, counts, labor, position
         )
         targets[position] = choice

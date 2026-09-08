@@ -52,9 +52,6 @@ def test_existing_crop_does_not_invent_seed_pickup():
 def test_plan_targets_has_no_fixed_seventeen_commit_plateau(monkeypatch):
     # A fake cheap output isolates the planner's commitment bookkeeping from
     # crop economics. The labor model is assumed to accept every item here.
-    # V2/V3 plateaued after 17 baseline additions even though later desired
-    # targets were still written. V4 must let the baseline grow with every
-    # accepted target and leave capacity decisions to LaborForecast.
     positions = [(x, y) for y in range(4) for x in range(5)]  # 20 fresh tiles
     obs = _obs(active_positions=positions)
     baseline_sizes = []
@@ -65,7 +62,7 @@ def test_plan_targets_has_no_fixed_seventeen_commit_plateau(monkeypatch):
         output.visits[7].append((None, 1, (), False))
         return ("WHEAT", False), output
 
-    monkeypatch.setattr(planner, "_choose", fake_choose)
+    monkeypatch.setattr(planner, "_choose_daily", fake_choose)
     targets = {}
     planner.plan_targets(obs, targets, positions, 29)
 
