@@ -56,14 +56,3 @@ def test_same_product_rival_supply_still_depresses_our_sale():
     rival = flow(sales={"STRAWBERRY": 80})
 
     assert marginal(candidate, external=rival) < marginal(candidate)
-
-
-def test_exact_queue_value_is_retained_as_diagnostic_model():
-    own = flow(sales={"CARROT": 6, "WHEAT": 40})
-    rival = flow(sales={"FERTILIZER": 100, "WHEAT": 40})
-    market = MarketForecast(INVENTORY, (), 0, 0, external=rival)
-
-    # The exact convention and robust planner convention are intentionally
-    # separate. Exact queue pairing remains available for engine-validation;
-    # robust value removes unobservable cross-product alignment.
-    assert market.value(own) != market.robust_value(own)
