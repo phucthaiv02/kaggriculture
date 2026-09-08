@@ -159,24 +159,12 @@ def schedule_open_tiles(obs, targets, plans, shed_access, hire_costs=()):
             break
     eligible.update(selected)
 
-    # If a replacement seed is affordable but not delivered yet, retain the
-    # harvester on its tile only when doing so cannot stall any already-queued
-    # protective work. The executor retries an unavailable PLANT at the front
-    # of the queue; putting that retry ahead of WATER/HARVEST/FEED/CARE is a
-    # hidden unbounded delay and was a major source of late-season crop loss.
-    for index, position in enumerate(positions):
-        target = vacant.get(position)
-        if (
-            position not in funded_positions or not target or target[0] not in CROPS
-            or available["private"]["seeds"].get(target[0], 0) > 0
-            or farm["tiles"][position[1]][position[0]] is not None
-            or _has_pending_protective_work(plans[index].queue)
-            or len(plans[index].queue) + 3 > remaining
-        ):
-            continue
-        plans[index].queue[:0] = [["PLANT", target[0]], ["WATER"]]
-        vacant.pop(position)
-        budgets[index] -= 3
+    # `selected`/`funded_positions` above is purchase intent only. A seed
+    # that is merely affordable is not executable inventory yet: market
+    # orders settle after worker actions. Leave the worker's current queue
+    # untouched; on the next observation the actual delivered seed will be
+    # admitted by the `actual` block below. This keeps speculative PLANT out
+    # of the front of WATER/HARVEST routes.
 
     # Already-owned inputs can be used this turn, including at hour 22.
     actual = [

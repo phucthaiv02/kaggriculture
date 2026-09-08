@@ -515,12 +515,14 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             }
 
         if state["day"] == day and not state["plans"]:
+            # Hour-0 planner purchases have already resolved by hour 1.
+            # Build execution work from inventory that actually reached the
+            # shed; never invent a seed here and make a worker wait on PLANT.
             tasks = build_tasks(
                 obs,
                 targets,
-                assume_crop_seeds=True,
                 prioritize_fertilizer_drop=state["opening_active"],
-            )  # preserve same-day HARVEST -> PLANT while seed arrives mid-day
+            )
             state["deferred_expansion_positions"] = {
                 position for position in state["deferred_expansion_positions"]
                 if not isinstance(farm["tiles"][position[1]][position[0]], dict)
@@ -624,9 +626,14 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             if seeds_available.get(crop, 0) > 0:
                 seeds_available[crop] -= 1
                 continue
+            # A missing seed means the market order did not actually land
+            # (cash/order-cap race, etc.). Do not pin this worker behind a
+            # retrying PLANT: discard the planting attempt and its immediate
+            # crop-care tail so later WATER/HARVEST work can still execute.
             plan = plans[index] if index < len(plans) else None
             if plan is not None:
-                plan.queue.insert(0, operation)
+                while plan.queue and plan.queue[0][0] in ("WATER", "FERTILIZE"):
+                    plan.queue.pop(0)
             worker_ops[index] = ["PASS"]
         farmer_op, hand_ops = worker_ops[0], worker_ops[1:]
 
