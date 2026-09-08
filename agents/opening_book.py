@@ -1,10 +1,10 @@
-"""Short fixed opening followed by the ROI planner.
+"""Fixed opening allocation for the initial NW quadrant.
 
-The opening book only creates the initial cash-flow/animal base.  It governs
-through day 2 so the two WHEAT -> COW/SHEEP conversions can happen, then hands
-off to ``agents/planner.py`` from day 3 onward.  Land expansion is independent
-of that handoff: buy attempts are derived from the number of already unlocked
-quadrants, targeting the first two extra quadrants on days 6 and 9.
+The opening book is used instead of the ROI planner until the first land
+purchase succeeds. Isolated 25-tile tests consistently favored this fixed
+allocation and its early cash-flow sequence over planning from scratch. Once
+another quadrant unlocks, all new land and later replant decisions hand off to
+the price-reactive planner in ``agents/planner.py``.
 """
 
 from __future__ import annotations
@@ -15,13 +15,13 @@ LAND_ORDER = official_game.LAND_ORDER
 
 OPENING_COUNTS = {"MELON": 12, "WHEAT": 9, "COW": 2, "SHEEP": 2}
 OPENING_SIZE = sum(OPENING_COUNTS.values())
-OPENING_HANDOFF_DAY = 3
 
 LAND_FIRST_DAY = 6
 LAND_INTERVAL_DAYS = 3
 LAND_MAX_EXTRA = 2
 LAND_BUY_DAYS = tuple(
-    LAND_FIRST_DAY + LAND_INTERVAL_DAYS * index for index in range(LAND_MAX_EXTRA)
+    LAND_FIRST_DAY + LAND_INTERVAL_DAYS * index
+    for index in range(LAND_MAX_EXTRA)
 )
 
 CONVERSION_START_DAY = 2
@@ -100,9 +100,6 @@ def make_opening_controller():
                 index = book["next_conversion"]
                 targets[position] = (CONVERSIONS[index], False)
                 book["next_conversion"] += 1
-        if day >= OPENING_HANDOFF_DAY:
-            book["handed_off"] = True
-            return False
         return True
 
     return governs
