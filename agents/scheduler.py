@@ -171,6 +171,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
         tasks,
         key=lambda task: (
             not task.urgent,
+            not (task.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(task))),
             not task.animal_harvest,
             not (
                 task.actions
@@ -195,6 +196,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
                 candidate = bucket[:insertion] + [task] + bucket[insertion:]
                 priority = lambda queued: (
                     not queued.urgent,
+                    not (queued.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(queued))),
                     not queued.animal_harvest,
                     not (
                         queued.actions

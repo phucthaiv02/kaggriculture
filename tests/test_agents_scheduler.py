@@ -314,6 +314,27 @@ def test_urgent_tasks_finish_early_even_when_sharing_worker_saves_travel():
     assert max(len(plan.queue) for plan in plans) == 5
 
 
+def test_urgent_crop_water_outranks_other_urgent_work_when_capacity_is_tight():
+    water = Task(SHED, [["WATER"]], urgent=True)
+    feed = Task(SHED, [["FEED"]], needs=Counter({"WHEAT": 1}), urgent=True)
+    plans, unassigned = build_queues(
+        [feed, water], farmer_start=SHED, hand_count=0, existing_hand_budget=1
+    )
+    assert plans[0].queue == [["WATER"]]
+    assert unassigned == [feed]
+
+
+def test_nonurgent_water_does_not_jump_a_preceding_fertilizer_task():
+    fertilizer = Task((4, 3), [["COLLECT_FERTILIZER"]], sells=Counter({"FERTILIZER": 1}))
+    water = Task((3, 3), [["WATER"]])
+    plans, unassigned = build_queues(
+        [fertilizer, water], farmer_start=(4, 4), hand_count=0, shed_access=((4, 4),)
+    )
+    assert unassigned == []
+    queue = plans[0].queue
+    assert queue.index(["COLLECT_FERTILIZER"]) < queue.index(["WATER"])
+
+
 if __name__ == "__main__":
     import sys
     failures = 0
