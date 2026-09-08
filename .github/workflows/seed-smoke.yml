@@ -7,6 +7,8 @@ on:
       - feat/planner-capacity-v4
     paths:
       - .github/workflows/seed-smoke.yml
+      - agents/**
+      - tests/**
 
 jobs:
   smoke:
@@ -16,10 +18,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Install dependencies
-        run: python -m pip install -U pip kaggle-environments
-      - name: Run seeds 1 to 5 vs pass
+        run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
+      - name: Run focused tests
+        run: pytest -q tests/test_agents_farm_tasks.py tests/test_agents_scheduler.py tests/test_agents_intraday.py tests/test_agents_opening_book.py tests/test_agents_planner_daily.py
+      - name: Diagnose opening WHEAT and run seeds 1 to 5 vs pass
         run: |
           python - <<'PY'
           import json
@@ -28,10 +32,46 @@ jobs:
           from experiments.crop_schedules import pass_agent
           from experiments.play_match import configuration, END_DAY
 
+          opening_wheat = [(x, y) for y in range(5) for x in range(5)][:19]
           results = []
           for seed in (1, 2, 3, 4, 5):
               env = make('kaggriculture', configuration=configuration(seed), debug=False)
               env.run([make_agent(END_DAY - 1, seed=seed), pass_agent])
+
+              snapshots = []
+              for states in env.steps:
+                  obs = states[0].observation
+                  day = int(obs['day'])
+                  hour = int(obs['hour'])
+                  if (day, hour) not in ((4, 0), (4, 23), (5, 0)):
+                      continue
+                  tiles = obs['farms'][0]['tiles']
+                  summary = {
+                      'day': day,
+                      'hour': hour,
+                      'initial_wheat_alive': 0,
+                      'initial_wheat_ready': 0,
+                      'replanted': 0,
+                      'weed': 0,
+                      'other_or_empty': 0,
+                      'hands': len(obs['farms'][0]['hands']),
+                      'money': float(obs['farms'][0]['money']),
+                  }
+                  for x, y in opening_wheat:
+                      tile = tiles[y][x]
+                      if isinstance(tile, dict) and tile.get('kind') == 'PLANT' and tile.get('crop') == 'WHEAT':
+                          if tile.get('planted_day') == 0:
+                              summary['initial_wheat_alive'] += 1
+                              summary['initial_wheat_ready'] += int(tile.get('yield_units', 0) > 0)
+                          else:
+                              summary['replanted'] += 1
+                      elif isinstance(tile, dict) and tile.get('kind') == 'WEED':
+                          summary['weed'] += 1
+                      else:
+                          summary['other_or_empty'] += 1
+                  snapshots.append(summary)
+              print('WHEAT_DIAG ' + json.dumps({'seed': seed, 'snapshots': snapshots}, sort_keys=True), flush=True)
+
               final = env.steps[-1]
               row = {
                   'seed': seed,
@@ -49,12 +89,11 @@ jobs:
           avg = sum(r['current_cash'] for r in results) / len(results)
           best = max(results, key=lambda r: r['current_cash'])
           worst = min(results, key=lambda r: r['current_cash'])
-          summary = {
+          print('SEED_SUMMARY ' + json.dumps({
               'average_current_cash': avg,
               'best_seed': best['seed'],
               'best_cash': best['current_cash'],
               'worst_seed': worst['seed'],
               'worst_cash': worst['current_cash'],
-          }
-          print('SEED_SUMMARY ' + json.dumps(summary, sort_keys=True), flush=True)
+          }, sort_keys=True), flush=True)
           PY
