@@ -3,9 +3,66 @@ on:
   push:
     branches:
       - tmp/benchmark-v5-seeds1-5
+permissions:
+  contents: read
 jobs:
-  smoke:
+  benchmark:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - run: python --version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install engine
+        run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
+      - name: Reconstruct exact opponent
+        run: |
+          mkdir -p public analyses
+          cat .tmp/opp.part0 .tmp/opp.part1 .tmp/opp.part2 | base64 -d | gzip -d > public/A.py
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          p = Path('public/A.py')
+          digest = hashlib.sha256(p.read_bytes()).hexdigest()
+          print('OPPONENT_SHA256=' + digest)
+          assert digest == 'ccf2aefdadd600d3e6fcaad2879a310eb15bbd14183fc2deeff9bb2525697b9a'
+          PY
+      - name: Run focused tests
+        run: |
+          pytest -q \
+            tests/test_agents_future_shops.py \
+            tests/test_agents_forecast.py \
+            tests/test_agents_forecast_robustness.py \
+            tests/test_agents_planner.py \
+            tests/test_agents_planner_capacity.py
+      - name: Run seed 1-5 target analyses
+        run: |
+          set -euo pipefail
+          for s in 1 2 3 4 5; do
+            echo "=== SEED $s ==="
+            python -m experiments.analyze_targets public/A.py --seed "$s" --output-dir analyses > "analyses/seed${s}.log"
+            cat "analyses/seed${s}.log"
+          done
+      - name: Consolidate benchmark
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          summaries = []
+          for p in sorted(Path('analyses').glob('*.summary.json')):
+              summaries.append(json.loads(p.read_text()))
+          compact = []
+          for s in summaries:
+              compact.append({
+                  'seed': s['seed'],
+                  'current_cash': s['current_cash'],
+                  'opponent_cash': s['opponent_cash'],
+                  'margin': s['margin'],
+                  'picks': s['picks'],
+                  'plantings': s['plantings'],
+                  'materialization': s['materialization'],
+                  'final': s['final'],
+              })
+          print('BENCHMARK_JSON=' + json.dumps(compact, separators=(',', ':')))
+          PY
