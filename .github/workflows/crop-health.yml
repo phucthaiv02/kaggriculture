@@ -1,0 +1,92 @@
+name: Crop Health Diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/planner-capacity-v4
+    paths:
+      - .github/workflows/crop-health.yml
+      - agents/**
+      - tests/**
+
+jobs:
+  crop-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install engine
+        run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7'
+      - name: Measure crop misses by day
+        run: |
+          python - <<'PY'
+          import json
+          from collections import Counter
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+          from agents.farm_tasks import build_tasks
+          from experiments.crop_schedules import pass_agent
+          from experiments.play_match import configuration, END_DAY
+
+          def closure_value(fn, name):
+              cells = dict(zip(fn.__code__.co_freevars, fn.__closure__ or ()))
+              return cells[name].cell_contents
+
+          for seed in (1, 2, 3, 4, 5):
+              production = make_agent(END_DAY - 1, seed=seed)
+              daily = []
+
+              def monitored(obs):
+                  action = production(obs)
+                  if int(obs.day) != int(getattr(obs, 'day', obs['day'])):
+                      return action
+                  if int(obs.hour) != 23:
+                      return action
+
+                  farm = obs.farms[obs.player]
+                  targets = closure_value(production, 'targets')
+                  local_obs = dict(obs, _planning_end_day=END_DAY - 1)
+                  tasks = build_tasks(local_obs, targets, assume_crop_seeds=True)
+                  pending_water = 0
+                  pending_harvest = 0
+                  for task in tasks:
+                      x, y = task.position
+                      tile = farm.tiles[y][x]
+                      if not (isinstance(tile, dict) and tile.get('kind') == 'PLANT'):
+                          continue
+                      ops = {op[0] for op in task.actions if op}
+                      pending_water += int('WATER' in ops)
+                      pending_harvest += int('HARVEST' in ops)
+
+                  weeds = 0
+                  crops = 0
+                  ready = 0
+                  for row in farm.tiles:
+                      for tile in row:
+                          if isinstance(tile, dict) and tile.get('kind') == 'WEED':
+                              weeds += 1
+                          elif isinstance(tile, dict) and tile.get('kind') == 'PLANT':
+                              crops += 1
+                              ready += int(tile.get('yield_units', 0) > 0)
+
+                  daily.append({
+                      'day': int(obs.day),
+                      'crops': crops,
+                      'ready_h23': ready,
+                      'pending_water_h23': pending_water,
+                      'pending_harvest_h23': pending_harvest,
+                      'weeds': weeds,
+                      'hands': len(farm.hands),
+                      'quadrants': len(farm.unlocked_quadrants),
+                      'money': float(farm.money),
+                  })
+                  return action
+
+              env = make('kaggriculture', configuration=configuration(seed), debug=False)
+              env.run([monitored, pass_agent])
+              print('CROP_HEALTH ' + json.dumps({'seed': seed, 'days': daily}, sort_keys=True), flush=True)
+          PY
