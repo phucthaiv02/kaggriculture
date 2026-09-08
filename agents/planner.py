@@ -7,7 +7,6 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as official_gam
 from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 from agents.forecast import MarketForecast, Production, production
 from agents.labor import LaborForecast
-from agents.scheduler import MAX_HANDS
 from agents.schedules import CROP_LAST_AGE, ONGOING_CROPS, cycle_finished
 from agents.horizon import (
     SEASON_END_DAY, TARGET_HORIZON_DAYS, cycle_end as _cycle_end,
@@ -20,12 +19,6 @@ SEED_COST = {name: official_game.CROPS[name]["seed"] for name in CROPS}
 ANIMAL_COST = {name: official_game.ANIMALS[name]["cost"] for name in ANIMALS}
 LAND_ORDER = official_game.LAND_ORDER
 LAND_BUY_UTILIZATION = 0.75
-
-# At most one brand-new producer per currently possible worker is allowed to
-# influence the shared market/labor baseline during one planning pass. The
-# executor may start more than this, but those extra desired targets are not
-# treated as committed production until a later observation makes them real.
-FRESH_COMMIT_SLOTS = MAX_HANDS + 1  # farmer + maximum hired hands
 
 # A standard 720-turn season has 30 days, indexed 0 through 29 by the engine.
 
@@ -91,7 +84,9 @@ def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
     market_cash = change in all sales less feed/fertilizer purchases, after
     per-unit slippage, existing production and SHOP/TOWN demand.
     capital_cost = all seeds in the window or one animal purchase.
-    labor_cost = additional daily worker cost over the same horizon.
+    labor_cost = additional daily worker cost over the same horizon. A target
+    that cannot fit inside the maximum worker capacity receives infinite labor
+    cost and is therefore rejected by _choose.
     """
     labor = labor or LaborForecast()
     results = []
@@ -193,30 +188,21 @@ def should_buy_land(farm, active_positions):
     return occupied / len(active_positions) >= LAND_BUY_UTILIZATION
 
 
-def _is_fresh_target_tile(tile):
-    """True when a choice would create a producer on currently idle land."""
-    return not (
-        isinstance(tile, dict)
-        and (tile.get("kind") == "PLANT" or tile.get("animal"))
-    )
-
-
 def plan_targets(obs, targets, active_positions, end_day):
-    """Reprice targets against actual production plus a bounded commitment set.
+    """Reprice targets against actual production and route-feasible commitments.
 
     Existing crops are forecast from their real age, held yield and watering
     state, including visible opponent crops. Unsown choices are reconsidered
     each day. No profitable candidate means no planting, with harvest-only
     cleanup handled by build_tasks.
 
-    A target decision is not the same thing as a producer that will actually
-    start this pass. Fresh empty/structure tiles are still assigned desired
-    targets so the executor can use any spare capacity, but only the first
-    ``FRESH_COMMIT_SLOTS`` (nearest the shed, matching the planning order) are
-    allowed to add future supply/labor to the shared baseline. That prevents
-    a whole unlocked quadrant from depressing later candidate scores before
-    the scheduler has had a chance to materialize it. Finished/replanting
-    producers remain committed normally.
+    V2 used a fixed 17-fresh-target commitment cap. That was a useful safety
+    valve while the route forecast undercounted fresh crop work, but it became
+    stale once the portfolio changed: one worker can start multiple nearby
+    crops, while a distant or input-heavy producer can consume far more route
+    budget. Capacity now comes from LaborForecast itself. Every accepted target
+    enters the shared baseline, and later candidates are rejected naturally if
+    the combined visits cannot fit the farmer plus maximum hands.
     """
     day = obs["day"]
     end_day = _cycle_end(day, end_day)
@@ -318,10 +304,11 @@ def plan_targets(obs, targets, active_positions, end_day):
         for p in shed_access
         if farm["tiles"][p[1]][p[0]] != "LOCKED"
     ))
-    fresh_commits = 0
 
-    # Assign near the shed first. Only a bounded number of brand-new choices
-    # enter the shared baseline; all desired targets are still recorded.
+    # Assign near the shed first so greedy marginal allocation spends route
+    # capacity on cheaper-to-service positions before distant ones. Unlike the
+    # old fixed slot cap, every accepted target changes market saturation and
+    # labor load for the next position.
     for position in sorted(
         replanning, key=lambda p: (distance(p), p[1], p[0])
     ):
@@ -343,12 +330,5 @@ def plan_targets(obs, targets, active_positions, end_day):
         if not choice:
             continue
 
-        fresh = _is_fresh_target_tile(tile)
-        if fresh and fresh_commits >= FRESH_COMMIT_SLOTS:
-            # Desired but not trusted as immediate committed production.
-            continue
-
         baseline.add(output, position)
         counts[choice[0]] += 1
-        if fresh:
-            fresh_commits += 1
