@@ -3,6 +3,13 @@
 Production uses the installed game's tile actions and daily refresh functions.
 Forecasts assume scheduled care succeeds and harvested goods sell that day;
 travel delays, future opponents' decisions and unknown shops are not predicted.
+
+The exact queue simulator is retained for engine-validation tests. Planner
+marginals use a robust rival projection instead: future rival *sales* affect
+only the same product, while future rival inputs are not treated as guaranteed
+market buys. We can observe a rival producer, but not whether its future feed
+or fertilizer comes from the market, its own shed, or its own production; and
+we do not know the rival's future cross-product market-order queue positions.
 """
 from collections import Counter, defaultdict
 from copy import deepcopy
@@ -127,7 +134,7 @@ class MarketForecast:
                 stock -= 1
         return cash, stock
 
-    def value(self, flows):
+    def _value(self, flows, robust_external=False):
         stocks = dict(self.inventory)
         cash = 0
         previous = self.day * 24 + self.hour - 1
@@ -142,10 +149,29 @@ class MarketForecast:
                 if product in self.center_products:
                     stocks[product] -= center_ticks
             previous = step
-            cash += self._settle_day(stocks, flows, when)
+            if robust_external:
+                cash += self._settle_day_robust(stocks, flows, when)
+            else:
+                cash += self._settle_day(stocks, flows, when)
         return cash
 
+    def value(self, flows):
+        """Exact value under the forecast's explicit future queue convention."""
+        return self._value(flows, robust_external=False)
+
+    def robust_value(self, flows):
+        """Value with only observable/product-local rival effects.
+
+        Rival future sales are projected because visible producers make those
+        plausible. Rival future inputs are deliberately ignored: a required
+        WHEAT/FERTILIZER unit does not imply a market BUY because the rival may
+        already own it or produce it internally. Cross-product queue alignment
+        is also ignored because future market-order positions are unobserved.
+        """
+        return self._value(flows, robust_external=True)
+
     def _settle_day(self, stocks, flows, when):
+        # Exact daily-queue convention retained for engine-validation tests.
         # Daily flows have no observed order queue. Use PRODUCTS order for
         # both players, netting harvested feed/fertilizer before trading.
         queues = []
@@ -180,10 +206,67 @@ class MarketForecast:
                         cash += price if amount > 0 else -price
         return cash
 
+    def _settle_day_robust(self, stocks, flows, when):
+        """Settle rival pressure per product, without invented rival buys.
+
+        The market has independent stock per product. Pairing a newly inserted
+        CARROT order with a rival FERTILIZER order can shift later queue indices
+        in the exact convention and accidentally change MILK/WHEAT pricing,
+        even though the candidate has no relationship to those products. That
+        alignment is unknowable for future turns, so robust planning makes
+        rival interaction local to each product instead.
+        """
+        own_sales = flows.sales.get(when, {})
+        own_inputs = flows.inputs.get(when, {})
+        rival_sales = self.external.sales.get(when, {})
+        cash = 0
+
+        for product in game.PRODUCTS:
+            own_amount = own_sales.get(product, 0) - own_inputs.get(product, 0)
+            # Do not subtract external.inputs here. A future rival requirement
+            # is not evidence of a future market BUY.
+            rival_amount = rival_sales.get(product, 0)
+            if not own_amount and not rival_amount:
+                continue
+
+            for unit in range(max(abs(own_amount), abs(rival_amount))):
+                stock = stocks.get(product, 0)
+                quoted = []
+                if unit < abs(own_amount):
+                    price = self.price(product, stock if own_amount > 0 else stock - 1)
+                    quoted.append((0, own_amount, price))
+                if unit < abs(rival_amount):
+                    price = self.price(product, stock if rival_amount > 0 else stock - 1)
+                    quoted.append((1, rival_amount, price))
+
+                # Same-product simultaneous units are still quoted from the
+                # same pre-commit stock, matching engine simultaneous quoting.
+                for player, amount, price in quoted:
+                    stocks[product] = stocks.get(product, 0) + (
+                        int(price > 1) if amount > 0 else -1
+                    )
+                    if player == 0:
+                        cash += price if amount > 0 else -price
+        return cash
+
+    def _has_external_projection(self):
+        return any(self.external.sales.values()) or any(self.external.inputs.values())
+
     def marginal_profit(self, baseline, candidate, fixed_cost, baseline_value=None):
         combined = Production()
         combined.add(baseline)
         combined.add(candidate)
+
+        # Planner calls this with visible rival production. Use the robust
+        # projection there, but keep exact engine-equivalent behavior when no
+        # rival projection exists (including existing unit tests and helpers).
+        if self._has_external_projection():
+            return (
+                self.robust_value(combined)
+                - self.robust_value(baseline)
+                - fixed_cost
+            )
+
         if baseline_value is None:
             baseline_value = self.value(baseline)
         return self.value(combined) - baseline_value - fixed_cost
