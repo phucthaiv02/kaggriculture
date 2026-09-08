@@ -8,16 +8,16 @@ def ripe_wheat(position):
     return Task(
         position,
         [["WATER"], ["HARVEST"], ["PLANT", "WHEAT"], ["WATER"]],
+        needs=Counter({"WHEAT": 1}),
         urgent=True,
         ends_cycle=True,
     )
 
 
-def test_ripe_wheat_wall_packs_harvest_even_when_replant_tails_do_not_fit():
+def test_ripe_wheat_wall_packs_every_harvest_before_replant_tails():
     # From (4, 4), visiting these four top-row tiles costs 8 movement steps.
-    # WATER+HARVEST for all four is another 8 steps and fits comfortably in
-    # one 23-turn worker day.  Treating PLANT+WATER as part of the same atomic
-    # task adds 8 more steps and used to reject part of the harvest wall.
+    # WATER+HARVEST for all four is another 8 steps and fits a 16-turn budget
+    # exactly. The replacement tails must therefore be dropped, not harvests.
     tasks = [ripe_wheat((x, 0)) for x in range(4)]
 
     hands, dropped = hands_needed(tasks, (4, 4), max_hands=0)
@@ -28,11 +28,29 @@ def test_ripe_wheat_wall_packs_harvest_even_when_replant_tails_do_not_fit():
         tasks,
         (4, 4),
         0,
-        worker_budgets=[23],
+        worker_budgets=[16],
     )
     assert unassigned == []
     assert plans[0].queue.count(["HARVEST"]) == 4
     assert ["PLANT", "WHEAT"] not in plans[0].queue
+
+
+def test_safe_replant_tail_is_restored_when_worker_has_budget():
+    task = ripe_wheat((4, 4))
+    plans, unassigned = build_queues(
+        [task],
+        (4, 4),
+        0,
+        worker_budgets=[5],
+    )
+    assert unassigned == []
+    assert plans[0].queue == [
+        ["PICKUP", "WHEAT", 1],
+        ["WATER"],
+        ["HARVEST"],
+        ["PLANT", "WHEAT"],
+        ["WATER"],
+    ]
 
 
 def test_post_harvest_replacement_inputs_do_not_block_harvest_prefix():
