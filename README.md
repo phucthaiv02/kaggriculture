@@ -76,6 +76,17 @@ python -m experiments.play_match --opponent path/to/notebook.ipynb
 The production agent always runs as player 0. Match outputs are written under
 `replays/` by default.
 
+Trace planner scores against actual PLACE/PLANT materialization for the same
+kind of opponent:
+
+```bash
+python -m experiments.analyze_targets path/to/notebook.ipynb --seed 1
+```
+
+The analysis records forecast profit, first forecast sale day, and whether each
+selected target materialized on the same day, was delayed, or never
+materialized. Outputs are written under `replays/`.
+
 Validate the crop and animal maintenance schedules:
 
 ```bash
