@@ -67,18 +67,18 @@ class WorkerPlan:
 
 
 def _mandatory_actions(task):
-    """Return the part of a task that must finish before its deadline.
+    """Return the deadline-sensitive prefix of a task.
 
-    A finished one-time crop can carry a whole producer transition in one
-    ``Task``: WATER, HARVEST, then PLANT/PLACE the next target.  Packing that
-    atomically made the deadline-sensitive harvest depend on optional work
-    *after* the tile becomes empty.  Under a synchronized WHEAT harvest wall,
-    a route that had time for WATER+HARVEST could therefore be rejected just
-    because its replant tail did not fit.
+    A finished one-time crop may encode an entire producer transition in one
+    ``Task``: WATER, HARVEST, then PLANT/PLACE the next target. Packing that
+    atomically made a ripe crop's HARVEST depend on optional work after the
+    tile becomes empty. With many WHEAT tiles maturing together, routes that
+    had enough time to harvest were rejected simply because the replacement
+    tail did not fit.
 
-    Harvesting the ripe crop is the irreversible/deadline-sensitive part.
-    Once HARVEST actually clears the tile, agents/intraday.py observes the
-    vacancy on the next turn and safely schedules any feasible replacement.
+    For urgent cycle-ending crop work, HARVEST is the mandatory boundary.
+    Replacement work is admitted only after every mandatory task assigned to
+    that worker already fits its real turn budget.
     """
     if task.urgent and task.ends_cycle:
         for index, action in enumerate(task.actions):
@@ -87,31 +87,43 @@ def _mandatory_actions(task):
     return task.actions
 
 
-def _mandatory_needs(task):
-    """Inputs required by the mandatory prefix, excluding deferred replacement."""
-    actions = _mandatory_actions(task)
-    if len(actions) < len(task.actions):
-        # For a ripe one-time crop, build_tasks' ``needs`` belong to the
-        # post-HARVEST replacement (animal/feed/etc.).  WATER and HARVEST do
-        # not need a shed pickup.  Keep those supplies available for intraday
-        # placement rather than making the harvest route detour for them.
+def _has_optional_tail(task):
+    return len(_mandatory_actions(task)) < len(task.actions)
+
+
+def _task_actions(task, include_optional=False):
+    if include_optional or not _has_optional_tail(task):
+        return task.actions
+    return _mandatory_actions(task)
+
+
+def _task_needs(task, include_optional=False):
+    """Inputs needed by the actions actually admitted to the worker queue."""
+    if _has_optional_tail(task) and not include_optional:
+        # WATER/HARVEST need no shed inputs. build_tasks' needs on a finished
+        # crop belong to the post-HARVEST replacement (seed, animal, feed...).
         return Counter()
     return task.needs
 
 
-def _task_queue(start, bucket, shed_access):
-    """Build the mandatory route, sharing execution and packing accounting.
+def _task_queue(start, bucket, shed_access, full_task_ids=frozenset()):
+    """Build one route for the selected mandatory work and safe optional tails.
 
     DROP empties the worker's inventory. Only collect supplies through the
     next DROP, so later supplies stay available in the shed in the meantime.
+    ``full_task_ids`` contains cycle-ending tasks whose post-HARVEST tail has
+    been proven to fit without displacing any mandatory work.
     """
     queue, current = [], start
     pickup_needed = True
     for task_index, task in enumerate(bucket):
+        include_optional = id(task) in full_task_ids
         if pickup_needed:
             needs = Counter()
             for later in bucket[task_index:]:
-                needs.update(_mandatory_needs(later))
+                needs.update(
+                    _task_needs(later, include_optional=id(later) in full_task_ids)
+                )
                 if later.immediate_drop:
                     break
             if needs:
@@ -120,7 +132,7 @@ def _task_queue(start, bucket, shed_access):
                 queue += [["PICKUP", item, amount] for item, amount in needs.items() if amount > 0]
                 current = shed
             pickup_needed = False
-        queue += route(current, task.position) + _mandatory_actions(task)
+        queue += route(current, task.position) + _task_actions(task, include_optional)
         current = task.position
         if task.immediate_drop:
             shed = nearest_shed(current, shed_access)
@@ -134,13 +146,52 @@ def _task_queue(start, bucket, shed_access):
     return queue, current
 
 
-def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
-    """Greedy bin-pack using each candidate worker's exact queue length.
+def _admit_optional_tails(start, bucket, budget, shed_access):
+    """Greedily restore post-HARVEST tails that fit after mandatory packing.
 
-    The projection includes travel from the real spawn, one operation for
-    every distinct PICKUP, travel between tasks, and all mandatory tile
-    actions. Optional post-harvest replacement work is admitted later by the
-    intraday vacancy scheduler once the harvest has really happened.
+    Mandatory prefixes are fixed first. We then add the cheapest replacement
+    tail one at a time, recomputing the exact queue (including shed pickups)
+    after each admission. Therefore every admitted PLANT/PLACE may delay later
+    harvests only within a queue whose *entire* length still fits the worker's
+    real budget; a replacement can never make a ripe crop miss day end.
+    """
+    full_task_ids = set()
+    optional = [task for task in bucket if _has_optional_tail(task)]
+    while optional:
+        base_length = len(
+            _task_queue(start, bucket, shed_access, full_task_ids)[0]
+        )
+        choices = []
+        for task in optional:
+            candidate_ids = full_task_ids | {id(task)}
+            projected = len(
+                _task_queue(start, bucket, shed_access, candidate_ids)[0]
+            )
+            if projected <= budget:
+                choices.append(
+                    (
+                        projected - base_length,
+                        projected,
+                        task.position[1],
+                        task.position[0],
+                        task,
+                    )
+                )
+        if not choices:
+            break
+        _, _, _, _, chosen = min(choices, key=lambda item: item[:4])
+        full_task_ids.add(id(chosen))
+        optional.remove(chosen)
+    return full_task_ids
+
+
+def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
+    """Greedy bin-pack using each candidate worker's exact mandatory queue.
+
+    The first pass includes travel from the real spawn, required PICKUPs and
+    every deadline-sensitive action, but treats post-HARVEST replacement tails
+    as optional. build_queues restores as many tails as safely fit only after
+    all mandatory work has been assigned.
     """
     buckets = [[] for _ in worker_starts]
 
@@ -180,7 +231,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
                 candidate = bucket[:insertion] + [task] + bucket[insertion:]
                 # Animal survival work remains ahead of ordinary crop work,
                 # but tasks within the same priority class may be inserted
-                # wherever the route is shortest.  Appending in global task
+                # wherever the route is shortest. Appending in global task
                 # order was the source of workers crossing the farm first
                 # and then doubling back to tiles beside their own spawn.
                 priority = lambda queued: (
@@ -227,18 +278,15 @@ def hands_needed(
     pending_hand_budget=HAND_BUDGET,
     max_hands=MAX_HANDS,
 ):
-    """Fewest hands (0..max_hands) that fit today's tasks within budget.
+    """Fewest hands (0..max_hands) that fit today's mandatory work.
 
-    Urgent (animal-care) tasks are never dropped for lack of hands -- a
-    missed feed is a lasting loss (the animal escapes), not just a delayed
-    harvest -- so this also reports which tasks had to be dropped if even
-    max_hands can't fit everything.
+    Urgent animal care and ripe-crop harvests are never sacrificed to optional
+    post-HARVEST replacement work. Replacement tails use spare turns after the
+    minimum safe workforce has been established.
 
-    `max_hands` defaults to the module ceiling but accepts a lower override
-    -- agents/planner.py's plan_targets uses this to test a candidate
-    portfolio against a *safety-margined* hand count (a few below the real
-    MAX_HANDS) before committing to it, so routine day-to-day task-mix
-    variation never actually reaches the true ceiling in practice.
+    `max_hands` defaults to the module ceiling but accepts a lower override --
+    agents/planner.py's plan_targets uses this to test a candidate portfolio
+    against a safety-margined hand count before committing to it.
     """
     minimum = len(existing_hand_starts)
     for count in range(minimum, max_hands + 1):
@@ -271,35 +319,18 @@ def build_queues(
     existing_hand_budget=None,
     worker_budgets=None,
 ):
-    """Assign tasks to farmer + hand_count hands and lay out each one's route.
+    """Assign tasks to workers, then spend spare turns on safe replacements.
 
     `worker_budgets` overrides all budgets when appending work after existing
     queues: each worker can have a different number of turns left.
 
     A worker returns to the shed to DROP mid-day only if it both carries a
-    sellable item *and* has spare turns left after its assigned tasks --
-    inventories are dropped to the shed automatically at day end regardless
-    (see kaggriculture's _end_of_day), so an early return only pays for
-    itself when it enables a same-day sale (selling.py) or frees carry
-    capacity; it should never be bought at the cost of a task that would
-    otherwise go undone.
+    sellable item and has spare turns left after its assigned work. Inventories
+    are dropped to the shed automatically at day end, so an early return must
+    never displace mandatory work.
 
-    `pending_hand_budget` only ever reaches a hand beyond `len(hand_starts)`
-    -- every slot up to that point is budgeted FARMER_BUDGET/HAND_BUDGET
-    (a full day), because the normal caller (agents/expansion_agent.py's
-    hour-1 queue build) really does hand each of those a full day. That
-    assumption breaks for a caller re-packing *already-real* workers
-    partway through the day (agents/expansion_agent.py's
-    _schedule_late_placements, calling with `farmer_start`/`hand_starts`
-    covering every currently-idle worker, real positions and all) -- there,
-    every slot is "existing" by this function's accounting, so
-    pending_hand_budget never applies to any of them and they were each
-    silently budgeted a full day's worth of turns instead of what's
-    actually left. Confirmed directly (seed 1, day 23): two mid-day
-    workers built routes 17-18 steps long against only 16 real turns left,
-    for tasks including a SHEEP already a day overdue on its feed.
-    `existing_hand_budget`, when given, overrides both FARMER_BUDGET and
-    HAND_BUDGET for exactly this case; left None, behavior is unchanged.
+    `existing_hand_budget`, when given, limits already-real workers during
+    intraday repacking; left None, the normal hour-1 full-day budgets apply.
     """
     starts = [tuple(farmer_start)] + predicted_hand_starts(
         farmer_start, hand_starts, hand_count
@@ -320,7 +351,9 @@ def build_queues(
         if not bucket:
             plans.append(WorkerPlan(start, []))
             continue
-        queue, current = _task_queue(start, bucket, shed_access)
+
+        full_task_ids = _admit_optional_tails(start, bucket, budget, shed_access)
+        queue, current = _task_queue(start, bucket, shed_access, full_task_ids)
         carries_sellable = any(task.sells and not task.immediate_drop for task in bucket)
         if carries_sellable:
             shed = nearest_shed(current, shed_access)
