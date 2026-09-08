@@ -20,12 +20,23 @@ def test_harvester_replants_before_leaving_and_is_not_scheduled_twice():
 
 def test_harvester_waits_for_affordable_seed_instead_of_walking_away():
     obs = make_obs(day=8, money=10)
-    plans = [WorkerPlan((4, 4), [["EAST"], ["WATER"]])]
+    plans = [WorkerPlan((4, 4), [["EAST"]])]
     targets = {(4, 4): ("WHEAT", False)}
     eligible, hires = schedule_open_tiles(obs, targets, plans, SHED_ACCESS)
     assert plans[0].queue[:2] == [["PLANT", "WHEAT"], ["WATER"]]
     assert purchase_orders(obs, eligible, list(eligible)) == [["BUY_SEED", "WHEAT", 1]]
     assert hires == 0
+
+
+def test_delayed_seed_never_preempts_pending_crop_protection():
+    targets = {(4, 4): ("WHEAT", False)}
+    for protective in ("WATER", "HARVEST"):
+        obs = make_obs(day=8, money=10)
+        plans = [WorkerPlan((4, 4), [["EAST"], [protective]])]
+        eligible, hires = schedule_open_tiles(obs, targets, plans, SHED_ACCESS)
+        assert plans[0].queue == [["EAST"], [protective]]
+        assert purchase_orders(obs, eligible, list(eligible)) == [["BUY_SEED", "WHEAT", 1]]
+        assert hires == 0
 
 
 def test_new_land_uses_only_the_steps_left_after_existing_queues():
