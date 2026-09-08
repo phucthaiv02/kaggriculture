@@ -30,18 +30,29 @@ jobs:
           PY
       - name: Run focused tests
         run: |
-          pytest -q \
-            tests/test_agents_future_shops.py \
-            tests/test_agents_forecast.py \
-            tests/test_agents_forecast_robustness.py \
-            tests/test_agents_planner.py \
-            tests/test_agents_planner_capacity.py
+          python - <<'PY'
+          import agents  # Pin the repository package before Kaggle imports its lux agents.py.
+          import pytest
+          raise SystemExit(pytest.main([
+              '-q',
+              'tests/test_agents_future_shops.py',
+              'tests/test_agents_forecast.py',
+              'tests/test_agents_forecast_robustness.py',
+              'tests/test_agents_planner.py',
+              'tests/test_agents_planner_capacity.py',
+          ]))
+          PY
       - name: Run seed 1-5 target analyses
         run: |
           set -euo pipefail
           for s in 1 2 3 4 5; do
             echo "=== SEED $s ==="
-            python -m experiments.analyze_targets public/A.py --seed "$s" --output-dir analyses > "analyses/seed${s}.log"
+            python - "$s" > "analyses/seed${s}.log" <<'PY'
+          import sys
+          import agents  # Keep the local package bound before kaggle_environments loads.
+          from experiments.analyze_targets import run
+          run('public/A.py', seed=int(sys.argv[1]), output_dir='analyses')
+          PY
             cat "analyses/seed${s}.log"
           done
       - name: Consolidate benchmark
