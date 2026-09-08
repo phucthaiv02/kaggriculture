@@ -1,10 +1,10 @@
-"""Fixed opening allocation for the initial NW quadrant.
+"""Short fixed opening followed by the ROI planner.
 
-The opening book is used instead of the ROI planner until the first land
-purchase succeeds. Isolated 25-tile tests consistently favored this fixed
-allocation and its early cash-flow sequence over planning from scratch. Once
-another quadrant unlocks, all new land and later replant decisions hand off to
-the price-reactive planner in ``agents/planner.py``.
+The opening book only creates the initial cash-flow/animal base.  It governs
+through day 2 so the two WHEAT -> COW/SHEEP conversions can happen, then hands
+off to ``agents/planner.py`` from day 3 onward.  Land expansion is independent
+of that handoff: buy attempts are derived from the number of already unlocked
+quadrants, targeting the first two extra quadrants on days 6 and 9.
 """
 
 from __future__ import annotations
@@ -14,46 +14,48 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as official_gam
 LAND_ORDER = official_game.LAND_ORDER
 
 # 12 MELON + 9 WHEAT + 2 COW + 2 SHEEP = 25 (NW's whole board). Wheat is
-# funded ahead of each animal's verified age-relative FEED schedule. In
-# particular, placement is age 0: SHEEP feeds/cares then, while COW starts at
-# age 1 (experiments/animal_yields.py).
+# funded ahead of each animal's verified age-relative FEED schedule.
 OPENING_COUNTS = {"MELON": 12, "WHEAT": 9, "COW": 2, "SHEEP": 2}
 OPENING_SIZE = sum(OPENING_COUNTS.values())
 
-# Temporarily buy exactly one quadrant on engine/UI day 7 so the expansion
-# path can be inspected in isolation.
-LAND_BUY_DAYS = (7,)
+# The fixed book gets the farm started, then the planner can react to live
+# prices for three full days before the first expansion attempt.
+OPENING_HANDOFF_DAY = 3
+
+# State-derived land cadence.  LAND_BUY_DAYS is kept as a readable summary;
+# should_buy_land_on_schedule derives the next attempt from unlocked land so a
+# failed/unfunded order retries instead of silently missing the schedule.
+LAND_FIRST_DAY = 6
+LAND_INTERVAL_DAYS = 3
+LAND_MAX_EXTRA = 2
+LAND_BUY_DAYS = tuple(
+    LAND_FIRST_DAY + LAND_INTERVAL_DAYS * index for index in range(LAND_MAX_EXTRA)
+)
 
 # Convert two of the initial WHEAT targets to one COW and one SHEEP together
-# on day 2 (the UI's Day 3). Their two harvested WHEAT units can then feed
-# the newly placed animals without buying feed from the market.
-# farm_tasks.build_tasks deliberately supports harvesting a one-time crop
-# early when its target changes, so each conversion can start as soon as the
-# opening has generated some WHEAT instead of waiting for the full cycle.
+# on day 2 (the UI's Day 3). Their harvested WHEAT can feed the new animals
+# without buying that feed from the market.
 CONVERSION_START_DAY = 2
 CONVERSIONS = ("COW", "SHEEP")
 
 
 def should_buy_land_on_schedule(obs, farm):
-    """Submit one land order at hour 0 on the scheduled day, if available.
+    """Attempt the next of two land purchases at hour 0 on a 3-day cadence.
 
-    Affordability itself is left to the engine (BUY_LAND is simply a no-op if
-    the farm cannot cover the cost at that instant).
+    The next target day comes from actual unlocked-quadrant state.  If an
+    order is unaffordable, the same purchase remains due on subsequent days
+    until the quadrant count changes.  Affordability itself is left to the
+    engine.
     """
     n_extra = len(farm["unlocked_quadrants"]) - 1
-    return (
-        obs["day"] in LAND_BUY_DAYS
-        and obs.get("hour", 0) == 0
-        and n_extra < len(LAND_ORDER)
-    )
+    if n_extra < 0 or n_extra >= min(LAND_MAX_EXTRA, len(LAND_ORDER)):
+        return False
+    next_day = LAND_FIRST_DAY + LAND_INTERVAL_DAYS * n_extra
+    return obs["day"] >= next_day and obs.get("hour", 0) == 0
 
 
 def build_opening_targets(positions):
-    """Return the fixed day-0 allocation for the initial 25 active tiles.
-
-    The opening deliberately does not commit fertilizer; early fertilizer is
-    sold to support the initial cash-flow plan.
-    """
+    """Return the fixed day-0 allocation for the initial 25 active tiles."""
     if len(positions) != OPENING_SIZE:
         raise ValueError(
             f"opening book requires exactly {OPENING_SIZE} active positions, got {len(positions)}"
@@ -66,12 +68,12 @@ def build_opening_targets(positions):
 
 
 def make_opening_controller():
-    """Create the stateful opening-book controller.
+    """Create the short fixed-opening controller.
 
-    The returned callable mutates ``targets`` while the opening book governs
-    the farm and returns ``True`` so the caller skips the dynamic planner.
-    Once the first additional quadrant unlocks, it returns ``False``
-    permanently.
+    Returns ``True`` while the fixed book owns target selection.  From day 3
+    onward it returns ``False`` permanently so the normal planner immediately
+    reevaluates the live farm.  A successful early land unlock also forces an
+    immediate handoff.
     """
     book = {
         "applied": False,
@@ -95,8 +97,6 @@ def make_opening_controller():
         if not book["applied"]:
             opening = build_opening_targets(active_positions)
             targets.update(opening)
-            # Converted animals produce every few days (and fertilizer every
-            # day), so keep their recurring HARVEST/COLLECT/DROP route short.
             shed = (len(tiles[0]) // 2 - 1, len(tiles) // 2 - 1)
             book["wheat_positions"] = tuple(
                 sorted(
@@ -134,6 +134,10 @@ def make_opening_controller():
                 index = book["next_conversion"]
                 targets[position] = (CONVERSIONS[index], False)
                 book["next_conversion"] += 1
+
+        if day >= OPENING_HANDOFF_DAY:
+            book["handed_off"] = True
+            return False
 
         return True
 
