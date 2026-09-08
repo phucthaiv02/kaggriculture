@@ -91,6 +91,44 @@ def _affordable_hires(farm, desired, money):
     return affordable
 
 
+def _is_protective_task(task):
+    """Work that must survive capacity cuts before expansion/replacement."""
+    if task.urgent or task.animal_harvest:
+        return True
+    return any(action and action[0] == "HARVEST" for action in task.actions)
+
+
+def _capacity_safe_queues(
+    tasks, farmer_start, hand_count, existing_hands, shed_access,
+    pending_hand_budget=22, existing_hand_budget=23,
+):
+    """Pack against the workers we can actually afford.
+
+    Try the complete workload first. If any protective work is unassigned,
+    discard expansion/replacement work for this morning and repack only
+    protective work. Only admitted tasks may reserve inventory or suppress
+    intraday rescue.
+    """
+    kwargs = dict(
+        pending_hand_budget=pending_hand_budget,
+        existing_hand_budget=existing_hand_budget,
+    )
+    plans, unassigned = build_queues(
+        tasks, farmer_start, hand_count, existing_hands, shed_access, **kwargs
+    )
+    protective_debt = [task for task in unassigned if _is_protective_task(task)]
+    active_tasks = tasks
+    if protective_debt:
+        active_tasks = [task for task in tasks if _is_protective_task(task)]
+        plans, unassigned = build_queues(
+            active_tasks, farmer_start, hand_count, existing_hands, shed_access, **kwargs
+        )
+        protective_debt = list(unassigned)
+    unassigned_ids = {id(task) for task in unassigned}
+    admitted = [task for task in active_tasks if id(task) not in unassigned_ids]
+    return plans, admitted, unassigned, protective_debt
+
+
 def _sale_revenue(obs, sales):
     """Exact same-turn proceeds before subsequent BUY orders execute."""
     inventory = dict(obs["market"]["inventory"])
@@ -210,6 +248,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         "opening_active": False, "scheduled_placements": set(),
         "unverified_hand_indices": set(),
         "deferred_expansion_positions": set(),
+        "protective_debt_positions": set(),
     }
     opening_governs = make_opening_controller()
 
@@ -345,7 +384,15 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             )
         }
         committed = queue_commitments(worker_positions, state["plans"])[1]
-        for position, target in targets.items():
+        ordered_positions = sorted(
+            targets,
+            key=lambda position: (
+                position not in state["protective_debt_positions"],
+                position[1], position[0],
+            ),
+        )
+        for position in ordered_positions:
+            target = targets[position]
             if not target:
                 continue
             if position in committed:
@@ -546,15 +593,17 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             )
             hand_count = len(existing_hands) + affordable_hands
             state["hand_target"] = hand_count
-            plans, _unassigned = build_queues(
+            plans, admitted_tasks, _unassigned, protective_debt = _capacity_safe_queues(
                 tasks,
                 tuple(farm["farmer"]),
                 hand_count,
                 existing_hands,
                 shed_access,
                 pending_hand_budget=22,
+                existing_hand_budget=23,
             )
-            state["plans"], state["reserved"] = plans, reserved_items(tasks)
+            state["plans"], state["reserved"] = plans, reserved_items(admitted_tasks)
+            state["protective_debt_positions"] = {task.position for task in protective_debt}
             # Indices beyond today's already-real hands got a route built
             # from predicted_hand_starts' *guess* at where they'll spawn --
             # see _validate_predicted_hands below for why that guess can be
@@ -564,7 +613,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             )
             state["scheduled_placements"] = {
                 task.position
-                for task in tasks
+                for task in admitted_tasks
                 if any(action[0] in ("PLANT", "PLACE") for action in task.actions)
             }
 
