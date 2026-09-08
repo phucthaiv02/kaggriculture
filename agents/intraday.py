@@ -13,6 +13,12 @@ TILE_ACTIONS = {
     "DIG", "PLANT", "WATER", "FERTILIZE", "HARVEST", "PLACE",
     "BUILD_COOP", "BUILD_PASTURE", "FEED", "CARE", "COLLECT_FERTILIZER",
 }
+PROTECTIVE_OPS = {"WATER", "HARVEST", "FEED", "CARE"}
+
+
+def _has_pending_protective_work(queue):
+    """True when delaying this route can lose standing production or animals."""
+    return any(operation and operation[0] in PROTECTIVE_OPS for operation in queue)
 
 
 def queue_commitments(positions, plans):
@@ -154,14 +160,17 @@ def schedule_open_tiles(obs, targets, plans, shed_access, hire_costs=()):
     eligible.update(selected)
 
     # If a replacement seed is affordable but not delivered yet, retain the
-    # harvester on its tile. The agent's PLANT guard waits for the purchase
-    # instead of letting the worker walk away and requiring a return trip.
+    # harvester on its tile only when doing so cannot stall any already-queued
+    # protective work. The executor retries an unavailable PLANT at the front
+    # of the queue; putting that retry ahead of WATER/HARVEST/FEED/CARE is a
+    # hidden unbounded delay and was a major source of late-season crop loss.
     for index, position in enumerate(positions):
         target = vacant.get(position)
         if (
             position not in funded_positions or not target or target[0] not in CROPS
             or available["private"]["seeds"].get(target[0], 0) > 0
             or farm["tiles"][position[1]][position[0]] is not None
+            or _has_pending_protective_work(plans[index].queue)
             or len(plans[index].queue) + 3 > remaining
         ):
             continue
