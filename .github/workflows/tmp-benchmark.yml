@@ -1,0 +1,11 @@
+name: tmp-benchmark
+on:
+  push:
+    branches:
+      - tmp/benchmark-v5-seeds1-5
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python --version
