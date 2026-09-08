@@ -1,8 +1,8 @@
-name: tmp-benchmark-no-opening
+name: tmp-benchmark-hybrid-opening
 on:
   push:
     branches:
-      - tmp/benchmark-no-opening-v5
+      - tmp/benchmark-hybrid-opening-land-v5
 permissions:
   contents: read
 jobs:
@@ -42,7 +42,7 @@ jobs:
               'tests/test_agents_planner_capacity.py',
           ]))
           PY
-      - name: Benchmark no-opening seeds 1-5
+      - name: Benchmark hybrid seeds 1-5
         run: |
           python - <<'PY'
           import json, time
@@ -59,7 +59,6 @@ jobs:
               attempts = []
               unlocks = []
               seen_quadrants = [None]
-
               def timed(obs, config, current=current, times=times):
                   farm = obs['farms'][obs['player']]
                   n_quadrants = len(farm['unlocked_quadrants'])
@@ -76,13 +75,10 @@ jobs:
                   if any(order and order[0] == 'BUY_LAND' for order in action.get('market', [])):
                       attempts.append([int(obs['day']), int(obs['hour'])])
                   return action
-
               opponent, _, _ = resolve_opponent('public/A.py')
               env = make('kaggriculture', configuration=configuration(seed), debug=False)
               env.run([timed, opponent])
               final = env.steps[-1]
-              final_obs = final[0].observation
-              final_quadrants = len(final_obs['farms'][0]['unlocked_quadrants']) if isinstance(final_obs, dict) else None
               row = {
                   'seed': seed,
                   'current_cash': float(final[0].reward),
@@ -90,15 +86,60 @@ jobs:
                   'margin': float(final[0].reward - final[1].reward),
                   'buy_land_attempts': attempts,
                   'land_unlocks': unlocks,
-                  'final_quadrants': final_quadrants,
                   'max_turn_s': max(times),
                   'over_0_5s': sum(t > 0.5 for t in times),
               }
               rows.append(row)
               all_times.extend(times)
-              print('NO_OPENING_SEED=' + json.dumps(row, separators=(',', ':')))
-
-          print('NO_OPENING_SUMMARY=' + json.dumps({
+              print('HYBRID_SEED=' + json.dumps(row, separators=(',', ':')))
+          print('HYBRID_SUMMARY=' + json.dumps({
+              'mean_cash': sum(r['current_cash'] for r in rows) / len(rows),
+              'mean_opponent': sum(r['opponent_cash'] for r in rows) / len(rows),
+              'mean_margin': sum(r['margin'] for r in rows) / len(rows),
+              'max_turn_s': max(all_times),
+              'over_0_5s': sum(t > 0.5 for t in all_times),
+          }, separators=(',', ':')))
+          PY
+      - name: Benchmark V4 baseline seeds 1-5
+        run: |
+          git fetch --depth=1 origin feat/planner-capacity-v4:refs/remotes/origin/feat/planner-capacity-v4
+          git worktree add /tmp/v4 refs/remotes/origin/feat/planner-capacity-v4
+          mkdir -p /tmp/v4/public
+          cp public/A.py /tmp/v4/public/A.py
+          cd /tmp/v4
+          python - <<'PY'
+          import json, time
+          import agents
+          from kaggle_environments import make
+          import agents.expansion_agent as expansion
+          from experiments.play_match import configuration, resolve_opponent
+          rows = []
+          all_times = []
+          for seed in range(1, 6):
+              current = expansion.make_agent(29, seed=seed)
+              times = []
+              def timed(obs, config, current=current, times=times):
+                  started = time.perf_counter()
+                  try:
+                      return current(obs, config)
+                  finally:
+                      times.append(time.perf_counter() - started)
+              opponent, _, _ = resolve_opponent('public/A.py')
+              env = make('kaggriculture', configuration=configuration(seed), debug=False)
+              env.run([timed, opponent])
+              final = env.steps[-1]
+              row = {
+                  'seed': seed,
+                  'current_cash': float(final[0].reward),
+                  'opponent_cash': float(final[1].reward),
+                  'margin': float(final[0].reward - final[1].reward),
+                  'max_turn_s': max(times),
+                  'over_0_5s': sum(t > 0.5 for t in times),
+              }
+              rows.append(row)
+              all_times.extend(times)
+              print('V4_SEED=' + json.dumps(row, separators=(',', ':')))
+          print('V4_SUMMARY=' + json.dumps({
               'mean_cash': sum(r['current_cash'] for r in rows) / len(rows),
               'mean_opponent': sum(r['opponent_cash'] for r in rows) / len(rows),
               'mean_margin': sum(r['margin'] for r in rows) / len(rows),
