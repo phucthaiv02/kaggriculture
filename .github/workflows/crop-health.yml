@@ -25,10 +25,10 @@ jobs:
         run: |
           python - <<'PY'
           import json
-          from collections import Counter
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
           from agents.farm_tasks import build_tasks
+          from agents.scheduler import build_queues, hands_needed
           from experiments.crop_schedules import pass_agent
           from experiments.play_match import configuration, END_DAY
 
@@ -36,57 +36,109 @@ jobs:
               cells = dict(zip(fn.__code__.co_freevars, fn.__closure__ or ()))
               return cells[name].cell_contents
 
+          def open_shed_access(farm):
+              return tuple(
+                  p for p in ((4, 4), (5, 4), (4, 5), (5, 5))
+                  if farm['tiles'][p[1]][p[0]] != 'LOCKED'
+              )
+
+          def crop_counts(farm):
+              weeds = crops = ready = 0
+              for row in farm['tiles']:
+                  for tile in row:
+                      if isinstance(tile, dict) and tile.get('kind') == 'WEED':
+                          weeds += 1
+                      elif isinstance(tile, dict) and tile.get('kind') == 'PLANT':
+                          crops += 1
+                          ready += int(tile.get('yield_units', 0) > 0)
+              return crops, weeds, ready
+
+          def has_op(task, op):
+              return any(action and action[0] == op for action in task.actions)
+
           for seed in (1, 2, 3, 4, 5):
               production = make_agent(END_DAY - 1, seed=seed)
-              daily = []
+              records = []
+              prior_h0_weeds = 0
 
               def monitored(obs):
+                  nonlocal_prior = None
                   action = production(obs)
-                  if int(obs.day) != int(getattr(obs, 'day', obs['day'])):
-                      return action
-                  if int(obs.hour) != 23:
-                      return action
-
+                  day, hour = int(obs.day), int(obs.hour)
                   farm = obs.farms[obs.player]
                   targets = closure_value(production, 'targets')
+                  state = closure_value(production, 'state')
                   local_obs = dict(obs, _planning_end_day=END_DAY - 1)
-                  tasks = build_tasks(local_obs, targets, assume_crop_seeds=True)
-                  pending_water = 0
-                  pending_harvest = 0
-                  for task in tasks:
-                      x, y = task.position
-                      tile = farm.tiles[y][x]
-                      if not (isinstance(tile, dict) and tile.get('kind') == 'PLANT'):
-                          continue
-                      ops = {op[0] for op in task.actions if op}
-                      pending_water += int('WATER' in ops)
-                      pending_harvest += int('HARVEST' in ops)
 
-                  weeds = 0
-                  crops = 0
-                  ready = 0
-                  for row in farm.tiles:
-                      for tile in row:
-                          if isinstance(tile, dict) and tile.get('kind') == 'WEED':
-                              weeds += 1
-                          elif isinstance(tile, dict) and tile.get('kind') == 'PLANT':
-                              crops += 1
-                              ready += int(tile.get('yield_units', 0) > 0)
+                  if hour == 0:
+                      crops, weeds, ready = crop_counts(farm)
+                      records.append({
+                          'kind': 'h0', 'day': day, 'crops': crops, 'weeds': weeds,
+                          'ready': ready, 'hands': len(farm.hands),
+                          'quadrants': len(farm.unlocked_quadrants),
+                          'money': float(farm.money),
+                      })
 
-                  daily.append({
-                      'day': int(obs.day),
-                      'crops': crops,
-                      'ready_h23': ready,
-                      'pending_water_h23': pending_water,
-                      'pending_harvest_h23': pending_harvest,
-                      'weeds': weeds,
-                      'hands': len(farm.hands),
-                      'quadrants': len(farm.unlocked_quadrants),
-                      'money': float(farm.money),
-                  })
+                  if hour == 1:
+                      tasks = build_tasks(
+                          local_obs, targets,
+                          prioritize_fertilizer_drop=state['opening_active'],
+                      )
+                      tasks = [
+                          task for task in tasks
+                          if task.position not in state['deferred_expansion_positions']
+                      ]
+                      existing_hands = tuple(map(tuple, farm.hands))
+                      shed_access = open_shed_access(farm)
+                      required_hands, max_dropped = hands_needed(
+                          tasks,
+                          tuple(farm.farmer),
+                          existing_hands,
+                          shed_access,
+                          pending_hand_budget=22,
+                      )
+                      planned_hands = state['hand_target']
+                      _, unassigned = build_queues(
+                          tasks,
+                          tuple(farm.farmer),
+                          planned_hands,
+                          existing_hands,
+                          shed_access,
+                          pending_hand_budget=22,
+                      )
+                      records.append({
+                          'kind': 'h1', 'day': day,
+                          'tasks': len(tasks),
+                          'urgent_tasks': sum(task.urgent for task in tasks),
+                          'water_tasks': sum(has_op(task, 'WATER') for task in tasks),
+                          'harvest_tasks': sum(has_op(task, 'HARVEST') for task in tasks),
+                          'required_hands': required_hands,
+                          'planned_hands': planned_hands,
+                          'existing_hands': len(existing_hands),
+                          'unassigned': len(unassigned),
+                          'unassigned_urgent': sum(task.urgent for task in unassigned),
+                          'unassigned_water': sum(has_op(task, 'WATER') for task in unassigned),
+                          'unassigned_harvest': sum(has_op(task, 'HARVEST') for task in unassigned),
+                          'max_dropped': len(max_dropped),
+                      })
+
+                  if hour == 23:
+                      tasks = build_tasks(local_obs, targets)
+                      pending_water = sum(has_op(task, 'WATER') for task in tasks)
+                      pending_harvest = sum(has_op(task, 'HARVEST') for task in tasks)
+                      crops, weeds, ready = crop_counts(farm)
+                      records.append({
+                          'kind': 'h23', 'day': day,
+                          'crops': crops, 'weeds': weeds, 'ready': ready,
+                          'pending_water': pending_water,
+                          'pending_harvest': pending_harvest,
+                          'hands': len(farm.hands),
+                          'quadrants': len(farm.unlocked_quadrants),
+                          'money': float(farm.money),
+                      })
                   return action
 
               env = make('kaggriculture', configuration=configuration(seed), debug=False)
               env.run([monitored, pass_agent])
-              print('CROP_HEALTH ' + json.dumps({'seed': seed, 'days': daily}, sort_keys=True), flush=True)
+              print('CROP_HEALTH ' + json.dumps({'seed': seed, 'records': records}, sort_keys=True), flush=True)
           PY
