@@ -12,6 +12,7 @@ from __future__ import annotations
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
 
 LAND_ORDER = official_game.LAND_ORDER
+LAND_PRICES = official_game.LAND_PRICES
 
 # 12 MELON + 9 WHEAT + 2 COW + 2 SHEEP = 25 (NW's whole board). Wheat is
 # funded ahead of each animal's verified age-relative FEED schedule. In
@@ -20,9 +21,13 @@ LAND_ORDER = official_game.LAND_ORDER
 OPENING_COUNTS = {"MELON": 12, "WHEAT": 9, "COW": 2, "SHEEP": 2}
 OPENING_SIZE = sum(OPENING_COUNTS.values())
 
-# Temporarily buy exactly one quadrant on engine/UI day 7 so the expansion
-# path can be inspected in isolation.
+# Keep the verified first expansion timing. Later quadrants are no longer on
+# a fixed calendar: they unlock only after real producers occupy most of the
+# currently owned land.
 LAND_BUY_DAYS = (7,)
+LAND_BUY_UTILIZATION = 0.75
+LAND_MIN_REMAINING_DAYS = 10
+LAND_CASH_BUFFER = 1000
 
 # Convert two of the initial WHEAT targets to one COW and one SHEEP together
 # on day 2 (the UI's Day 3). Their two harvested WHEAT units can then feed
@@ -34,18 +39,54 @@ CONVERSION_START_DAY = 2
 CONVERSIONS = ("COW", "SHEEP")
 
 
-def should_buy_land_on_schedule(obs, farm):
-    """Submit one land order at hour 0 on the scheduled day, if available.
+def _land_utilization(farm):
+    """Fraction of unlocked tiles that contain a real crop or animal.
 
-    Affordability itself is left to the engine (BUY_LAND is simply a no-op if
-    the farm cannot cover the cost at that instant).
+    Desired targets do not count. Expansion should react to production that
+    the executor actually materialized, otherwise unlocking one quadrant can
+    immediately cascade into buying the rest before workers have filled it.
     """
+    active = 0
+    occupied = 0
+    for row in farm["tiles"]:
+        for tile in row:
+            if tile == "LOCKED":
+                continue
+            active += 1
+            if isinstance(tile, dict) and (
+                tile.get("kind") == "PLANT" or tile.get("animal")
+            ):
+                occupied += 1
+    return occupied / active if active else 0.0
+
+
+def should_buy_land_on_schedule(obs, farm):
+    """Submit a land order at hour 0 when the farm is ready to expand.
+
+    The first extra quadrant keeps the verified day-7 opening timing. After
+    that, expansion is demand-driven: at least 75% of the currently unlocked
+    land must contain real producers, at least ten production days must remain,
+    and the farm must retain a $1000 cash buffer after paying the next land
+    price. The engine still performs the final affordability check.
+    """
+    if obs.get("hour", 0) != 0:
+        return False
+
     n_extra = len(farm["unlocked_quadrants"]) - 1
-    return (
-        obs["day"] in LAND_BUY_DAYS
-        and obs.get("hour", 0) == 0
-        and n_extra < len(LAND_ORDER)
-    )
+    if n_extra >= len(LAND_ORDER):
+        return False
+
+    if n_extra == 0:
+        return obs["day"] in LAND_BUY_DAYS
+
+    end_day = int(obs.get("_planning_end_day", 29))
+    if end_day - int(obs["day"]) < LAND_MIN_REMAINING_DAYS:
+        return False
+    if _land_utilization(farm) < LAND_BUY_UTILIZATION:
+        return False
+
+    next_price = LAND_PRICES[n_extra]
+    return farm.get("money", 0) >= next_price + LAND_CASH_BUFFER
 
 
 def build_opening_targets(positions):
