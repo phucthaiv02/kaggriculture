@@ -1,11 +1,9 @@
-name: Apply Crop Water Route Fix
+name: Apply Crop Water Priority Fix
 
 on:
   push:
-    branches:
-      - feat/planner-capacity-v4
-    paths:
-      - .github/workflows/apply-crop-water-fix.yml
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/apply-crop-water-fix.yml]
 
 permissions:
   contents: write
@@ -21,85 +19,36 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Apply route-safety fix
+      - name: Apply crop protection priority
         run: |
           python - <<'PY'
           from pathlib import Path
-
-          path = Path('agents/farm_tasks.py')
-          text = path.read_text()
-
-          marker = '    deadline: int | None = None  # absolute engine step before a crop decays\n'
-          assert marker in text
-          text = text.replace(
-              marker,
-              marker + '    input_pending: bool = False  # mandatory input is planned but not in the shed yet\n',
-              1,
-          )
-
-          marker = '        immediate_drop, refinance_feed = False, False\n'
-          assert marker in text
-          text = text.replace(marker, marker + '        input_pending = False\n', 1)
-
-          marker = '''            elif feed_today:\n                # Keep the survival task in the schedule even when hour-1\n                # inventory is temporarily empty. feed_wheat_order can buy\n                # WHEAT on any later market pass; omitting the task here\n                # permanently left this animal unfed for the whole day.\n'''
-          assert marker in text, 'missing-WHEAT feed block not found'
-          text = text.replace(
-              marker,
-              '''            elif feed_today:\n                # Keep survival work visible for intraday rescue, but do not\n                # let an input that has not reached the shed block executable\n                # WATER/HARVEST earlier in another route.\n                input_pending = True\n''',
-              1,
-          )
-
-          marker = '                    deadline=(tile.get("max_lifespan_step") if ends_cycle and isinstance(tile, dict) else None),\n'
-          assert marker in text
-          text = text.replace(marker, marker + '                    input_pending=input_pending,\n', 1)
-          path.write_text(text)
-
           path = Path('agents/scheduler.py')
           text = path.read_text()
-          start = text.index('def _task_queue(start, bucket, shed_access):\n')
-          end = text.index('\n\ndef _tail_queue(start, task, shed_access):\n', start)
-          replacement = '''def _task_queue(start, bucket, shed_access):\n    """Build mandatory work without pulling future unavailable inputs forward.\n\n    PICKUP is emitted only when the current task actually needs an input. This\n    prevents a later FEED whose WHEAT has not settled yet from putting a\n    retrying PICKUP in front of an earlier WATER/HARVEST. Once pickup is\n    necessary, adjacent needs with the same availability class may still be\n    batched to retain the shed-trip optimization.\n    """\n    queue, current = [], start\n    prefetched_until = -1\n    for task_index, task in enumerate(bucket):\n        needs_now = _mandatory_needs(task)\n        if task_index > prefetched_until and needs_now:\n            needs = Counter()\n            pending = task.input_pending\n            prefetched_until = task_index\n            for later_index in range(task_index, len(bucket)):\n                later = bucket[later_index]\n                if later.input_pending != pending:\n                    break\n                needs.update(_mandatory_needs(later))\n                prefetched_until = later_index\n                if later.immediate_drop:\n                    break\n            shed = nearest_shed(current, shed_access)\n            queue += route(current, shed)\n            queue += [["PICKUP", item, amount] for item, amount in needs.items() if amount > 0]\n            current = shed\n\n        queue += route(current, task.position) + _mandatory_actions(task)\n        current = task.position\n        if task.immediate_drop:\n            shed = nearest_shed(current, shed_access)\n            queue += route(current, shed) + [["DROP"]]\n            current = shed\n            if task.refinance_feed:\n                queue += [["PASS"], ["PICKUP", "WHEAT", 1]]\n                queue += route(current, task.position) + [["FEED"], ["CARE"]]\n                current = task.position\n            prefetched_until = task_index\n    return queue, current\n'''
-          text = text[:start] + replacement + text[end:]
-
-          marker = '            not task.urgent,\n            not task.animal_harvest,\n'
-          assert marker in text
-          text = text.replace(
-              marker,
-              '            not task.urgent,\n            task.input_pending,\n            not task.animal_harvest,\n',
-              1,
-          )
-          marker = '                    not queued.urgent,\n                    not queued.animal_harvest,\n'
-          assert marker in text
-          text = text.replace(
-              marker,
-              '                    not queued.urgent,\n                    queued.input_pending,\n                    not queued.animal_harvest,\n',
-              1,
-          )
+          old = '''        key=lambda task: (\n            not task.urgent,\n            not task.animal_harvest,\n'''
+          new = '''        key=lambda task: (\n            not task.urgent,\n            not any(action and action[0] == "WATER" for action in _mandatory_actions(task)),\n            not task.animal_harvest,\n'''
+          assert old in text
+          text = text.replace(old, new, 1)
+          old = '''                priority = lambda queued: (\n                    not queued.urgent,\n                    not queued.animal_harvest,\n'''
+          new = '''                priority = lambda queued: (\n                    not queued.urgent,\n                    not any(action and action[0] == "WATER" for action in _mandatory_actions(queued)),\n                    not queued.animal_harvest,\n'''
+          assert old in text
+          text = text.replace(old, new, 1)
           path.write_text(text)
 
           path = Path('tests/test_agents_scheduler.py')
           text = path.read_text()
           marker = '\n\nif __name__ == "__main__":\n'
           assert marker in text
-          tests = '''\n\ndef test_pending_input_can_never_block_executable_urgent_water():\n    water = Task((4, 3), [["WATER"]], urgent=True)\n    pending_feed = Task(\n        (4, 2), [["FEED"], ["CARE"]],\n        needs=Counter({"WHEAT": 1}), urgent=True, input_pending=True,\n    )\n    plans, unassigned = build_queues(\n        [pending_feed, water], farmer_start=SHED, hand_count=0\n    )\n    assert unassigned == []\n    queue = plans[0].queue\n    assert queue.index(["WATER"]) < queue.index(["PICKUP", "WHEAT", 1])\n    assert queue.index(["PICKUP", "WHEAT", 1]) < queue.index(["FEED"])\n\n\ndef test_pending_input_does_not_evict_water_when_only_one_task_fits():\n    water = Task((4, 3), [["WATER"]], urgent=True)\n    pending_feed = Task(\n        SHED, [["FEED"]], needs=Counter({"WHEAT": 1}),\n        urgent=True, input_pending=True,\n    )\n    plans, unassigned = build_queues(\n        [pending_feed, water], farmer_start=SHED, hand_count=0,\n        existing_hand_budget=2,\n    )\n    assert ["WATER"] in plans[0].queue\n    assert unassigned == [pending_feed]\n'''
-          text = text.replace(marker, tests + marker, 1)
-          path.write_text(text)
-
-          path = Path('tests/test_agents_farm_tasks.py')
-          text = path.read_text()
-          marker = '\n\ndef test_live_animal_already_fed_is_not_fed_twice_when_tasks_are_rebuilt():\n'
-          assert marker in text
-          test = '''\n\ndef test_live_animal_missing_wheat_marks_feed_input_pending():\n    obs = make_obs(day=3, tiles={(0, 0): animal_tile("SHEEP", placed_day=0)}, shed={})\n    task = one_task(build_tasks(obs, {(0, 0): ("SHEEP", False)}))\n    assert task.actions == [["FEED"], ["CARE"]]\n    assert task.needs == {"WHEAT": 1}\n    assert task.urgent\n    assert task.input_pending\n'''
+          test = '''\n\ndef test_urgent_crop_water_outranks_other_urgent_work_when_capacity_is_tight():\n    water = Task(SHED, [["WATER"]], urgent=True)\n    feed = Task(SHED, [["FEED"]], needs=Counter({"WHEAT": 1}), urgent=True)\n    plans, unassigned = build_queues(\n        [feed, water], farmer_start=SHED, hand_count=0, existing_hand_budget=1\n    )\n    assert plans[0].queue == [["WATER"]]\n    assert unassigned == [feed]\n'''
           text = text.replace(marker, test + marker, 1)
           path.write_text(text)
-
           Path('.github/workflows/apply-crop-water-fix.yml').unlink()
           PY
       - name: Install engine and tests
         run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
-      - name: Run focused regression tests
+      - name: Focused tests
         run: python -m pytest -q tests/test_agents_scheduler.py tests/test_agents_farm_tasks.py tests/test_agents_intraday.py tests/test_agents_harvest_priority.py tests/test_agents_planner_daily.py tests/test_agents_opening_book.py
-      - name: Compare crop health on seeds 1-5
+      - name: Five-seed crop health
         run: |
           python - <<'PY'
           import json
@@ -108,10 +57,8 @@ jobs:
           from agents.farm_tasks import build_tasks
           from experiments.crop_schedules import pass_agent
           from experiments.play_match import configuration, END_DAY
-
-          final_weeds = []
-          pending_totals = []
-          for seed in (1, 2, 3, 4, 5):
+          weeds_all, pending_all, rewards = [], [], []
+          for seed in (1,2,3,4,5):
               agent = make_agent(END_DAY - 1, seed=seed)
               pending = [0]
               def monitored(obs):
@@ -120,39 +67,24 @@ jobs:
                       cells = dict(zip(agent.__code__.co_freevars, agent.__closure__ or ()))
                       targets = cells['targets'].cell_contents
                       tasks = build_tasks(dict(obs, _planning_end_day=END_DAY - 1), targets)
-                      pending[0] += sum(
-                          any(op and op[0] == 'WATER' for op in task.actions)
-                          for task in tasks
-                      )
+                      pending[0] += sum(any(op and op[0] == 'WATER' for op in t.actions) for t in tasks)
                   return action
               env = make('kaggriculture', configuration=configuration(seed), debug=False)
               env.run([monitored, pass_agent])
               tiles = env.steps[-1][0].observation.farms[0].tiles
-              weeds = sum(
-                  isinstance(tile, dict) and tile.get('kind') == 'WEED'
-                  for row in tiles for tile in row
-              )
-              final_weeds.append(weeds)
-              pending_totals.append(pending[0])
-              print('POST_CROP_HEALTH ' + json.dumps({
-                  'seed': seed, 'final_weeds': weeds,
-                  'pending_water_h23_total': pending[0],
-                  'reward': float(env.steps[-1][0].reward),
-              }, sort_keys=True), flush=True)
-          avg = sum(final_weeds) / len(final_weeds)
-          print('POST_CROP_SUMMARY ' + json.dumps({
-              'final_weeds': final_weeds,
-              'average_final_weeds': avg,
-              'pending_water_h23_total': pending_totals,
-          }, sort_keys=True), flush=True)
-          # Pre-fix exact-branch baseline: [20, 18, 24, 26, 19], mean 21.4.
+              weeds = sum(isinstance(t, dict) and t.get('kind') == 'WEED' for row in tiles for t in row)
+              reward = float(env.steps[-1][0].reward)
+              weeds_all.append(weeds); pending_all.append(pending[0]); rewards.append(reward)
+              print('CROP_HEALTH ' + json.dumps({'seed':seed,'weeds':weeds,'pending_h23':pending[0],'reward':reward}), flush=True)
+          avg = sum(weeds_all)/5
+          print('CROP_SUMMARY ' + json.dumps({'weeds':weeds_all,'mean_weeds':avg,'pending_h23':pending_all,'rewards':rewards}), flush=True)
           if avg >= 21.4:
-              raise SystemExit(f'crop health did not improve: mean weeds {avg}')
+              raise SystemExit(f'no improvement: mean weeds {avg}')
           PY
-      - name: Commit fix
+      - name: Commit proven fix
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add agents/farm_tasks.py agents/scheduler.py tests/test_agents_scheduler.py tests/test_agents_farm_tasks.py .github/workflows/apply-crop-water-fix.yml
-          git commit -m 'fix: keep pending inputs behind crop protection'
+          git add agents/scheduler.py tests/test_agents_scheduler.py .github/workflows/apply-crop-water-fix.yml
+          git commit -m 'fix: prioritize urgent crop watering under capacity'
           git push origin HEAD:feat/planner-capacity-v4
