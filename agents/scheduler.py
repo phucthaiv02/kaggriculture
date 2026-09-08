@@ -66,6 +66,39 @@ class WorkerPlan:
     queue: list  # ops to pop one per turn
 
 
+def _mandatory_actions(task):
+    """Return the part of a task that must finish before its deadline.
+
+    A finished one-time crop can carry a whole producer transition in one
+    ``Task``: WATER, HARVEST, then PLANT/PLACE the next target.  Packing that
+    atomically made the deadline-sensitive harvest depend on optional work
+    *after* the tile becomes empty.  Under a synchronized WHEAT harvest wall,
+    a route that had time for WATER+HARVEST could therefore be rejected just
+    because its replant tail did not fit.
+
+    Harvesting the ripe crop is the irreversible/deadline-sensitive part.
+    Once HARVEST actually clears the tile, agents/intraday.py observes the
+    vacancy on the next turn and safely schedules any feasible replacement.
+    """
+    if task.urgent and task.ends_cycle:
+        for index, action in enumerate(task.actions):
+            if action and action[0] == "HARVEST":
+                return task.actions[:index + 1]
+    return task.actions
+
+
+def _mandatory_needs(task):
+    """Inputs required by the mandatory prefix, excluding deferred replacement."""
+    actions = _mandatory_actions(task)
+    if len(actions) < len(task.actions):
+        # For a ripe one-time crop, build_tasks' ``needs`` belong to the
+        # post-HARVEST replacement (animal/feed/etc.).  WATER and HARVEST do
+        # not need a shed pickup.  Keep those supplies available for intraday
+        # placement rather than making the harvest route detour for them.
+        return Counter()
+    return task.needs
+
+
 def _task_queue(start, bucket, shed_access):
     """Build the mandatory route, sharing execution and packing accounting.
 
@@ -78,7 +111,7 @@ def _task_queue(start, bucket, shed_access):
         if pickup_needed:
             needs = Counter()
             for later in bucket[task_index:]:
-                needs.update(later.needs)
+                needs.update(_mandatory_needs(later))
                 if later.immediate_drop:
                     break
             if needs:
@@ -87,7 +120,7 @@ def _task_queue(start, bucket, shed_access):
                 queue += [["PICKUP", item, amount] for item, amount in needs.items() if amount > 0]
                 current = shed
             pickup_needed = False
-        queue += route(current, task.position) + task.actions
+        queue += route(current, task.position) + _mandatory_actions(task)
         current = task.position
         if task.immediate_drop:
             shed = nearest_shed(current, shed_access)
@@ -105,8 +138,9 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
     """Greedy bin-pack using each candidate worker's exact queue length.
 
     The projection includes travel from the real spawn, one operation for
-    every distinct PICKUP, travel between tasks, and all tile actions. The
-    optional DROP trip is added later only when it fits.
+    every distinct PICKUP, travel between tasks, and all mandatory tile
+    actions. Optional post-harvest replacement work is admitted later by the
+    intraday vacancy scheduler once the harvest has really happened.
     """
     buckets = [[] for _ in worker_starts]
 
@@ -132,7 +166,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
                 abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
                 for start in worker_starts
             ),
-            -len(task.actions),
+            -len(_mandatory_actions(task)),
             task.position[1],
             task.position[0],
         ),
