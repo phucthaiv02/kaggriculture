@@ -9,6 +9,7 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as game
 
 from agents.opening_book import (
     LAND_BUY_DAYS,
+    MAX_SCHEDULED_LAND_PURCHASES,
     OPENING_COUNTS,
     OPENING_REFINANCE_DAY,
     PLANNER_HANDOFF_DAY,
@@ -80,13 +81,28 @@ def test_day_zero_purchase_plan_covers_every_required_feed_action():
     assert ["BUY_ANIMAL", "SHEEP", 2] in orders
 
 
-def test_debug_land_purchase_is_only_on_day_seven():
+def test_land_purchase_schedule_is_exactly_day_seven_and_day_ten():
     farm = {"unlocked_quadrants": ["NW"]}
-    assert LAND_BUY_DAYS == (7,)
-    assert should_buy_land_on_schedule({"day": 6, "hour": 0}, farm) is False
+    assert LAND_BUY_DAYS == (7, 10)
+    assert MAX_SCHEDULED_LAND_PURCHASES == 2
+    for day in (0, 6, 8, 9, 11, 20, 29):
+        assert should_buy_land_on_schedule({"day": day, "hour": 0}, farm) is False
     assert should_buy_land_on_schedule({"day": 7, "hour": 0}, farm) is True
+    assert should_buy_land_on_schedule({"day": 10, "hour": 0}, farm) is True
     assert should_buy_land_on_schedule({"day": 7, "hour": 1}, farm) is False
-    assert should_buy_land_on_schedule({"day": 8, "hour": 0}, farm) is False
+    assert should_buy_land_on_schedule({"day": 10, "hour": 1}, farm) is False
+
+
+def test_day_ten_can_buy_second_quadrant_but_never_a_third():
+    after_first_buy = {"unlocked_quadrants": ["NW", "NE"]}
+    assert should_buy_land_on_schedule(
+        {"day": 10, "hour": 0}, after_first_buy
+    ) is True
+
+    after_two_buys = {"unlocked_quadrants": ["NW", "NE", "SW"]}
+    assert should_buy_land_on_schedule(
+        {"day": 10, "hour": 0}, after_two_buys
+    ) is False
 
 
 def test_build_opening_targets_rejects_wrong_board_size():
