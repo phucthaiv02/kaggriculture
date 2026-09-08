@@ -1,0 +1,148 @@
+name: Apply Full Actual Position Replan
+
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/apply-all-task-replan.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/planner-capacity-v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply exact lifecycle plus full replan
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          # Exact one-time crop lifecycle: never harvest early for target conversion.
+          p=Path('agents/farm_tasks.py')
+          s=p.read_text()
+          old='''            early_exit = (\n                crop not in ONGOING_CROPS and name != crop and tile.get("yield_units", 0) > 0\n            )\n'''
+          new='''            # Target changes wait until the current one-time crop reaches\n            # its verified max-yield age. Early harvest sacrifices yield; a\n            # late harvest enters decay.\n            early_exit = False\n'''
+          assert old in s
+          p.write_text(s.replace(old,new,1))
+
+          # Due one-time max-yield harvests are hard-deadline work.
+          p=Path('agents/scheduler.py')
+          s=p.read_text()
+          old='''    ordered = sorted(\n        tasks,\n        key=lambda task: (\n            not task.urgent,\n            not (task.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(task))),\n            not task.animal_harvest,\n'''
+          new='''    def hard_crop_harvest(task):\n        return (\n            task.ends_cycle\n            and any(action and action[0] == "HARVEST" for action in _mandatory_actions(task))\n        )\n\n    ordered = sorted(\n        tasks,\n        key=lambda task: (\n            not hard_crop_harvest(task),\n            not task.urgent,\n            not (task.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(task))),\n            not task.animal_harvest,\n'''
+          assert old in s
+          s=s.replace(old,new,1)
+          old2='''                priority = lambda queued: (\n                    not queued.urgent,\n                    not (queued.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(queued))),\n                    not queued.animal_harvest,\n'''
+          new2='''                priority = lambda queued: (\n                    not hard_crop_harvest(queued),\n                    not queued.urgent,\n                    not (queued.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(queued))),\n                    not queued.animal_harvest,\n'''
+          assert old2 in s
+          p.write_text(s.replace(old2,new2,1))
+
+          # Hour 2 receding-horizon replan: all successful morning hires now
+          # exist at their actual positions. Throw away stale predicted-start
+          # routes and rebuild ALL currently unfinished work from live state.
+          p=Path('agents/expansion_agent.py')
+          s=p.read_text()
+          marker='''    def _schedule_late_placements(obs, farm, day, hour):\n'''
+          insert='''    def _replan_all_from_actual(obs, farm, day, hour):\n        """Rebuild every unfinished route from live worker positions at hour 2.\n\n        Hour-1 planning may use predicted spawn positions for hands hired that\n        morning. By hour 2 all successful hires are observable. Replanning from\n        current state removes route drift without discarding animal, market, or\n        expansion work; completed hour-1 actions are naturally absent from the\n        new build_tasks result.\n        """\n        if hour != 2:\n            return\n        tasks = build_tasks(\n            obs, targets, prioritize_fertilizer_drop=state["opening_active"]\n        )\n        state["deferred_expansion_positions"] = {\n            position for position in state["deferred_expansion_positions"]\n            if not isinstance(farm["tiles"][position[1]][position[0]], dict)\n        }\n        tasks = [\n            task for task in tasks\n            if task.position not in state["deferred_expansion_positions"]\n        ]\n        actual_hands = tuple(map(tuple, farm["hands"]))\n        remaining = 24 - hour\n        plans, admitted, unassigned, protective_debt = _capacity_safe_queues(\n            tasks, tuple(farm["farmer"]), len(actual_hands), actual_hands,\n            _open_shed_access(farm), pending_hand_budget=remaining,\n            existing_hand_budget=remaining,\n        )\n        state["plans"] = plans\n        state["reserved"] = reserved_items(admitted)\n        state["protective_debt_positions"] = {task.position for task in protective_debt}\n        state["scheduled_placements"] = {\n            task.position for task in admitted\n            if any(action[0] in ("PLANT", "PLACE") for action in task.actions)\n        }\n        state["unverified_hand_indices"] = set()\n\n'''
+          assert marker in s
+          s=s.replace(marker,insert+marker,1)
+          call='''        if state["unverified_hand_indices"]:\n            _validate_predicted_hands(farm, hour)\n'''
+          repl='''        if state["unverified_hand_indices"]:\n            _validate_predicted_hands(farm, hour)\n        _replan_all_from_actual(obs, farm, day, hour)\n'''
+          assert call in s
+          p.write_text(s.replace(call,repl,1))
+
+          # Update old target-conversion tests to the new exact-max-yield invariant.
+          p=Path('tests/test_agents_farm_tasks.py')
+          s=p.read_text()
+          old='''def test_wheat_conversion_builds_pasture_immediately_after_harvest_without_inputs():\n    obs = make_obs(\n        day=1,\n        tiles={(0, 0): plant("WHEAT", planted_day=0, day=1, yield_units=1)},\n        shed={},\n    )\n    task = one_task(build_tasks(obs, {(0, 0): ("COW", False)}))\n    assert task.actions == [["WATER"], ["HARVEST"], ["BUILD_PASTURE"]]\n    assert task.ends_cycle\n    assert not task.needs\n\n\ndef test_wheat_conversion_does_not_feed_cow_on_placement_day():\n    obs = make_obs(\n        day=2,\n        tiles={(0, 0): plant("WHEAT", planted_day=0, day=2, yield_units=1)},\n        shed={"COW": 1},\n    )\n    task = one_task(build_tasks(obs, {(0, 0): ("COW", False)}))\n    assert task.actions == [\n        ["WATER"], ["HARVEST"], ["BUILD_PASTURE"], ["PLACE", "COW"]\n    ]\n    assert task.needs == {"COW": 1}\n    assert task.sells == {}\n'''
+          new='''def test_wheat_conversion_waits_for_exact_max_yield_day():\n    obs = make_obs(\n        day=1,\n        tiles={(0, 0): plant("WHEAT", planted_day=0, day=1, yield_units=1)},\n        shed={},\n    )\n    assert build_tasks(obs, {(0, 0): ("COW", False)}) == []\n\n\ndef test_wheat_conversion_keeps_maintenance_before_max_yield():\n    obs = make_obs(\n        day=2,\n        tiles={(0, 0): plant("WHEAT", planted_day=0, day=2, yield_units=1)},\n        shed={"COW": 1},\n    )\n    task = one_task(build_tasks(obs, {(0, 0): ("COW", False)}))\n    assert task.actions == [["WATER"]]\n    assert not task.ends_cycle\n    assert not task.needs\n\n\ndef test_wheat_conversion_happens_on_exact_max_yield_day():\n    obs = make_obs(\n        day=4,\n        tiles={(0, 0): plant("WHEAT", planted_day=0, day=4, yield_units=4)},\n        shed={"COW": 1},\n    )\n    task = one_task(build_tasks(obs, {(0, 0): ("COW", False)}))\n    assert task.actions == [\n        ["WATER"], ["HARVEST"], ["BUILD_PASTURE"], ["PLACE", "COW"]\n    ]\n    assert task.ends_cycle\n    assert task.needs == {"COW": 1}\n'''
+          assert old in s
+          p.write_text(s.replace(old,new,1))
+
+          t=Path('tests/test_agents_exact_crop_harvest.py')
+          t.write_text('''from agents.farm_tasks import Task, build_tasks\nfrom agents.scheduler import SHED, build_queues\nfrom tests.test_agents_farm_tasks import make_obs, plant\n\n\ndef test_target_change_does_not_harvest_early():\n    tile = plant("WHEAT", planted_day=0, day=2, yield_units=2)\n    task = build_tasks(make_obs(day=2, tiles={(0, 0): tile}), {(0, 0): ("CARROT", False)})[0]\n    assert ["HARVEST"] not in task.actions\n\n\ndef test_exact_max_yield_harvest_exists():\n    tile = plant("WHEAT", planted_day=0, day=4, yield_units=4)\n    task = build_tasks(make_obs(day=4, tiles={(0, 0): tile}), {(0, 0): ("WHEAT", False)})[0]\n    assert ["HARVEST"] in task.actions\n\n\ndef test_due_harvest_outranks_water_when_only_one_fits():\n    harvest = Task(SHED, [["HARVEST"]], urgent=True, ends_cycle=True, deadline=120)\n    water = Task(SHED, [["WATER"]], urgent=True)\n    plans, unassigned = build_queues([water, harvest], SHED, 0, (), (SHED,), existing_hand_budget=1)\n    assert plans[0].queue == [["HARVEST"]]\n    assert unassigned == [water]\n''')
+
+          Path('.github/workflows/apply-all-task-replan.yml').unlink()
+          PY
+
+      - name: Install engine and tests
+        run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
+
+      - name: Focused tests
+        run: python -m pytest -q tests/test_agents_exact_crop_harvest.py tests/test_agents_capacity_guard.py tests/test_agents_scheduler.py tests/test_agents_farm_tasks.py tests/test_agents_intraday.py tests/test_agents_harvest_priority.py tests/test_agents_planner_daily.py tests/test_agents_opening_book.py
+
+      - name: Five-seed lifecycle and reward gate
+        run: |
+          python - <<'PY'
+          import json
+          from copy import deepcopy
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+          from agents.schedules import ONGOING_CROPS, CROP_LAST_AGE
+          from experiments.crop_schedules import pass_agent
+          from experiments.play_match import configuration, END_DAY
+
+          rows=[]
+          for seed in (1,2,3,4,5):
+              agent=make_agent(END_DAY-1, seed=seed)
+              preventable=[]; terminal=[]; early=[]; exact=[]; max_hands=0; hand_days=[]
+              def monitored(obs):
+                  previous=monitored.state
+                  tiles=obs.farms[obs.player].tiles
+                  if previous is not None:
+                      prev_tiles,pd,ph=previous
+                      step=int(obs.day)*24+int(obs.hour)
+                      for y,row in enumerate(tiles):
+                          for x,cur in enumerate(row):
+                              old=prev_tiles[y][x]
+                              if not (isinstance(old,dict) and old.get('kind')=='PLANT'):
+                                  continue
+                              crop=old['crop']; age=pd-old['planted_day']
+                              same_plant=(isinstance(cur,dict) and cur.get('kind')=='PLANT' and cur.get('crop')==crop and cur.get('planted_day')==old.get('planted_day'))
+                              became_weed=(isinstance(cur,dict) and cur.get('kind')=='WEED')
+                              if crop not in ONGOING_CROPS and not same_plant and not became_weed and old.get('yield_units',0)>0:
+                                  if age < CROP_LAST_AGE[crop]: early.append((pd,ph,(x,y),crop,age))
+                                  elif age == CROP_LAST_AGE[crop]: exact.append((pd,ph,(x,y),crop))
+                              if became_weed:
+                                  deadline=old.get('max_lifespan_step',-1)
+                                  terminal_ok=(crop in ONGOING_CROPS and ((isinstance(deadline,int) and deadline>=0 and step>=deadline) or (age>=CROP_LAST_AGE[crop] and old.get('yield_units',0)==0)))
+                                  event=(int(obs.day),int(obs.hour),(x,y),crop,old.get('consecutive_unwatered'),deadline)
+                                  (terminal if terminal_ok else preventable).append(event)
+                  if int(obs.hour)==1:
+                      hand_days.append((int(obs.day),len(obs.farms[obs.player].hands)))
+                  monitored.state=(deepcopy(tiles),int(obs.day),int(obs.hour))
+                  return agent(obs)
+              monitored.state=None
+              env=make('kaggriculture', configuration=configuration(seed), debug=False)
+              env.run([monitored, pass_agent])
+              reward=float(env.steps[-1][0].reward)
+              row={'seed':seed,'preventable':preventable,'terminal':len(terminal),'early':early,'exact_count':len(exact),'reward':reward,'hand_days':hand_days}
+              rows.append(row)
+              print('FULL_REPLAN '+json.dumps(row), flush=True)
+          total=sum(len(r['preventable']) for r in rows)
+          early_total=sum(len(r['early']) for r in rows)
+          mean_reward=sum(r['reward'] for r in rows)/5
+          print('FULL_REPLAN_SUMMARY '+json.dumps({'preventable_total':total,'early_total':early_total,'mean_reward':mean_reward}), flush=True)
+          if early_total:
+              raise SystemExit(f'early harvests remain: {early_total}')
+          if total:
+              raise SystemExit(f'preventable crop loss remains: {total}')
+          if mean_reward < 105000:
+              raise SystemExit(f'reward still too low: {mean_reward}')
+          PY
+
+      - name: Commit proven full replan
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add agents/farm_tasks.py agents/scheduler.py agents/expansion_agent.py tests/test_agents_farm_tasks.py tests/test_agents_exact_crop_harvest.py .github/workflows/apply-all-task-replan.yml
+          git commit -m 'fix: replan all work from actual hand positions'
+          git push origin HEAD:feat/planner-capacity-v4
