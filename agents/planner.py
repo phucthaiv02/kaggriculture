@@ -7,6 +7,7 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as official_gam
 from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 from agents.forecast import MarketForecast, Production, production
 from agents.labor import LaborForecast
+from agents.scheduler import MAX_HANDS
 from agents.schedules import CROP_LAST_AGE, ONGOING_CROPS, cycle_finished
 from agents.horizon import (
     SEASON_END_DAY, TARGET_HORIZON_DAYS, cycle_end as _cycle_end,
@@ -19,6 +20,13 @@ SEED_COST = {name: official_game.CROPS[name]["seed"] for name in CROPS}
 ANIMAL_COST = {name: official_game.ANIMALS[name]["cost"] for name in ANIMALS}
 LAND_ORDER = official_game.LAND_ORDER
 LAND_BUY_UTILIZATION = 0.75
+
+# At most one brand-new producer per currently possible worker is allowed to
+# influence the shared market/labor baseline during one planning pass. The
+# executor may start more than this, but those extra desired targets are not
+# treated as committed production until a later observation makes them real.
+FRESH_COMMIT_SLOTS = MAX_HANDS + 1  # farmer + maximum hired hands
+
 # A standard 720-turn season has 30 days, indexed 0 through 29 by the engine.
 
 
@@ -33,12 +41,18 @@ def _rotation(name, fertilize, day, end_day, tile=None):
     if tile is None and day + _first_yield_age(name) > end_day:
         return Production(), 0
     if name in ANIMALS:
-        return production(name, fertilize, day, end_day, tile), (0 if tile is not None else ANIMAL_COST[name])
+        return production(name, fertilize, day, end_day, tile), (
+            0 if tile is not None else ANIMAL_COST[name]
+        )
     output = production(name, fertilize, day, end_day, tile)
     cost = 0 if tile is not None else SEED_COST[name]
-    planted = tile['planted_day'] if tile is not None else day
+    planted = tile["planted_day"] if tile is not None else day
     start = max(day, planted + CROP_LAST_AGE[name])
-    first_harvest = _first_yield_age(name) if name in ONGOING_CROPS else CROP_LAST_AGE[name]
+    first_harvest = (
+        _first_yield_age(name)
+        if name in ONGOING_CROPS
+        else CROP_LAST_AGE[name]
+    )
     while start + first_harvest <= end_day:
         output.add(production(name, fertilize, start, end_day))
         cost += SEED_COST[name]
@@ -84,13 +98,17 @@ def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
     end = _cycle_end(market.day, market.end_day)
     scoped_market = copy(market)
     scoped_market.end_day = end
+
     def scoped(flow):
         result = Production()
         for field in ("sales", "inputs", "visits"):
             getattr(result, field).update(
-                (d, value) for d, value in getattr(flow, field).items()
-                if market.day <= d <= end)
+                (d, value)
+                for d, value in getattr(flow, field).items()
+                if market.day <= d <= end
+            )
         return result
+
     scoped_baseline = scoped(baseline)
     baseline_cost = labor.cost(scoped_baseline.visits)
     baseline_value = scoped_market.value(scoped_baseline)
@@ -98,20 +116,36 @@ def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
         if market.day + _first_yield_age(choice[0]) > end:
             continue
         output = scoped(output)
-        results.append(TargetProfit(
-            choice, output,
-            scoped_market.marginal_profit(scoped_baseline, output, 0, baseline_value),
-            cost, labor.marginal_cost(scoped_baseline, output, position, baseline_cost),
-        ))
+        results.append(
+            TargetProfit(
+                choice,
+                output,
+                scoped_market.marginal_profit(
+                    scoped_baseline, output, 0, baseline_value
+                ),
+                cost,
+                labor.marginal_cost(
+                    scoped_baseline, output, position, baseline_cost
+                ),
+            )
+        )
     return results
 
 
 def _choose(market, baseline, candidates, counts, labor=None, position=(4, 4)):
-    profitable = [result for result in evaluate_targets(market, baseline, candidates, labor, position)
-                  if result.profit > 0]
+    profitable = [
+        result
+        for result in evaluate_targets(
+            market, baseline, candidates, labor, position
+        )
+        if result.profit > 0
+    ]
     if not profitable:
         return None, None
-    result = max(profitable, key=lambda r: (r.profit, -counts[r.choice[0]], r.choice))
+    result = max(
+        profitable,
+        key=lambda r: (r.profit, -counts[r.choice[0]], r.choice),
+    )
     return result.choice, result.output
 
 
@@ -152,18 +186,37 @@ def should_buy_land(farm, active_positions):
     occupied = 0
     for x, y in active_positions:
         tile = tiles[y][x]
-        if isinstance(tile, dict) and (tile.get("kind") == "PLANT" or "animal" in tile):
+        if isinstance(tile, dict) and (
+            tile.get("kind") == "PLANT" or "animal" in tile
+        ):
             occupied += 1
     return occupied / len(active_positions) >= LAND_BUY_UTILIZATION
 
 
+def _is_fresh_target_tile(tile):
+    """True when a choice would create a producer on currently idle land."""
+    return not (
+        isinstance(tile, dict)
+        and (tile.get("kind") == "PLANT" or tile.get("animal"))
+    )
+
+
 def plan_targets(obs, targets, active_positions, end_day):
-    """Reprice each new commitment against actual remaining production.
+    """Reprice targets against actual production plus a bounded commitment set.
 
     Existing crops are forecast from their real age, held yield and watering
     state, including visible opponent crops. Unsown choices are reconsidered
     each day. No profitable candidate means no planting, with harvest-only
     cleanup handled by build_tasks.
+
+    A target decision is not the same thing as a producer that will actually
+    start this pass. Fresh empty/structure tiles are still assigned desired
+    targets so the executor can use any spare capacity, but only the first
+    ``FRESH_COMMIT_SLOTS`` (nearest the shed, matching the planning order) are
+    allowed to add future supply/labor to the shared baseline. That prevents
+    a whole unlocked quadrant from depressing later candidate scores before
+    the scheduler has had a chance to materialize it. Finished/replanting
+    producers remain committed normally.
     """
     day = obs["day"]
     end_day = _cycle_end(day, end_day)
@@ -172,6 +225,7 @@ def plan_targets(obs, targets, active_positions, end_day):
     counts = Counter()
     replanning = []
     external = Production()
+
     for position in active_positions:
         x, y = position
         tile = farm["tiles"][y][x]
@@ -182,7 +236,11 @@ def plan_targets(obs, targets, active_positions, end_day):
             if not cycle_finished(tile["crop"], day - tile["planted_day"], tile):
                 continue
             # Preserve a conversion already scheduled by the opening.
-            if current and current[0] != tile["crop"] and can_start(current[0], day, end_day):
+            if (
+                current
+                and current[0] != tile["crop"]
+                and can_start(current[0], day, end_day)
+            ):
                 continue
         replanning.append(position)
 
@@ -194,7 +252,9 @@ def plan_targets(obs, targets, active_positions, end_day):
             for x, tile in enumerate(row):
                 if not isinstance(tile, dict):
                     continue
-                name = tile.get("animal") or (tile.get("crop") if tile.get("kind") == "PLANT" else None)
+                name = tile.get("animal") or (
+                    tile.get("crop") if tile.get("kind") == "PLANT" else None
+                )
                 if not name:
                     continue
                 target = targets.get((x, y)) if player == obs["player"] else None
@@ -210,37 +270,85 @@ def plan_targets(obs, targets, active_positions, end_day):
                     counts[name] += 1
 
     # Include unsold goods exactly once, separately from remaining tile output.
-    baseline.sales[day].update({p: n for p, n in obs["private"]["shed"].items() if p in official_game.PRODUCTS})
+    baseline.sales[day].update({
+        p: n
+        for p, n in obs["private"]["shed"].items()
+        if p in official_game.PRODUCTS
+    })
     for carried in obs["private"].get("inventories", []):
-        baseline.sales[day].update({p: n for p, n in carried.items() if p in official_game.PRODUCTS})
+        baseline.sales[day].update({
+            p: n
+            for p, n in carried.items()
+            if p in official_game.PRODUCTS
+        })
     for position, target in targets.items():
         if not target or position in replanning:
             continue
         x, y = position
         tile = farm["tiles"][y][x]
-        actual = tile.get("animal") or tile.get("crop") if isinstance(tile, dict) else None
+        actual = (
+            tile.get("animal") or tile.get("crop")
+            if isinstance(tile, dict)
+            else None
+        )
         if actual != target[0] and not actual:
             baseline.add(_rotation(*target, day, end_day)[0], position)
             counts[target[0]] += 1
 
-    market = MarketForecast(obs["market"]["inventory"], obs["town"]["unlocked_shops"],
-                            day, end_day, obs.get("hour", 0), obs["market"].get("params"), external)
+    market = MarketForecast(
+        obs["market"]["inventory"],
+        obs["town"]["unlocked_shops"],
+        day,
+        end_day,
+        obs.get("hour", 0),
+        obs["market"].get("params"),
+        external,
+    )
     candidates = list(_candidates(day, end_day))
     shed_access = ((4, 4), (5, 4), (4, 5), (5, 5))
+
     def distance(p):
-        return min(abs(p[0] - s[0]) + abs(p[1] - s[1]) for s in shed_access)
-    labor = LaborForecast(tuple(p for p in shed_access if farm["tiles"][p[1]][p[0]] != "LOCKED"))
-    # Assign in a stable order near the shed, updating supply and labor after every pick.
-    for position in sorted(replanning, key=lambda p: (distance(p), p[1], p[0])):
+        return min(
+            abs(p[0] - s[0]) + abs(p[1] - s[1])
+            for s in shed_access
+        )
+
+    labor = LaborForecast(tuple(
+        p
+        for p in shed_access
+        if farm["tiles"][p[1]][p[0]] != "LOCKED"
+    ))
+    fresh_commits = 0
+
+    # Assign near the shed first. Only a bounded number of brand-new choices
+    # enter the shared baseline; all desired targets are still recorded.
+    for position in sorted(
+        replanning, key=lambda p: (distance(p), p[1], p[0])
+    ):
         x, y = position
         tile = farm["tiles"][y][x]
         allowed = candidates
         if isinstance(tile, dict) and tile.get("kind") in ("COOP", "PASTURE"):
-            allowed = [c for c in candidates if c[0][0] in ANIMALS
-                       and official_game.ANIMALS[c[0][0]]["structure"] == tile["kind"]]
-        choice, output = _choose(market, baseline, allowed, counts, labor, position)
+            allowed = [
+                c
+                for c in candidates
+                if c[0][0] in ANIMALS
+                and official_game.ANIMALS[c[0][0]]["structure"] == tile["kind"]
+            ]
+
+        choice, output = _choose(
+            market, baseline, allowed, counts, labor, position
+        )
         targets[position] = choice
-        if choice:
-            # Include this commitment's supply and labor in the shared window.
-            baseline.add(output, position)
-            counts[choice[0]] += 1
+        if not choice:
+            continue
+
+        fresh = _is_fresh_target_tile(tile)
+        if fresh and fresh_commits >= FRESH_COMMIT_SLOTS:
+            # Desired but not trusted as immediate committed production.
+            continue
+
+        baseline.add(output, position)
+        counts[choice[0]] += 1
+        if fresh:
+            fresh_commits += 1
