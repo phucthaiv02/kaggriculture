@@ -1,6 +1,7 @@
 """Fill newly empty tiles using only uncommitted worker time and supplies."""
 
 from collections import Counter
+from agents.horizon import can_start_today
 
 from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 
@@ -67,7 +68,7 @@ def schedule_open_tiles(obs, targets, plans, shed_access, hire_costs=()):
             continue
         if position in committed or (isinstance(tile, dict) and (tile.get("crop") or tile.get("animal"))):
             eligible[position] = target
-        else:
+        elif can_start_today(target[0], obs):
             vacant[position] = target
 
     # The worker that just harvested need not leave and walk back later.

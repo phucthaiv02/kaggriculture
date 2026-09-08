@@ -66,7 +66,7 @@ def test_profitable_alternatives_survive_category_concentration():
     assert choice[0] != "WHEAT", choice
 
 
-def test_crop_rotation_values_additional_complete_cycles():
+def test_crop_score_adds_replants_inside_the_window():
     from agents.planner import _score
 
     committed = Counter({"WHEAT": 100})

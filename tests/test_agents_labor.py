@@ -5,7 +5,7 @@ from agents.planner import _rotation, _choose
 from agents.expansion_agent import _protect_animal_structures
 
 
-def test_crop_rotation_accounts_for_every_seed_and_harvest():
+def test_crop_window_accounts_for_every_seed_and_harvest():
     flow, cost = _rotation('WHEAT', False, 0, 12)
     assert cost == 30
     assert {day: units['WHEAT'] for day, units in flow.sales.items() if units['WHEAT']} == {4: 4, 8: 4, 12: 4}
@@ -17,7 +17,7 @@ def test_existing_rotation_does_not_charge_sunk_seed():
     tile['yield_units'] = 3
     flow, cost = _rotation('WHEAT', False, 3, 8, tile)
     assert cost == 10
-    assert sum(flow.sales[d]['WHEAT'] for d in flow.sales) > 4
+    assert [d for d, units in flow.sales.items() if units['WHEAT']] == [4, 8]
 
 
 def test_daily_hires_are_not_free_or_paid_only_once():
@@ -30,9 +30,10 @@ def test_daily_hires_are_not_free_or_paid_only_once():
 
 def test_labor_cost_can_reverse_gross_profit_ranking():
     class Revenue:
+        day, end_day = 0, 29
         def value(self, _): return 0
         def marginal_profit(self, baseline, output, cost, baseline_value):
-            return 100 if output is busy else 90
+            return 100 if output.visits else 90
     busy, light = Production(), Production()
     # The farm already needs many workers. A daily-work producer adds
     # costly marginal hires; the low-maintenance option fits existing labor.

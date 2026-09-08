@@ -6,6 +6,14 @@ Strategy agents, experiments, and regression tests for Kaggle's
 The production agent manages crops, animals, labor, land expansion, and market
 orders to maximize end-of-season cash.
 
+New PLACE/PLANT targets maximize net profit over a shared window of
+`min(16, end_day - day)` elapsed days, including harvests on the final day.
+Candidates whose first yield falls beyond this window are excluded. Only
+scheduled harvests within the window contribute revenue. Crops are replanted
+when at least one subsequent scheduled harvest fits, with every seed charged.
+Profit includes purchase, feed, fertilizer,
+additional labor, and market price impact, without profit-per-day normalization.
+
 ## Repository layout
 
 - `agents/` — production planning, scheduling, forecasting, labor, selling,

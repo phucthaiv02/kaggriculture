@@ -72,9 +72,34 @@ def test_final_cash_beats_starting_money():
 
 
 def test_day_zero_fills_all_25_opening_tiles():
-    _, daily = run_solo(seed=1, end_day=1)
+    _, daily = run_solo(seed=1)
     day_one = next(row for row in daily if row["day"] == 1)
     assert day_one["occupied"] == 25
+
+
+def test_thirty_day_game_never_starts_production_past_first_yield_deadline():
+    config = configuration(1)
+    config['episodeSteps'] = 30 * 24
+    env = make('kaggriculture', configuration=config, debug=False)
+    # Deliberately pass the old erroneous endpoint: actual config must win.
+    env.run([make_agent(30, seed=1), pass_agent])
+    seen = set()
+    for step in env.steps:
+        for y, row in enumerate(step[0].observation.farms[0]['tiles']):
+            for x, tile in enumerate(row):
+                if not isinstance(tile, dict):
+                    continue
+                name = tile.get('animal') or tile.get('crop')
+                if not name:
+                    continue
+                start = tile.get('placed_day', tile.get('planted_day'))
+                key = (x, y, name, start)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rules = official_game.ANIMALS if tile.get('animal') else official_game.CROPS
+                assert start + rules[name]['first_yield_day'] <= 29, key
+    assert seen
 
 
 def test_money_does_not_stay_near_zero_past_day_15():

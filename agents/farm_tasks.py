@@ -15,6 +15,7 @@ can be revisited daily (see agents/schedules.py's module docstring).
 from __future__ import annotations
 
 from collections import Counter
+from agents.horizon import SEASON_END_DAY, can_start, can_start_today
 from dataclasses import dataclass, field
 
 from kaggle_environments.envs.kaggriculture.kaggriculture import ANIMALS as ENV_ANIMALS
@@ -48,7 +49,8 @@ class Task:
 
 
 def _new_planting_actions(name, fertilize_commit, seeds_available, animals_available, wheat_available,
-                           needs_dig, needs_build=True, wheat_needs_pickup=True):
+                           needs_dig, needs_build=True, wheat_needs_pickup=True,
+                           day=0, end_day=SEASON_END_DAY):
     """Actions to start a fresh planting/placement on an empty (or weedy) tile.
 
     `needs_build` is False only for an animal moving onto a structure that's
@@ -56,6 +58,8 @@ def _new_planting_actions(name, fertilize_commit, seeds_available, animals_avail
     escaped from) -- BUILD_PASTURE there would just no-op (the engine
     requires `tile is None`), silently wasting one of that worker's turns.
     """
+    if not can_start(name, day, end_day):
+        return None, Counter()
     if name in CROPS:
         if not seeds_available:
             return None, Counter()
@@ -264,6 +268,7 @@ def build_tasks(
                     wheat_left + (1 if harvested_feed else 0),
                     False,
                     wheat_needs_pickup=not harvested_feed,
+                    day=day, end_day=obs.get('_planning_end_day', SEASON_END_DAY),
                 )
                 if new_actions:
                     if name in CROPS:
@@ -288,6 +293,7 @@ def build_tasks(
                 name, fertilize_commit, 0, available, wheat_left,
                 needs_dig=isinstance(tile, dict) and not already_built,
                 needs_build=not already_built,
+                day=day, end_day=obs.get('_planning_end_day', SEASON_END_DAY),
             )
             if new_actions:
                 if new_needs[name]:
@@ -301,6 +307,7 @@ def build_tasks(
         ):
             new_actions, new_needs = _new_planting_actions(
                 name, fertilize_commit, seeds_left[name], 0, 0, isinstance(tile, dict),
+                day=day, end_day=obs.get('_planning_end_day', SEASON_END_DAY),
             )
             if new_actions:
                 seeds_left[name] -= 1
@@ -366,6 +373,8 @@ def _animal_and_seed_demand(
             if exits_early or finished_today:
                 wheat_incoming += tile.get("yield_units", 0)
         if name in CROPS:
+            if not can_start_today(name, obs):
+                continue
             if not isinstance(tile, dict) or tile.get("kind") != "PLANT":
                 seed_demand[name] += 1
             else:
@@ -378,7 +387,7 @@ def _animal_and_seed_demand(
             if isinstance(tile, dict) and tile.get("animal") == name:
                 if not tile.get("fed_today"):
                     live_animals += 1
-            else:
+            elif can_start_today(name, obs):
                 animal_missing[name] += 1
     animal_slots = sum(animal_missing.values())
     for name in ANIMALS:

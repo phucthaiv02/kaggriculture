@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import lru_cache
+from itertools import zip_longest
 
 from kaggle_environments.envs.kaggriculture import kaggriculture as game
 from agents.schedules import (
@@ -141,19 +142,42 @@ class MarketForecast:
                 if product in self.center_products:
                     stocks[product] -= center_ticks
             previous = step
-            rival_sales = self.external.sales.get(when, {})
-            rival_inputs = self.external.inputs.get(when, {})
-            for product in rival_sales.keys() | rival_inputs.keys():
-                _, stocks[product] = self.trade(
-                    product, stocks.get(product, 0),
-                    rival_sales.get(product, 0) - rival_inputs.get(product, 0),
-                )
-            sales, inputs = flows.sales.get(when, {}), flows.inputs.get(when, {})
-            for product in sales.keys() | inputs.keys():
-                # Own harvest used as feed/fertilizer need not be sold then bought.
-                amount = sales.get(product, 0) - inputs.get(product, 0)
+            cash += self._settle_day(stocks, flows, when)
+        return cash
+
+    def _settle_day(self, stocks, flows, when):
+        # Daily flows have no observed order queue. Use PRODUCTS order for
+        # both players, netting harvested feed/fertilizer before trading.
+        queues = []
+        for production_flow in (flows, self.external):
+            sales = production_flow.sales.get(when, {})
+            inputs = production_flow.inputs.get(when, {})
+            queues.append([(p, sales.get(p, 0) - inputs.get(p, 0))
+                           for p in game.PRODUCTS
+                           if sales.get(p, 0) != inputs.get(p, 0)])
+        cash = 0
+        for orders in zip_longest(*queues):
+            if None in orders:
+                player = 0 if orders[0] is not None else 1
+                product, amount = orders[player]
                 delta, stocks[product] = self.trade(product, stocks.get(product, 0), amount)
-                cash += delta
+                if player == 0:
+                    cash += delta
+                continue
+            for unit in range(max(abs(order[1]) for order in orders if order)):
+                quoted = []
+                for player, order in enumerate(orders):
+                    if order is None or unit >= abs(order[1]):
+                        continue
+                    product, amount = order
+                    stock = stocks.get(product, 0)
+                    price = self.price(product, stock if amount > 0 else stock - 1)
+                    quoted.append((player, product, amount, price))
+                # Match the engine: quote both units before committing either.
+                for player, product, amount, price in quoted:
+                    stocks[product] = stocks.get(product, 0) + (int(price > 1) if amount > 0 else -1)
+                    if player == 0:
+                        cash += price if amount > 0 else -price
         return cash
 
     def marginal_profit(self, baseline, candidate, fixed_cost, baseline_value=None):

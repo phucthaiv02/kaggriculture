@@ -91,7 +91,7 @@ def _slug(value: str) -> str:
 
 def run(opponent="pass", seed=1, output_dir=None):
     opponent_agent, opponent_name, opponent_meta = resolve_opponent(str(opponent))
-    current = make_agent(END_DAY, seed=seed)
+    current = make_agent(END_DAY - 1, seed=seed)
 
     env = make("kaggriculture", configuration=configuration(seed), debug=False)
     env.run([current, opponent_agent])

@@ -35,6 +35,7 @@ from agents.farm_tasks import (
 from agents.opening_book import make_opening_controller, should_buy_land_on_schedule
 from agents.intraday import queue_commitments, schedule_open_tiles
 from agents.planner import SEASON_END_DAY, plan_targets
+from agents.horizon import can_start_today
 from agents.scheduler import MAX_HANDS, build_queues, hands_needed
 from agents.schedules import is_maintenance_day, should_care_animal, should_feed_animal
 from agents.selling import sell_orders
@@ -430,7 +431,13 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
 
         return
 
-    def agent(obs):
+    def agent(obs, configuration=None):
+        effective_end = end_day
+        if configuration is not None:
+            # The final observation is terminal; no action can run from it.
+            last_action_day = (int(configuration['episodeSteps']) - 2) // int(configuration.get('turnsPerDay', 24))
+            effective_end = min(effective_end, last_action_day)
+        obs = dict(obs, _planning_end_day=effective_end)
         day, hour = obs["day"], obs["hour"]
         farm = obs["farms"][obs["player"]]
 
@@ -442,7 +449,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 position for position in positions if position not in targets
             )
             state["opening_active"] = opening_governs(obs, targets, positions)
-            plan_targets(obs, targets, positions, end_day)
+            plan_targets(obs, targets, positions, effective_end)
 
         if hour == 0:
             positions = _active_positions(farm)
@@ -451,7 +458,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             # on the ROI planner takes over.
             state["opening_active"] = opening_governs(obs, targets, positions)
             if not state["opening_active"]:
-                plan_targets(obs, targets, positions, end_day)
+                plan_targets(obs, targets, positions, effective_end)
             else:
                 # The opening book only ever assigns the original NW tiles
                 # (agents/opening_book.py's build_opening_targets). Without
@@ -463,7 +470,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 # touching the opening book's own NW allocation.
                 new_positions = [p for p in positions if p not in targets]
                 if new_positions:
-                    plan_targets(obs, targets, new_positions, end_day)
+                    plan_targets(obs, targets, new_positions, effective_end)
             tasks = build_tasks(
                 obs, targets,
                 assume_crop_seeds=day > 0,
@@ -591,6 +598,15 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         seeds_available = dict(obs["private"]["seeds"])
         shed_available = Counter(obs["private"]["shed"])
         for index, operation in enumerate(worker_ops):
+            if operation and operation[0] in ('PLANT', 'PLACE') and not can_start_today(operation[1], obs):
+                worker_ops[index] = ['PASS']
+                if index < len(plans):
+                    queue = plans[index].queue
+                    # Cancel care for the rejected new producer, preserving
+                    # the worker's route and other tiles' harvest tasks.
+                    while queue and queue[0][0] in ('WATER', 'FERTILIZE', 'FEED', 'CARE'):
+                        queue.pop(0)
+                continue
             if operation and operation[0] == "PICKUP":
                 item = operation[1]
                 requested = operation[2] if len(operation) > 2 else 1

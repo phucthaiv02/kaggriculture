@@ -49,12 +49,13 @@ def engine_market(inventory, params=None, shops=()):
     return state, env
 
 
-def settle(state, env, orders):
-    state[0].action = {'market': orders}
-    shed = state[0].observation.private['shed']
-    for op, product, quantity in orders:
-        if op == 'SELL':
-            shed[product] = shed.get(product, 0) + quantity
+def settle(state, env, orders, rival_orders=()):
+    for player, queue in enumerate((orders, rival_orders)):
+        state[player].action = {'market': list(queue)}
+        shed = state[player].observation.private['shed']
+        for op, product, quantity in queue:
+            if op == 'SELL':
+                shed[product] = shed.get(product, 0) + quantity
     before = state[0].observation.farms[0]['money']
     game._process_market(state, env)
     return state[0].observation.farms[0]['money'] - before
@@ -86,10 +87,47 @@ def test_buy_then_sell_round_trip_matches_engine():
     assert stock == state[0].observation.market['inventory']['WHEAT'] == -10
 
 
+@pytest.mark.parametrize('own,rival', [
+    ({'MELON': 80}, {'MELON': 80}),
+    ({'MELON': 80}, {'MELON': 15}),
+    ({'MELON': 15}, {'MELON': 80}),
+    ({'WHEAT': -20}, {'WHEAT': 35}),
+    ({'WHEAT': 35}, {'WHEAT': -20}),
+    ({'WHEAT': -20}, {'WHEAT': -35}),
+    ({'WHEAT': 5, 'MELON': 80}, {'MELON': 15}),
+    ({'MELON': 80}, {}),
+    ({}, {'MELON': 80}),
+])
+@pytest.mark.parametrize('stock', [-100, game.MARKET_I0, 100000])
+@pytest.mark.parametrize('custom_params', [False, True])
+def test_simultaneous_forecast_matches_engine(own, rival, stock, custom_params):
+    params = deepcopy(game.MARKET_PARAMS) if custom_params else None
+    if params:
+        for values in params.values():
+            values['base'] *= 2
+    inventory = {p: stock for p in game.PRODUCTS}
+    state, env = engine_market(inventory, params)
+    flows = [Production(), Production()]
+    queues = []
+    for flow, amounts in zip(flows, (own, rival)):
+        orders = []
+        for product in game.PRODUCTS:
+            amount = amounts.get(product, 0)
+            if amount:
+                (flow.sales if amount > 0 else flow.inputs)[0][product] = abs(amount)
+                orders.append(['SELL' if amount > 0 else 'BUY_PRODUCT', product, abs(amount)])
+        queues.append(orders)
+    expected = settle(state, env, *queues)
+    forecast = MarketForecast(inventory, (), 0, 0, params=params, external=flows[1])
+    stocks = dict(inventory)
+    assert forecast._settle_day(stocks, flows[0], 0) == expected
+    assert stocks == state[0].observation.market['inventory']
+
+
 @pytest.mark.parametrize('hour', [0, 3, 4, 23])
 def test_daily_cash_matches_engine_demand_and_settlement(hour):
     # Replay the forecast's explicit convention: net inputs with own output,
-    # settle at hour 23, and process forecast rival trades before ours.
+    # settle both players' order queues together at hour 23.
     shop = next(iter(game.SHOPS))
     shops = [shop, shop]  # Duplicate shops consume independently.
     inventory = {p: -5 for p in game.PRODUCTS}
@@ -103,15 +141,15 @@ def test_daily_cash_matches_engine_demand_and_settlement(hour):
     for step in range(2 * 24 + hour, 4 * 24):
         day = step // 24
         if step % 24 == 23:
-            for flows in (external, flow):
+            queues = []
+            for flows in (flow, external):
                 orders = []
                 for product in game.PRODUCTS:
                     amount = flows.sales[day][product] - flows.inputs[day][product]
                     if amount:
                         orders.append(['SELL' if amount > 0 else 'BUY_PRODUCT', product, abs(amount)])
-                cash = settle(state, env, orders)
-                if flows is flow:
-                    expected += cash
+                queues.append(orders)
+            expected += settle(state, env, *queues)
         game._town_consume(env, state, step)
     assert MarketForecast(inventory, shops, 2, 3, hour, external=external).value(flow) == expected
 

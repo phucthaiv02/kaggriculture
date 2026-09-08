@@ -1,5 +1,6 @@
 """Choose the highest marginal net profit after forecast market slippage."""
 from collections import Counter
+from copy import copy
 from dataclasses import dataclass
 
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
@@ -7,6 +8,10 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 from agents.forecast import MarketForecast, Production, production
 from agents.labor import LaborForecast
 from agents.schedules import CROP_LAST_AGE, ONGOING_CROPS, cycle_finished
+from agents.horizon import (
+    SEASON_END_DAY, TARGET_HORIZON_DAYS, cycle_end as _cycle_end,
+    first_yield_age as _first_yield_age, can_start,
+)
 
 CROPS = ("WHEAT", "CARROT", "MELON", "TOMATO", "STRAWBERRY")
 ANIMALS = ("GOOSE", "COW", "SHEEP")
@@ -15,7 +20,6 @@ ANIMAL_COST = {name: official_game.ANIMALS[name]["cost"] for name in ANIMALS}
 LAND_ORDER = official_game.LAND_ORDER
 LAND_BUY_UTILIZATION = 0.75
 # A standard 720-turn season has 30 days, indexed 0 through 29 by the engine.
-SEASON_END_DAY = 29
 
 
 def _expected_price(product, inventory, committed_units, town_demand=None):
@@ -24,20 +28,18 @@ def _expected_price(product, inventory, committed_units, town_demand=None):
 
 
 def _rotation(name, fertilize, day, end_day, tile=None):
-    """Compare all producers over the same remaining season, including seed costs.
-
-    Replanting the same crop is a forecast scenario, reconsidered on each
-    real harvest; it is not a locked target or a fallback rule.
-    """
-    output = Production()
+    """Include crop replants only when a scheduled harvest fits the window."""
+    end_day = _cycle_end(day, end_day)
+    if tile is None and day + _first_yield_age(name) > end_day:
+        return Production(), 0
     if name in ANIMALS:
-        return production(name, fertilize, day, end_day, tile), (0 if tile else ANIMAL_COST[name])
-    first = official_game.CROPS[name]["first_yield_day"] if name in ONGOING_CROPS else CROP_LAST_AGE[name]
-    start, cost = day, 0
-    if tile is not None:
-        output.add(production(name, fertilize, day, end_day, tile))
-        start = max(day, tile["planted_day"] + CROP_LAST_AGE[name])
-    while start + first <= end_day:
+        return production(name, fertilize, day, end_day, tile), (0 if tile is not None else ANIMAL_COST[name])
+    output = production(name, fertilize, day, end_day, tile)
+    cost = 0 if tile is not None else SEED_COST[name]
+    planted = tile['planted_day'] if tile is not None else day
+    start = max(day, planted + CROP_LAST_AGE[name])
+    first_harvest = _first_yield_age(name) if name in ONGOING_CROPS else CROP_LAST_AGE[name]
+    while start + first_harvest <= end_day:
         output.add(production(name, fertilize, start, end_day))
         cost += SEED_COST[name]
         start += CROP_LAST_AGE[name]
@@ -45,11 +47,9 @@ def _rotation(name, fertilize, day, end_day, tile=None):
 
 
 def _candidates(day, end_day):
+    end_day = _cycle_end(day, end_day)
     for name in sorted((*CROPS, *ANIMALS)):
-        if name in ONGOING_CROPS:
-            first = official_game.CROPS[name]["first_yield_day"]
-        else:
-            first = CROP_LAST_AGE[name] if name in CROPS else official_game.ANIMALS[name]["first_yield_day"]
+        first = _first_yield_age(name)
         if day + first > end_day:
             continue
         for fertilize in ((False, True) if name in CROPS else (False,)):
@@ -67,29 +67,43 @@ class TargetProfit:
 
     @property
     def profit(self):
-        """Whole-season added cash, never divided by days, cost or tile share."""
+        """Single-cycle added cash, never divided by days, cost or tile share."""
         return self.market_cash - self.capital_cost - self.labor_cost
 
 
 def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
-    """One formula for every target, from PLANT/PLACE to the season end.
+    """Compare every target over the same min(16, remaining days) horizon.
 
     market_cash = change in all sales less feed/fertilizer purchases, after
     per-unit slippage, existing production and SHOP/TOWN demand.
-    capital_cost = every seed in the crop rotation, or one animal purchase.
+    capital_cost = all seeds in the window or one animal purchase.
     labor_cost = additional daily worker cost over the same horizon.
     """
     labor = labor or LaborForecast()
-    baseline_cost = labor.cost(baseline.visits)
-    baseline_value = market.value(baseline)
-    return [
-        TargetProfit(
+    results = []
+    end = _cycle_end(market.day, market.end_day)
+    scoped_market = copy(market)
+    scoped_market.end_day = end
+    def scoped(flow):
+        result = Production()
+        for field in ("sales", "inputs", "visits"):
+            getattr(result, field).update(
+                (d, value) for d, value in getattr(flow, field).items()
+                if market.day <= d <= end)
+        return result
+    scoped_baseline = scoped(baseline)
+    baseline_cost = labor.cost(scoped_baseline.visits)
+    baseline_value = scoped_market.value(scoped_baseline)
+    for choice, output, cost in candidates:
+        if market.day + _first_yield_age(choice[0]) > end:
+            continue
+        output = scoped(output)
+        results.append(TargetProfit(
             choice, output,
-            market.marginal_profit(baseline, output, 0, baseline_value),
-            cost, labor.marginal_cost(baseline, output, position, baseline_cost),
-        )
-        for choice, output, cost in candidates
-    ]
+            scoped_market.marginal_profit(scoped_baseline, output, 0, baseline_value),
+            cost, labor.marginal_cost(scoped_baseline, output, position, baseline_cost),
+        ))
+    return results
 
 
 def _choose(market, baseline, candidates, counts, labor=None, position=(4, 4)):
@@ -152,6 +166,7 @@ def plan_targets(obs, targets, active_positions, end_day):
     cleanup handled by build_tasks.
     """
     day = obs["day"]
+    end_day = _cycle_end(day, end_day)
     farm = obs["farms"][obs["player"]]
     baseline = Production()
     counts = Counter()
@@ -167,7 +182,7 @@ def plan_targets(obs, targets, active_positions, end_day):
             if not cycle_finished(tile["crop"], day - tile["planted_day"], tile):
                 continue
             # Preserve a conversion already scheduled by the opening.
-            if current and current[0] != tile["crop"]:
+            if current and current[0] != tile["crop"] and can_start(current[0], day, end_day):
                 continue
         replanning.append(position)
 
@@ -226,5 +241,6 @@ def plan_targets(obs, targets, active_positions, end_day):
         choice, output = _choose(market, baseline, allowed, counts, labor, position)
         targets[position] = choice
         if choice:
+            # Include this commitment's supply and labor in the shared window.
             baseline.add(output, position)
             counts[choice[0]] += 1
