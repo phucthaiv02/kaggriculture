@@ -16,9 +16,9 @@ EXPECTED_HORIZONS = {
     "MELON": 10,
     "TOMATO": 11,
     "STRAWBERRY": 16,
-    "GOOSE": 15,
-    "COW": 14,
-    "SHEEP": 12,
+    "GOOSE": 4,
+    "COW": 8,
+    "SHEEP": 6,
 }
 
 
@@ -52,22 +52,20 @@ def test_daily_candidates_do_not_project_past_their_own_horizon(name):
         assert max(harvest_days) <= EXPECTED_HORIZONS[name]
 
 
-def test_animal_windows_include_requested_number_of_followup_harvests():
+def test_animal_windows_stop_at_first_harvest():
     candidates = {
         choice: flow
         for choice, flow, _cost in _daily_candidates(0, 29)
     }
-    expected_counts = {"GOOSE": 7, "COW": 4, "SHEEP": 3}
-    for name, count in expected_counts.items():
+    for name in ("GOOSE", "SHEEP", "COW"):
         product = game.ANIMALS[name]["product"]
         harvest_days = [
             day
             for day, units in candidates[(name, False)].sales.items()
             if units[product]
         ]
-        assert len(harvest_days) == count
-        assert harvest_days[0] == game.ANIMALS[name]["first_yield_day"]
-        assert harvest_days[-1] == EXPECTED_HORIZONS[name]
+        assert harvest_days == [game.ANIMALS[name]["first_yield_day"]]
+        assert EXPECTED_HORIZONS[name] == game.ANIMALS[name]["first_yield_day"]
 
 
 def test_profit_per_day_can_beat_higher_absolute_cycle_profit():
