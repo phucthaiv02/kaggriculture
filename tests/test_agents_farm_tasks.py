@@ -478,3 +478,12 @@ def test_stale_target_never_digs_animal_structures():
         obs = make_obs(day=7, tiles={(0, 0): {"kind": "COOP"}},
                        seeds={"WHEAT": 1}, shed={"COW": 1, "WHEAT": 1})
         assert build_tasks(obs, {(0, 0): (name, False)}) == []
+
+
+def test_missed_water_is_rescued_even_outside_normal_schedule():
+    tile = plant("WHEAT", 0, 1)
+    tile["consecutive_unwatered"] = 1
+    obs = make_obs(day=1, tiles={(0, 0): tile})
+    task = one_task(build_tasks(obs, {(0, 0): ("WHEAT", False)}))
+    assert task.actions == [["WATER"]]
+    assert task.urgent

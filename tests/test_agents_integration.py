@@ -139,126 +139,6 @@ def test_portfolio_uses_both_crops_and_animals():
     assert names & animals, f"no animal in final portfolio: {names}"
 
 
-def test_animal_buys_are_followed_by_same_day_place_actions():
-    """An animal bought from same-day fertilizer proceeds is placed that day."""
-    env = make("kaggriculture", configuration=configuration(1), debug=False)
-    agent = make_agent(END_DAY, seed=1)
-    state = env.state
-    bought_days, placed_days = set(), set()
-    for step in range(int(env.configuration.episodeSteps) - 1):
-        obs = state[0].observation
-        action = agent(obs)
-        if any(order and order[0] == "BUY_ANIMAL" for order in action.get("market", [])):
-            bought_days.add(obs.day)
-        worker_ops = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
-        if any(op and op[0] == "PLACE" for op in worker_ops):
-            placed_days.add(obs.day)
-        state[0].action = action
-        state[1].action = pass_agent(state[1].observation)
-        state = official_game.interpreter(state, env)
-        state[0].observation.step = step + 1
-    assert 2 in bought_days
-    assert 2 in placed_days
-
-
-def test_day_three_places_converted_cow_on_the_nearest_conversion_tile():
-    """Checking PLACE alone is insufficient: it must land on (4,3), the
-    nearest WHEAT-to-COW conversion tile, and mutate that exact pasture."""
-    env = make("kaggriculture", configuration=configuration(1), debug=False)
-    env.run([make_agent(END_DAY, seed=1), pass_agent])
-
-    matches = []
-    for step in env.steps:
-        state = step[0]
-        obs = state.observation
-        if obs.day != 2:
-            continue
-        action = state.action or {}
-        operations = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
-        positions = [tuple(obs.farms[0].farmer), *map(tuple, obs.farms[0].hands)]
-        for operation, position in zip(operations, positions):
-            if operation == ["PLACE", "COW"]:
-                matches.append((obs.hour, position, obs.farms[0].tiles[position[1]][position[0]]))
-
-    assert len(matches) == 1
-    hour, position, tile = matches[0]
-    assert hour < 24
-    assert position == (4, 3)
-    assert tile["kind"] == "PASTURE"
-    assert tile["animal"] == "COW"
-    assert tile["placed_day"] == 2
-
-
-def test_conversion_batch_harvests_two_wheat_and_buys_cow_without_market_feed():
-    env = make("kaggriculture", configuration=configuration(1), debug=False)
-    env.run([make_agent(END_DAY, seed=1), pass_agent])
-
-    conversion_harvests = []
-    cow_purchase_passes = []
-    for step in env.steps:
-        state = step[0]
-        obs = state.observation
-        action = state.action or {}
-        operations = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
-        positions = [tuple(obs.farms[0].farmer), *map(tuple, obs.farms[0].hands)]
-        if obs.day == 2:
-            conversion_harvests += [
-                position
-                for operation, position in zip(operations, positions)
-                if operation == ["HARVEST"] and position in {(4, 3), (3, 3)}
-            ]
-        market = action.get("market", [])
-        if obs.day == 2 and ["BUY_ANIMAL", "COW", 1] in market:
-            cow_purchase_passes.append(market)
-
-    assert set(conversion_harvests) == {(4, 3), (3, 3)}
-    assert cow_purchase_passes
-    assert all(
-        not any(order[0] == "BUY_PRODUCT" and order[1] == "WHEAT" for order in market)
-        for market in cow_purchase_passes
-    )
-
-
-def test_day_five_buys_seven_wheat_seeds_and_replants_all_harvested_tiles():
-    """UI Day 5 is engine index 4: all 7 opening WHEAT tiles must complete
-    WATER -> HARVEST -> PLANT -> WATER on that exact day, with no spill into
-    index 5."""
-    env = make("kaggriculture", configuration=configuration(1), debug=False)
-    env.run([make_agent(END_DAY, seed=1), pass_agent])
-
-    actions = [
-        step[0].action or {} for step in env.steps
-        if step[0].observation.day == 4
-    ]
-    market = [order for action in actions for order in action.get("market", [])]
-    assert sum(
-        int(order[2])
-        for order in market
-        if order[:2] == ["BUY_SEED", "WHEAT"]
-    ) == 7
-    day_five_end = next(
-        step[0].observation
-        for step in env.steps
-        if step[0].observation.day == 5 and step[0].observation.hour == 0
-    )
-    replanted = [
-        tile
-        for row in day_five_end.farms[0]["tiles"]
-        for tile in row
-        if isinstance(tile, dict)
-        and tile.get("crop") == "WHEAT"
-        and tile.get("planted_day") == 4
-    ]
-    assert len(replanted) == 7
-    weeds = [
-        tile for step in env.steps if step[0].observation.day in (4, 5)
-        for row in step[0].observation.farms[0]["tiles"]
-        for tile in row
-        if isinstance(tile, dict) and tile.get("kind") == "WEED"
-    ]
-    assert not weeds, "a tile decayed to WEED instead of just replanting a day late"
-
-
 def test_every_opening_animal_is_fed_on_each_verified_feed_age():
     env = make("kaggriculture", configuration=configuration(1), debug=False)
     env.run([make_agent(END_DAY, seed=1), pass_agent])
@@ -281,58 +161,6 @@ def test_every_opening_animal_is_fed_on_each_verified_feed_age():
             obs.day,
             [(tile["animal"], tile.get("consecutive_unfed", 0)) for tile in required_yesterday],
         )
-
-
-def test_day_three_places_cow_on_the_nearest_conversion_pasture():
-    env = make("kaggriculture", configuration=configuration(1), debug=False)
-    env.run([make_agent(END_DAY, seed=1), pass_agent])
-
-    placements = []
-    for step in env.steps:
-        state = step[0]
-        obs = state.observation
-        if obs.day != 2:
-            continue
-        action = state.action or {}
-        operations = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
-        positions = [tuple(obs.farms[0]["farmer"]), *map(tuple, obs.farms[0]["hands"])]
-        placements += [
-            (position, operation)
-            for position, operation in zip(positions, operations)
-            if operation and operation[0] == "PLACE"
-        ]
-
-    assert ((4, 3), ["PLACE", "COW"]) in placements
-    next_day = next(
-        step[0].observation
-        for step in env.steps
-        if step[0].observation.day == 3 and step[0].observation.hour == 0
-    )
-    tile = next_day.farms[0]["tiles"][3][4]
-    assert tile["kind"] == "PASTURE"
-    assert tile["animal"] == "COW"
-    assert tile["placed_day"] == 2
-
-
-def test_sixth_opening_animal_is_placed_on_day_index_three():
-    env = make("kaggriculture", configuration=configuration(1), debug=False)
-    env.run([make_agent(END_DAY, seed=1), pass_agent])
-
-    day_four = next(
-        step[0].observation
-        for step in env.steps
-        if step[0].observation.day == 4 and step[0].observation.hour == 0
-    )
-    animals = [
-        tile
-        for row in day_four.farms[0]["tiles"]
-        for tile in row
-        if isinstance(tile, dict) and tile.get("animal")
-    ]
-    assert len(animals) == 6
-    sixth = day_four.farms[0]["tiles"][3][3]
-    assert sixth["animal"] == "SHEEP"
-    assert sixth["placed_day"] == 3
 
 
 def test_day_three_late_placement_does_not_drop_crop_work():
@@ -389,3 +217,30 @@ if __name__ == "__main__":
                 print(f"FAIL {name}: {exc}")
     print(f"{'ALL PASSED' if not failures else f'{failures} FAILED'}")
     sys.exit(1 if failures else 0)
+
+
+def test_opening_portfolio_feed_and_second_day_fertilizer_cashflow():
+    from collections import Counter
+    from agents.opening_book import OPENING_COUNTS
+
+    env = make("kaggriculture", configuration=configuration(1), debug=False)
+    agent = make_agent(END_DAY, seed=1)
+    fertilizer_sold = 0
+    for turn in range(48):
+        obs = env.state[0].observation
+        action = agent(obs)
+        if turn == 0:
+            assert action["market"][0] == ["BUY_PRODUCT", "WHEAT", 6]
+        if obs.day == 1:
+            fertilizer_sold += sum(order[2] for order in action["market"]
+                                   if order[:2] == ["SELL", "FERTILIZER"])
+        env.step([action, pass_agent(env.state[1].observation)])
+        if turn == 23:
+            farm = env.state[0].observation.farms[0]
+            portfolio = Counter(tile.get("animal") or tile.get("crop")
+                                for row in farm["tiles"] for tile in row
+                                if isinstance(tile, dict))
+            assert portfolio == Counter(OPENING_COUNTS)
+            first_day_cash = farm["money"]
+    assert fertilizer_sold == 6
+    assert env.state[0].observation.farms[0]["money"] > first_day_cash

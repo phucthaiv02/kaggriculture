@@ -212,7 +212,7 @@ def build_tasks(
                 fertilizer_left -= 1
                 needs["FERTILIZER"] += 1
                 actions.append(["FERTILIZE"])
-            if is_maintenance_day(crop, age, fertilize_commit) and not tile.get("watered_today"):
+            if (is_maintenance_day(crop, age, fertilize_commit) or tile.get("consecutive_unwatered", 0) > 0) and not tile.get("watered_today"):
                 actions.append(["WATER"])
                 # Every scheduled WATER is protective work. Waiting until a
                 # crop has already missed once leaves no scheduling margin:

@@ -138,3 +138,39 @@ def test_hire_does_not_reuse_money_for_an_already_promised_seed():
     targets = {(4, 3): ("WHEAT", False), (5, 4): ("WHEAT", False)}
     _, hires = schedule_open_tiles(obs, targets, plans, SHED_ACCESS, [1, 2])
     assert hires == 0
+
+
+def test_morning_harvest_queue_does_not_wait_for_unfunded_replant():
+    from agents.expansion_agent import make_agent
+    from test_agents_farm_tasks import plant
+    agent = make_agent()
+    cells = dict(zip(agent.__code__.co_freevars, agent.__closure__))
+    targets = cells["targets"].cell_contents
+    targets.update({(x, y): None for y in range(10) for x in range(10)})
+    targets.update({(4, 4): ("WHEAT", False), (3, 4): ("WHEAT", False)})
+    state = cells["state"].cell_contents
+    state["day"] = 4
+    obs = make_obs(day=4, money=0, tiles={
+        (4, 4): plant("WHEAT", 0, 4, yield_units=3),
+        (3, 4): plant("WHEAT", 0, 4, yield_units=3),
+    })
+    obs["hour"] = 1
+    agent(obs)
+    queues = [op for plan in state["plans"] for op in plan.queue]
+    assert queues.count(["HARVEST"]) == 2
+    assert not any(op[0] == "PLANT" for op in queues)
+
+
+def test_idle_worker_rescues_watered_crop_waiting_for_harvest():
+    from agents.expansion_agent import make_agent
+    from test_agents_farm_tasks import plant
+    agent = make_agent()
+    cells = dict(zip(agent.__code__.co_freevars, agent.__closure__))
+    cells["targets"].cell_contents.update({(x, y): None for y in range(10) for x in range(10)})
+    cells["targets"].cell_contents[(4, 4)] = ("WHEAT", False)
+    state = cells["state"].cell_contents
+    state.update(day=4, plans=[WorkerPlan((4, 4), [])])
+    obs = make_obs(day=4, money=0, tiles={
+        (4, 4): plant("WHEAT", 0, 4, yield_units=3, watered_today=True),
+    })
+    assert agent(obs)["farmer"] == ["HARVEST"]

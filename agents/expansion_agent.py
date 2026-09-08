@@ -37,7 +37,7 @@ from agents.intraday import queue_commitments, schedule_open_tiles
 from agents.planner import SEASON_END_DAY, plan_targets
 from agents.horizon import can_start_today
 from agents.scheduler import MAX_HANDS, build_queues, hands_needed
-from agents.schedules import is_maintenance_day, should_care_animal, should_feed_animal
+from agents.schedules import cycle_finished, is_maintenance_day, should_care_animal, should_feed_animal
 from agents.selling import sell_orders
 
 def _protect_animal_structures(farm, operations):
@@ -309,7 +309,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             if crop == name
             else tile.get("fertilized_until_day", -1) >= tile["planted_day"]
         )
-        return is_maintenance_day(crop, age, current_fertilized)
+        return tile.get("consecutive_unwatered", 0) > 0 or is_maintenance_day(crop, age, current_fertilized)
 
     def _schedule_late_placements(obs, farm, day, hour):
         """Use newly bought animals, and rescue any live animal whose
@@ -331,10 +331,6 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         if hour < 2 or not state["plans"]:
             return
         worker_positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
-        idle_indices = [
-            index for index, plan in enumerate(state["plans"])
-            if not plan.queue and index < len(worker_positions)
-        ]
         pending_targets = {}
         state["scheduled_placements"] = {
             position for position in state["scheduled_placements"]
@@ -366,7 +362,12 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 and position not in state["scheduled_placements"]
             ):
                 pending_targets[position] = target
-            elif _crop_still_needs_water(tile, name, fertilize_commit, day):
+            elif (
+                _crop_still_needs_water(tile, name, fertilize_commit, day)
+                or (isinstance(tile, dict) and tile.get("crop")
+                    and tile.get("yield_units", 0) > 0
+                    and cycle_finished(tile["crop"], day - tile["planted_day"], tile))
+            ):
                 pending_targets[position] = target
         if not pending_targets:
             return
@@ -386,6 +387,10 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             return
         shed_access = _open_shed_access(farm)
         remaining = 24 - hour
+        idle_indices = [
+            index for index, plan in enumerate(state["plans"])
+            if not plan.queue and index < len(worker_positions)
+        ]
         if idle_indices:
             # Every idle worker here already has a real position (it's
             # mid-day, not the hour-0 hiring pass), so build_queues would
@@ -454,8 +459,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         if hour == 0:
             positions = _active_positions(farm)
             # The hand-specified NW opening (agents/opening_book.py) governs
-            # targets in place until the first BUY_LAND succeeds; from then
-            # on the ROI planner takes over.
+            # targets for the first two days; then the ROI planner takes over.
             state["opening_active"] = opening_governs(obs, targets, positions)
             if not state["opening_active"]:
                 plan_targets(obs, targets, positions, effective_end)
@@ -518,9 +522,8 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             tasks = build_tasks(
                 obs,
                 targets,
-                assume_crop_seeds=True,
                 prioritize_fertilizer_drop=state["opening_active"],
-            )  # preserve same-day HARVEST -> PLANT while seed arrives mid-day
+            )  # Only real seeds: an unfunded replant must not block later harvests.
             state["deferred_expansion_positions"] = {
                 position for position in state["deferred_expansion_positions"]
                 if not isinstance(farm["tiles"][position[1]][position[0]], dict)
@@ -574,10 +577,10 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             [_hire_costs(farm, count) for count in range(1, MAX_HANDS - len(farm["hands"]) + 1)]
             if hour >= 2 and not state["unverified_hand_indices"] else []
         )
+        _schedule_late_placements(obs, farm, day, hour)
         purchase_targets, expansion_hires = schedule_open_tiles(
             obs, targets, state["plans"], _open_shed_access(farm), hire_costs,
         )
-        _schedule_late_placements(obs, farm, day, hour)
         # Remaining PICKUPs, including newly appended work, must be protected
         # from the same turn's sales.
         positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
