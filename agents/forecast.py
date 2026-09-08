@@ -2,14 +2,14 @@
 
 Production uses the installed game's tile actions and daily refresh functions.
 Forecasts assume scheduled care succeeds and harvested goods sell that day;
-travel delays, future opponents' decisions and unknown shops are not predicted.
+travel delays and future opponents' decisions are not predicted.
 
-The exact queue simulator is retained for engine-validation tests. Planner
-marginals use a robust rival projection instead: future rival *sales* affect
-only the same product, while future rival inputs are not treated as guaranteed
-market buys. We can observe a rival producer, but not whether its future feed
-or fertilizer comes from the market, its own shed, or its own production; and
-we do not know the rival's future cross-product market-order queue positions.
+The exact queue simulator is retained for engine-validation tests with the
+currently observed town. Planner marginals use a robust rival projection and
+integrate unknown future shop unlocks as an exact per-product expectation:
+future rival *sales* affect only the same product, future rival inputs are not
+treated as guaranteed market buys, and random shop draws are not collapsed
+into an average inventory path (important for nonlinear/hinge price curves).
 """
 from collections import Counter, defaultdict
 from copy import deepcopy
@@ -22,6 +22,14 @@ from agents.schedules import (
     CROP_LAST_AGE, ONGOING_CROPS, is_maintenance_day,
     should_fertilize_today, should_feed_animal, should_care_animal,
 )
+
+
+# Current engine defaults. The observation exposes already-unlocked shops but
+# not configuration/seed, so future shop identity is unknowable to the agent.
+SHOP_UNLOCK_INTERVAL = 3
+SHOP_SELL_INTERVAL = 4
+CENTER_SELL_INTERVAL = 24
+MAX_SHOP_INSTANCES = getattr(game, "MAX_SHOP_INSTANCES", 8)
 
 
 @dataclass
@@ -121,10 +129,33 @@ class MarketForecast:
         self.inventory = inventory
         self.day, self.end_day, self.hour = day, end_day, hour
         self.shop_demand = Counter()
+        self.shop_count = len(shops)
         for shop in shops:
             products = game.SHOPS[shop]
             for product in products:
                 self.shop_demand[product] += 2 if len(products) == 1 else 1
+
+        remaining_unlocks = max(0, MAX_SHOP_INSTANCES - self.shop_count)
+        self.future_shop_days = tuple(
+            when
+            for when in range(day + 1, end_day + 1)
+            if when % SHOP_UNLOCK_INTERVAL == 0
+        )[:remaining_unlocks]
+
+        self.shop_draw_distribution = {}
+        total_shops = len(game.SHOPS)
+        for product in game.PRODUCTS:
+            increments = Counter()
+            for products in game.SHOPS.values():
+                increment = 0
+                if product in products:
+                    increment = 2 if len(products) == 1 else 1
+                increments[increment] += 1
+            self.shop_draw_distribution[product] = tuple(
+                (increment, count / total_shops)
+                for increment, count in sorted(increments.items())
+            )
+
         self.center_products = set(game.TOWN_CENTER_PRODUCTS)
         self.price = lru_cache(maxsize=None)(lambda product, stock: game.market_price(product, stock, params))
         self.trade = lru_cache(maxsize=None)(self._trade)
@@ -142,6 +173,7 @@ class MarketForecast:
         return cash, stock
 
     def _value(self, flows, robust_external=False):
+        """Static-town valuation used by exact engine-equivalence tests."""
         stocks = dict(self.inventory)
         cash = 0
         previous = self.day * 24 + self.hour - 1
@@ -149,8 +181,8 @@ class MarketForecast:
             # Forecast delivery by the end of each harvest day. Today's held
             # shed goods are also priced here, consistently in both scenarios.
             step = when * 24 + 23
-            shop_ticks = step // 4 - previous // 4
-            center_ticks = step // 24 - previous // 24
+            shop_ticks = step // SHOP_SELL_INTERVAL - previous // SHOP_SELL_INTERVAL
+            center_ticks = step // CENTER_SELL_INTERVAL - previous // CENTER_SELL_INTERVAL
             for product in stocks:
                 stocks[product] -= self.shop_demand[product] * shop_ticks
                 if product in self.center_products:
@@ -163,19 +195,76 @@ class MarketForecast:
         return cash
 
     def value(self, flows):
-        """Exact value under the forecast's explicit future queue convention."""
+        """Exact value under the forecast's explicit current-town convention."""
         return self._value(flows, robust_external=False)
 
     def robust_value(self, flows):
-        """Value with only observable/product-local rival effects.
+        """Planner value under observable rival pressure and unknown shops.
 
-        Rival future sales are projected because visible producers make those
-        plausible. Rival future inputs are deliberately ignored: a required
-        WHEAT/FERTILIZER unit does not imply a market BUY because the rival may
-        already own it or produce it internally. Cross-product queue alignment
-        is also ignored because future market-order positions are unobserved.
+        Future shop identities are random and hidden. We integrate them exactly
+        per product rather than forecasting one shop or applying expected
+        demand directly to stock. Product inventories/prices are independent,
+        so E[sum(product cash)] == sum(E[product cash]); correlations between
+        products induced by a common shop draw therefore do not require a
+        joint 8^N enumeration.
         """
+        if self.future_shop_days:
+            return sum(
+                self._expected_product_value(flows, product)
+                for product in game.PRODUCTS
+            )
         return self._value(flows, robust_external=True)
+
+    def _expected_product_value(self, flows, product):
+        """Exact DP over future shop-demand rate for one product.
+
+        State = (market stock, per-shop-tick demand). Each unlock branches only
+        over the demand increment that a uniformly drawn shop contributes to
+        this product: usually {0,1}, or {0,2} for single-product shops. Paths
+        that reach the same state are merged with their probability-weighted
+        accumulated cash.
+        """
+        # state -> [probability, probability-weighted accumulated own cash]
+        states = {
+            (self.inventory.get(product, 0), self.shop_demand[product]): [1.0, 0.0]
+        }
+        future_shop_days = set(self.future_shop_days)
+        previous = self.day * 24 + self.hour - 1
+
+        for when in range(self.day, self.end_day + 1):
+            if when in future_shop_days:
+                branched = defaultdict(lambda: [0.0, 0.0])
+                for (stock, demand_rate), (probability, weighted_cash) in states.items():
+                    for increment, draw_probability in self.shop_draw_distribution[product]:
+                        key = (stock, demand_rate + increment)
+                        branched[key][0] += probability * draw_probability
+                        branched[key][1] += weighted_cash * draw_probability
+                states = dict(branched)
+
+            step = when * 24 + 23
+            shop_ticks = step // SHOP_SELL_INTERVAL - previous // SHOP_SELL_INTERVAL
+            center_ticks = step // CENTER_SELL_INTERVAL - previous // CENTER_SELL_INTERVAL
+            own_sales = flows.sales.get(when, {})
+            own_inputs = flows.inputs.get(when, {})
+            rival_sales = self.external.sales.get(when, {})
+            own_amount = own_sales.get(product, 0) - own_inputs.get(product, 0)
+            rival_amount = rival_sales.get(product, 0)
+
+            settled = defaultdict(lambda: [0.0, 0.0])
+            for (stock, demand_rate), (probability, weighted_cash) in states.items():
+                stock -= demand_rate * shop_ticks
+                if product in self.center_products:
+                    stock -= center_ticks
+                delta, stock = self._settle_product_robust(
+                    stock, product, own_amount, rival_amount
+                )
+                key = (stock, demand_rate)
+                settled[key][0] += probability
+                settled[key][1] += weighted_cash + probability * delta
+            states = dict(settled)
+            previous = step
+
+        return sum(weighted_cash for _, weighted_cash in states.values())
 
     def _settle_day(self, stocks, flows, when):
         # Exact daily-queue convention retained for engine-validation tests.
@@ -213,6 +302,29 @@ class MarketForecast:
                         cash += price if amount > 0 else -price
         return cash
 
+    def _settle_product_robust(self, stock, product, own_amount, rival_amount):
+        """Settle one product from one pre-trade stock under robust semantics."""
+        cash = 0
+        if not own_amount and not rival_amount:
+            return cash, stock
+
+        for unit in range(max(abs(own_amount), abs(rival_amount))):
+            quoted = []
+            if unit < abs(own_amount):
+                price = self.price(product, stock if own_amount > 0 else stock - 1)
+                quoted.append((0, own_amount, price))
+            if unit < abs(rival_amount):
+                price = self.price(product, stock if rival_amount > 0 else stock - 1)
+                quoted.append((1, rival_amount, price))
+
+            # Same-product simultaneous units are quoted from the same
+            # pre-commit stock, matching engine simultaneous quoting.
+            for player, amount, price in quoted:
+                stock += int(price > 1) if amount > 0 else -1
+                if player == 0:
+                    cash += price if amount > 0 else -price
+        return cash, stock
+
     def _settle_day_robust(self, stocks, flows, when):
         """Settle rival pressure per product, without invented rival buys.
 
@@ -233,27 +345,10 @@ class MarketForecast:
             # Do not subtract external.inputs here. A future rival requirement
             # is not evidence of a future market BUY.
             rival_amount = rival_sales.get(product, 0)
-            if not own_amount and not rival_amount:
-                continue
-
-            for unit in range(max(abs(own_amount), abs(rival_amount))):
-                stock = stocks.get(product, 0)
-                quoted = []
-                if unit < abs(own_amount):
-                    price = self.price(product, stock if own_amount > 0 else stock - 1)
-                    quoted.append((0, own_amount, price))
-                if unit < abs(rival_amount):
-                    price = self.price(product, stock if rival_amount > 0 else stock - 1)
-                    quoted.append((1, rival_amount, price))
-
-                # Same-product simultaneous units are still quoted from the
-                # same pre-commit stock, matching engine simultaneous quoting.
-                for player, amount, price in quoted:
-                    stocks[product] = stocks.get(product, 0) + (
-                        int(price > 1) if amount > 0 else -1
-                    )
-                    if player == 0:
-                        cash += price if amount > 0 else -price
+            delta, stocks[product] = self._settle_product_robust(
+                stocks.get(product, 0), product, own_amount, rival_amount
+            )
+            cash += delta
         return cash
 
     def _has_external_projection(self):
@@ -265,8 +360,9 @@ class MarketForecast:
         combined.add(candidate)
 
         # Planner calls this with visible rival production. Use the robust
-        # projection there, but keep exact engine-equivalent behavior when no
-        # rival projection exists (including existing unit tests and helpers).
+        # projection there, including stochastic future-shop expectation, but
+        # keep exact engine-equivalent behavior when no rival projection exists
+        # (including legacy helpers and exact unit tests).
         if self._has_external_projection():
             return (
                 self.robust_value(combined)
