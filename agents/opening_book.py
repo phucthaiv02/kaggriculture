@@ -20,9 +20,17 @@ LAND_ORDER = official_game.LAND_ORDER
 OPENING_COUNTS = {"MELON": 12, "WHEAT": 9, "COW": 2, "SHEEP": 2}
 OPENING_SIZE = sum(OPENING_COUNTS.values())
 
-# Temporarily buy exactly one quadrant on engine/UI day 7 so the expansion
-# path can be inspected in isolation.
-LAND_BUY_DAYS = (7,)
+# Keep the fixed opening in control until the first land purchase really
+# succeeds. Land attempts themselves follow successful land state: first extra
+# quadrant is due on day 6, second on day 9, and an unfunded attempt retries on
+# later mornings until the quadrant count changes.
+LAND_FIRST_DAY = 6
+LAND_INTERVAL_DAYS = 3
+LAND_MAX_EXTRA = 2
+LAND_BUY_DAYS = tuple(
+    LAND_FIRST_DAY + LAND_INTERVAL_DAYS * index
+    for index in range(LAND_MAX_EXTRA)
+)
 
 # Convert two of the initial WHEAT targets to one COW and one SHEEP together
 # on day 2 (the UI's Day 3). Their two harvested WHEAT units can then feed
@@ -35,17 +43,17 @@ CONVERSIONS = ("COW", "SHEEP")
 
 
 def should_buy_land_on_schedule(obs, farm):
-    """Submit one land order at hour 0 on the scheduled day, if available.
+    """Submit the next due land order at hour 0, based on successful buys.
 
-    Affordability itself is left to the engine (BUY_LAND is simply a no-op if
-    the farm cannot cover the cost at that instant).
+    Affordability itself is left to the engine. If BUY_LAND is a no-op because
+    cash is insufficient, the same stage stays eligible on later mornings
+    instead of being lost to a one-day schedule.
     """
     n_extra = len(farm["unlocked_quadrants"]) - 1
-    return (
-        obs["day"] in LAND_BUY_DAYS
-        and obs.get("hour", 0) == 0
-        and n_extra < len(LAND_ORDER)
-    )
+    if n_extra < 0 or n_extra >= min(LAND_MAX_EXTRA, len(LAND_ORDER)):
+        return False
+    next_day = LAND_FIRST_DAY + LAND_INTERVAL_DAYS * n_extra
+    return obs["day"] >= next_day and obs.get("hour", 0) == 0
 
 
 def build_opening_targets(positions):
