@@ -1,4 +1,4 @@
-"""Isolated tests for agents/opening_book.py using hand-built observations."""
+"""Isolated tests for the short hybrid opening."""
 
 from collections import Counter
 
@@ -6,7 +6,11 @@ import pytest
 
 from agents.opening_book import (
     LAND_BUY_DAYS,
+    LAND_FIRST_DAY,
+    LAND_INTERVAL_DAYS,
+    LAND_MAX_EXTRA,
     OPENING_COUNTS,
+    OPENING_HANDOFF_DAY,
     build_opening_targets,
     make_opening_controller,
     should_buy_land_on_schedule,
@@ -16,15 +20,15 @@ from agents.opening_book import (
 NW_POSITIONS = [(x, y) for y in range(5) for x in range(5)]
 
 
-def make_obs(day, tiles=()):
+def make_obs(day, tiles=(), quadrants=("NW",)):
     board = [[None] * 10 for _ in range(10)]
     for (x, y), tile in dict(tiles).items():
         board[y][x] = tile
-    farm = {"tiles": board, "unlocked_quadrants": ["NW"]}
+    farm = {"tiles": board, "unlocked_quadrants": list(quadrants)}
     return {"day": day, "player": 0, "farms": [farm, farm]}
 
 
-def wheat_tile(planted_day, yield_units=1):
+def wheat_tile(planted_day=0, yield_units=1):
     return {
         "kind": "PLANT",
         "crop": "WHEAT",
@@ -34,35 +38,12 @@ def wheat_tile(planted_day, yield_units=1):
     }
 
 
-def melon_tile(planted_day, yield_units=0):
-    return {
-        "kind": "PLANT",
-        "crop": "MELON",
-        "planted_day": planted_day,
-        "yield_units": yield_units,
-        "watered_today": True,
-    }
-
-
-def test_build_opening_targets_matches_counts_and_fills_the_board():
+def test_build_opening_targets_matches_fixed_portfolio():
     targets = build_opening_targets(NW_POSITIONS)
     assert len(targets) == 25
-    counts = Counter(value[0] for value in targets.values())
-    assert dict(counts) == OPENING_COUNTS
-    assert all(fertilize is False for _name, fertilize in targets.values())
-
-
-def test_opening_uses_requested_portfolio():
+    assert Counter(value[0] for value in targets.values()) == Counter(OPENING_COUNTS)
     assert OPENING_COUNTS == {"MELON": 12, "WHEAT": 9, "COW": 2, "SHEEP": 2}
-
-
-def test_debug_land_purchase_is_only_on_day_seven():
-    farm = {"unlocked_quadrants": ["NW"]}
-    assert LAND_BUY_DAYS == (7,)
-    assert should_buy_land_on_schedule({"day": 6, "hour": 0}, farm) is False
-    assert should_buy_land_on_schedule({"day": 7, "hour": 0}, farm) is True
-    assert should_buy_land_on_schedule({"day": 7, "hour": 1}, farm) is False
-    assert should_buy_land_on_schedule({"day": 8, "hour": 0}, farm) is False
+    assert all(fertilize is False for _name, fertilize in targets.values())
 
 
 def test_build_opening_targets_rejects_wrong_board_size():
@@ -70,128 +51,73 @@ def test_build_opening_targets_rejects_wrong_board_size():
         build_opening_targets(NW_POSITIONS[:-1])
 
 
-def test_first_call_applies_opening_book_and_keeps_governing():
+def test_fixed_opening_governs_days_zero_through_two():
     governs = make_opening_controller()
     targets = {}
-    obs = make_obs(day=0)
-    assert governs(obs, targets, NW_POSITIONS) is True
-    assert len(targets) == 25
+    assert OPENING_HANDOFF_DAY == 3
+    assert governs(make_obs(0), targets, NW_POSITIONS) is True
+    assert governs(make_obs(1), targets, NW_POSITIONS) is True
+    assert governs(make_obs(2), targets, NW_POSITIONS) is True
 
 
-def test_still_governs_while_melon_is_growing():
+def test_opening_hands_off_to_planner_on_day_three_permanently():
     governs = make_opening_controller()
     targets = {}
-    governs(make_obs(day=0), targets, NW_POSITIONS)
-    melon_position = next(
-        position for position, target in targets.items() if target[0] == "MELON"
-    )
-    obs = make_obs(
-        day=5,
-        tiles={melon_position: melon_tile(planted_day=0, yield_units=0)},
-    )
-    assert governs(obs, targets, NW_POSITIONS) is True
+    governs(make_obs(0), targets, NW_POSITIONS)
+    assert governs(make_obs(3), targets, NW_POSITIONS) is False
+    assert governs(make_obs(4), targets, NW_POSITIONS) is False
 
 
-def test_hands_off_when_first_extra_quadrant_unlocks():
+def test_day_two_conversion_still_creates_third_cow_and_sheep_before_handoff():
     governs = make_opening_controller()
     targets = {}
-    governs(make_obs(day=0), targets, NW_POSITIONS)
-    obs = make_obs(day=7)
-    obs["farms"][0]["unlocked_quadrants"] = ["NW", "NE"]
-    assert governs(obs, targets, NW_POSITIONS) is False
-
-
-def test_land_purchase_handoff_is_permanent():
-    governs = make_opening_controller()
-    targets = {}
-
-    governs(make_obs(day=0), targets, NW_POSITIONS)
-    bought = make_obs(day=7)
-    bought["farms"][0]["unlocked_quadrants"] = ["NW", "NE"]
-    assert governs(bought, targets, NW_POSITIONS) is False
-    assert governs(make_obs(day=8), targets, NW_POSITIONS) is False
-
-
-def test_disappearing_melon_does_not_end_six_day_opening_early():
-    governs = make_opening_controller()
-    targets = {}
-    governs(make_obs(day=0), targets, NW_POSITIONS)
-    melon_position = next(
-        position for position, target in targets.items() if target[0] == "MELON"
-    )
-    assert (
-        governs(
-            make_obs(day=1, tiles={melon_position: melon_tile(0, 1)}),
-            targets,
-            NW_POSITIONS,
-        )
-        is True
-    )
-    assert governs(make_obs(day=2), targets, NW_POSITIONS) is True
-
-
-def test_unfunded_empty_melon_target_does_not_end_opening_early():
-    governs = make_opening_controller()
-    targets = {}
-    governs(make_obs(day=0), targets, NW_POSITIONS)
-    assert governs(make_obs(day=1), targets, NW_POSITIONS) is True
-
-
-def test_converts_two_wheat_targets_to_one_cow_and_one_sheep_together_on_day_two():
-    governs = make_opening_controller()
-    targets = {}
-    governs(make_obs(day=0), targets, NW_POSITIONS)
-    wheat_positions = [
-        position for position, target in targets.items() if target[0] == "WHEAT"
-    ]
-    melon_position = next(
-        position for position, target in targets.items() if target[0] == "MELON"
-    )
-    closest_wheat = sorted(
+    governs(make_obs(0), targets, NW_POSITIONS)
+    wheat_positions = [p for p, target in targets.items() if target[0] == "WHEAT"]
+    closest = sorted(
         wheat_positions,
-        key=lambda position: (
-            abs(position[0] - 4) + abs(position[1] - 4),
-            -position[1],
-            -position[0],
-        ),
+        key=lambda p: (abs(p[0] - 4) + abs(p[1] - 4), -p[1], -p[0]),
     )
     growing = {
-        melon_position: melon_tile(0, 1),
-        closest_wheat[0]: wheat_tile(0),
-        closest_wheat[1]: wheat_tile(0),
+        closest[0]: wheat_tile(),
+        closest[1]: wheat_tile(),
     }
-
-    assert governs(make_obs(1, growing), targets, NW_POSITIONS) is True
-    assert Counter(value[0] for value in targets.values()) == Counter(OPENING_COUNTS)
-
-    growing[melon_position] = melon_tile(0, 1)
     assert governs(make_obs(2, growing), targets, NW_POSITIONS) is True
-    assert targets[closest_wheat[0]][0] == "COW"
-    assert targets[closest_wheat[1]][0] == "SHEEP"
+    assert targets[closest[0]][0] == "COW"
+    assert targets[closest[1]][0] == "SHEEP"
     assert Counter(value[0] for value in targets.values()) == Counter(
         {"MELON": 12, "WHEAT": 7, "COW": 3, "SHEEP": 3}
     )
 
-    growing[melon_position] = melon_tile(0, 1)
-    assert governs(make_obs(3, growing), targets, NW_POSITIONS) is True
-    assert targets[closest_wheat[0]][0] == "COW"
-    assert targets[closest_wheat[1]][0] == "SHEEP"
 
-
-def test_conversion_waits_until_a_real_wheat_crop_can_be_harvested():
+def test_successful_early_land_unlock_forces_handoff():
     governs = make_opening_controller()
     targets = {}
-    governs(make_obs(day=0), targets, NW_POSITIONS)
-    melon_position = next(
-        position for position, target in targets.items() if target[0] == "MELON"
-    )
+    governs(make_obs(0), targets, NW_POSITIONS)
+    assert governs(make_obs(2, quadrants=("NW", "NE")), targets, NW_POSITIONS) is False
 
-    assert (
-        governs(
-            make_obs(day=1, tiles={melon_position: melon_tile(0, 1)}),
-            targets,
-            NW_POSITIONS,
-        )
-        is True
-    )
-    assert Counter(value[0] for value in targets.values()) == Counter(OPENING_COUNTS)
+
+def test_land_policy_targets_days_six_and_nine_from_state():
+    assert LAND_FIRST_DAY == 6
+    assert LAND_INTERVAL_DAYS == 3
+    assert LAND_MAX_EXTRA == 2
+    assert LAND_BUY_DAYS == (6, 9)
+
+    nw = {"unlocked_quadrants": ["NW"]}
+    assert should_buy_land_on_schedule({"day": 5, "hour": 0}, nw) is False
+    assert should_buy_land_on_schedule({"day": 6, "hour": 0}, nw) is True
+    assert should_buy_land_on_schedule({"day": 6, "hour": 1}, nw) is False
+
+    one_extra = {"unlocked_quadrants": ["NW", "NE"]}
+    assert should_buy_land_on_schedule({"day": 8, "hour": 0}, one_extra) is False
+    assert should_buy_land_on_schedule({"day": 9, "hour": 0}, one_extra) is True
+
+    two_extra = {"unlocked_quadrants": ["NW", "NE", "SW"]}
+    assert should_buy_land_on_schedule({"day": 9, "hour": 0}, two_extra) is False
+    assert should_buy_land_on_schedule({"day": 12, "hour": 0}, two_extra) is False
+
+
+def test_unfunded_land_attempt_retries_until_quadrant_count_changes():
+    nw = {"unlocked_quadrants": ["NW"]}
+    assert should_buy_land_on_schedule({"day": 6, "hour": 0}, nw) is True
+    assert should_buy_land_on_schedule({"day": 7, "hour": 0}, nw) is True
+    assert should_buy_land_on_schedule({"day": 8, "hour": 0}, nw) is True
