@@ -1,8 +1,8 @@
-name: tmp-benchmark-hybrid-opening
+name: tmp-benchmark-opening-land-6-9
 on:
   push:
     branches:
-      - tmp/benchmark-hybrid-opening-land-v5
+      - tmp/benchmark-opening-land-6-9-v5
 permissions:
   contents: read
 jobs:
@@ -42,7 +42,7 @@ jobs:
               'tests/test_agents_planner_capacity.py',
           ]))
           PY
-      - name: Benchmark hybrid seeds 1-5
+      - name: Benchmark experiment seeds 1-5
         run: |
           python - <<'PY'
           import json, time
@@ -50,14 +50,11 @@ jobs:
           from kaggle_environments import make
           import agents.expansion_agent as expansion
           from experiments.play_match import configuration, resolve_opponent
-
           rows = []
           all_times = []
           for seed in range(1, 6):
               current = expansion.make_agent(29, seed=seed)
-              times = []
-              attempts = []
-              unlocks = []
+              times, attempts, unlocks = [], [], []
               seen_quadrants = [None]
               def timed(obs, config, current=current, times=times):
                   farm = obs['farms'][obs['player']]
@@ -91,8 +88,8 @@ jobs:
               }
               rows.append(row)
               all_times.extend(times)
-              print('HYBRID_SEED=' + json.dumps(row, separators=(',', ':')))
-          print('HYBRID_SUMMARY=' + json.dumps({
+              print('EXP_SEED=' + json.dumps(row, separators=(',', ':')))
+          print('EXP_SUMMARY=' + json.dumps({
               'mean_cash': sum(r['current_cash'] for r in rows) / len(rows),
               'mean_opponent': sum(r['opponent_cash'] for r in rows) / len(rows),
               'mean_margin': sum(r['margin'] for r in rows) / len(rows),
