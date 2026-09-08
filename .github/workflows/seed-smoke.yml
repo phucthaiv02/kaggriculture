@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
       - name: Run focused tests
-        run: pytest -q tests/test_agents_farm_tasks.py tests/test_agents_scheduler.py tests/test_agents_intraday.py tests/test_agents_opening_book.py tests/test_agents_planner_daily.py
+        run: python -m pytest -q tests/test_agents_farm_tasks.py tests/test_agents_scheduler.py tests/test_agents_intraday.py tests/test_agents_opening_book.py tests/test_agents_planner_daily.py
       - name: Diagnose opening WHEAT and run seeds 1 to 5 vs pass
         run: |
           python - <<'PY'
