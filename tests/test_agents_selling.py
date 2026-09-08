@@ -3,8 +3,11 @@
 from agents.selling import sell_orders
 
 
-def make_obs(shed):
-    return {"private": {"shed": shed}}
+def make_obs(shed, hour=None):
+    obs = {"private": {"shed": shed}}
+    if hour is not None:
+        obs["hour"] = hour
+    return obs
 
 
 def test_sells_surplus_wheat_and_other_inventory():
@@ -58,3 +61,22 @@ def test_surplus_sales_keep_two_days_of_animal_feed():
         ],
     )
     assert sell_orders(obs, {}) == [["SELL", "WHEAT", 8]]
+
+
+def test_holds_premium_animal_products_before_late_day_window():
+    obs = make_obs({"WHEAT": 5, "EGG": 2, "MILK": 3, "WOOL": 4}, hour=8)
+    assert sell_orders(obs, {}) == [["SELL", "WHEAT", 5]]
+
+
+def test_sells_premium_animal_products_after_final_shop_tick():
+    obs = make_obs({"EGG": 2, "MILK": 3, "WOOL": 4}, hour=20)
+    assert sell_orders(obs, {}) == [
+        ["SELL", "EGG", 2],
+        ["SELL", "MILK", 3],
+        ["SELL", "WOOL", 4],
+    ]
+
+
+def test_sells_overnight_premium_carry_at_hour_zero():
+    obs = make_obs({"MILK": 3}, hour=0)
+    assert sell_orders(obs, {}) == [["SELL", "MILK", 3]]
