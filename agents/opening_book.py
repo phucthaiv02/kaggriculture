@@ -26,22 +26,26 @@ OPENING_SIZE = sum(OPENING_COUNTS.values())
 OPENING_REFINANCE_DAY = 1
 PLANNER_HANDOFF_DAY = 2
 
-# Preserve the existing debug land-purchase schedule. The opening can hand off
-# well before this purchase; a successful earlier unlock also forces handoff.
-LAND_BUY_DAYS = (7,)
+# Expansion is deliberately fixed rather than utilization-driven: submit
+# exactly two scheduled BUY_LAND attempts, one on day 7 and one on day 10.
+# No later day may buy the third remaining quadrant.
+LAND_BUY_DAYS = (7, 10)
+MAX_SCHEDULED_LAND_PURCHASES = 2
 
 
 def should_buy_land_on_schedule(obs, farm):
-    """Submit one land order at hour 0 on the scheduled day, if available.
+    """Submit BUY_LAND only at hour 0 on day 7 or day 10.
 
     Affordability itself is left to the engine (BUY_LAND is simply a no-op if
-    the farm cannot cover the cost at that instant).
+    the farm cannot cover the cost at that instant). The strategy never owns
+    more than two extra quadrants through this schedule, so no third BUY_LAND
+    is emitted even if another scheduled day is added accidentally later.
     """
     n_extra = len(farm["unlocked_quadrants"]) - 1
     return (
         obs["day"] in LAND_BUY_DAYS
         and obs.get("hour", 0) == 0
-        and n_extra < len(LAND_ORDER)
+        and n_extra < min(MAX_SCHEDULED_LAND_PURCHASES, len(LAND_ORDER))
     )
 
 
