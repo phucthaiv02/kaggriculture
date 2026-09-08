@@ -94,8 +94,15 @@ def production(name, fertilize, day, end_day, tile=None):
                 act('HARVEST', when)
         result.sales[when].update({p: n for p, n in inventory.items() if n > 0})
         pickups = set(result.inputs[when])
-        if tile is None and when == day and animal:
-            pickups.add(name)
+        if tile is None and when == day:
+            if animal:
+                pickups.add(name)
+            else:
+                # Seeds are not market products, so they must not appear in
+                # Production.inputs. They *are* a real shed pickup for route
+                # capacity, though. A synthetic token lets LaborForecast count
+                # one batched pickup per crop type without changing economics.
+                pickups.add(f'SEED:{name}')
         if not animal and age >= CROP_LAST_AGE[name] and name in ONGOING_CROPS:
             actions += 1  # DIG the exhausted plant before a subsequent sowing.
         if actions:
