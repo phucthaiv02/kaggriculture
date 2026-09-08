@@ -1,0 +1,108 @@
+name: tmp-benchmark-no-opening
+on:
+  push:
+    branches:
+      - tmp/benchmark-no-opening-v5
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install engine
+        run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
+      - name: Reconstruct exact opponent
+        run: |
+          mkdir -p public
+          cat .tmp/opp.part0 .tmp/opp.part1 .tmp/opp.part2 | base64 -d | gzip -d > public/A.py
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          digest = hashlib.sha256(Path('public/A.py').read_bytes()).hexdigest()
+          print('OPPONENT_SHA256=' + digest)
+          assert digest == 'ccf2aefdadd600d3e6fcaad2879a310eb15bbd14183fc2deeff9bb2525697b9a'
+          PY
+      - name: Run focused tests
+        run: |
+          python - <<'PY'
+          import agents
+          import pytest
+          raise SystemExit(pytest.main([
+              '-q',
+              'tests/test_agents_opening_book.py',
+              'tests/test_agents_selling.py',
+              'tests/test_agents_forecast.py',
+              'tests/test_agents_forecast_robustness.py',
+              'tests/test_agents_planner.py',
+              'tests/test_agents_planner_capacity.py',
+          ]))
+          PY
+      - name: Benchmark no-opening seeds 1-5
+        run: |
+          python - <<'PY'
+          import json, time
+          import agents
+          from kaggle_environments import make
+          import agents.expansion_agent as expansion
+          from experiments.play_match import configuration, resolve_opponent
+
+          rows = []
+          all_times = []
+          for seed in range(1, 6):
+              current = expansion.make_agent(29, seed=seed)
+              times = []
+              attempts = []
+              unlocks = []
+              seen_quadrants = [None]
+
+              def timed(obs, config, current=current, times=times):
+                  farm = obs['farms'][obs['player']]
+                  n_quadrants = len(farm['unlocked_quadrants'])
+                  if seen_quadrants[0] is None:
+                      seen_quadrants[0] = n_quadrants
+                  elif n_quadrants > seen_quadrants[0]:
+                      unlocks.append([int(obs['day']), int(obs['hour']), n_quadrants])
+                      seen_quadrants[0] = n_quadrants
+                  started = time.perf_counter()
+                  try:
+                      action = current(obs, config)
+                  finally:
+                      times.append(time.perf_counter() - started)
+                  if any(order and order[0] == 'BUY_LAND' for order in action.get('market', [])):
+                      attempts.append([int(obs['day']), int(obs['hour'])])
+                  return action
+
+              opponent, _, _ = resolve_opponent('public/A.py')
+              env = make('kaggriculture', configuration=configuration(seed), debug=False)
+              env.run([timed, opponent])
+              final = env.steps[-1]
+              final_obs = final[0].observation
+              final_quadrants = len(final_obs['farms'][0]['unlocked_quadrants']) if isinstance(final_obs, dict) else None
+              row = {
+                  'seed': seed,
+                  'current_cash': float(final[0].reward),
+                  'opponent_cash': float(final[1].reward),
+                  'margin': float(final[0].reward - final[1].reward),
+                  'buy_land_attempts': attempts,
+                  'land_unlocks': unlocks,
+                  'final_quadrants': final_quadrants,
+                  'max_turn_s': max(times),
+                  'over_0_5s': sum(t > 0.5 for t in times),
+              }
+              rows.append(row)
+              all_times.extend(times)
+              print('NO_OPENING_SEED=' + json.dumps(row, separators=(',', ':')))
+
+          print('NO_OPENING_SUMMARY=' + json.dumps({
+              'mean_cash': sum(r['current_cash'] for r in rows) / len(rows),
+              'mean_opponent': sum(r['opponent_cash'] for r in rows) / len(rows),
+              'mean_margin': sum(r['margin'] for r in rows) / len(rows),
+              'max_turn_s': max(all_times),
+              'over_0_5s': sum(t > 0.5 for t in all_times),
+          }, separators=(',', ':')))
+          PY
