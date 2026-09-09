@@ -1,0 +1,115 @@
+name: AB Opponent Selling
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/ab-opponent-selling.yml]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: feat/planner-capacity-v4, fetch-depth: 0}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Patch opponent-aware selling
+        run: |
+          cat > /tmp/new_selling.py <<'PY'
+          """Sell surplus products while retaining feed and timing rival supply."""
+          from __future__ import annotations
+
+          from kaggle_environments.envs.kaggriculture import kaggriculture as game
+          from agents.schedules import CROP_LAST_AGE, ONGOING_CROPS, should_feed_animal
+
+          CASH_CROPS = ("WHEAT", "CARROT", "MELON", "TOMATO", "STRAWBERRY")
+          SELLABLE = CASH_CROPS + ("EGG", "MILK", "WOOL", "FERTILIZER")
+          LIQUIDITY_FLOOR = 2500
+
+          def _rival_supply_day(obs, product):
+              if "farms" not in obs or "player" not in obs or "day" not in obs:
+                  return None
+              today = obs["day"]
+              best = None
+              for player, farm in enumerate(obs["farms"]):
+                  if player == obs["player"]:
+                      continue
+                  for row in farm["tiles"]:
+                      for tile in row:
+                          if not isinstance(tile, dict):
+                              continue
+                          if tile.get("kind") == "PLANT" and tile.get("crop") == product:
+                              if tile.get("yield_units", 0) > 0:
+                                  return today
+                              crop = tile["crop"]
+                              if crop in ONGOING_CROPS:
+                                  when = tile["planted_day"] + game.CROPS[crop]["first_yield_day"]
+                              else:
+                                  when = tile["planted_day"] + CROP_LAST_AGE[crop]
+                              if when >= today:
+                                  best = when if best is None else min(best, when)
+                          animal = tile.get("animal")
+                          if animal and game.ANIMALS[animal]["product"] == product and tile.get("yield_units", 0) > 0:
+                              return today
+              return best
+
+          def _hold_for_rival(obs, product):
+              if product == "FERTILIZER" or "farms" not in obs:
+                  return False
+              end_day = obs.get("_planning_end_day", 29)
+              if obs.get("day", end_day) >= end_day - 1:
+                  return False
+              own_farm = obs["farms"][obs["player"]]
+              if own_farm.get("money", 0) < LIQUIDITY_FLOOR:
+                  return False
+              rival_day = _rival_supply_day(obs, product)
+              return rival_day is not None and rival_day > obs["day"] + 1
+
+          def sell_orders(obs, reserved):
+              """Sell surplus, but front-run visible rival supply when liquidity allows."""
+              reserved = dict(reserved)
+              if "farms" in obs:
+                  feed = 0
+                  for row in obs["farms"][obs["player"]]["tiles"]:
+                      for tile in row:
+                          if not isinstance(tile, dict) or not tile.get("animal"):
+                              continue
+                          age = obs["day"] - tile["placed_day"]
+                          feed += int(should_feed_animal(tile["animal"], age) and not tile.get("fed_today"))
+                          feed += int(should_feed_animal(tile["animal"], age + 1))
+                  reserved["WHEAT"] = max(reserved.get("WHEAT", 0), feed)
+
+              shed = obs["private"]["shed"]
+              orders = []
+              for item in SELLABLE:
+                  quantity = shed.get(item, 0) - reserved.get(item, 0)
+                  if quantity > 0 and not _hold_for_rival(obs, item):
+                      orders.append(["SELL", item, quantity])
+              return orders
+          PY
+          mv /tmp/new_selling.py agents/selling.py
+      - name: Install
+        run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
+      - name: Tests
+        run: python -m pytest -q tests/test_agents_selling.py tests/test_agents_forecast.py tests/test_agents_planner_daily.py
+      - name: Restore opponent
+        run: |
+          git fetch origin tmp/benchmark-v5-seeds1-5
+          mkdir -p .tmp public
+          for i in 0 1 2; do git show origin/tmp/benchmark-v5-seeds1-5:.tmp/opp.part$i > .tmp/opp.part$i; done
+          cat .tmp/opp.part0 .tmp/opp.part1 .tmp/opp.part2 | base64 -d | gzip -d > public/A.py
+      - name: Exact 10
+        run: |
+          python - <<'PY'
+          import importlib.util,json
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+          from experiments.play_match import configuration,END_DAY
+          spec=importlib.util.spec_from_file_location('opp','public/A.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          opp=getattr(m,'agent',None) or getattr(m,'main',None) or [v for v in m.__dict__.values() if callable(v) and getattr(v,'__module__',None)==m.__name__][0]
+          rows=[]
+          for seed in range(1,11):
+              e=make('kaggriculture',configuration=configuration(seed),debug=False); e.run([make_agent(END_DAY-1,seed=seed),opp])
+              a=float(e.steps[-1][0].reward); b=float(e.steps[-1][1].reward); rows.append((a,b)); print('SELL10',seed,a,b,a-b,flush=True)
+          print('SELL10_SUMMARY',json.dumps({'ours_mean':sum(a for a,b in rows)/10,'opp_mean':sum(b for a,b in rows)/10,'margin':sum(a-b for a,b in rows)/10,'wins':sum(a>b for a,b in rows)}),flush=True)
+          PY
