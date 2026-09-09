@@ -1,0 +1,70 @@
+name: Analyze Water Schedule Space
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/analyze-water-schedule-space.yml]
+permissions:
+  contents: read
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: feat/planner-capacity-v4}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Install engine
+        run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7'
+      - name: Enumerate minimum-action max-yield schedules
+        run: |
+          python - <<'PY'
+          from itertools import combinations
+          from copy import deepcopy
+          from kaggle_environments.envs.kaggriculture import kaggriculture as game
+          from experiments.crop_schedules import CASES
+
+          def simulate(crop, fert, waters):
+              case = CASES[(crop, fert)]
+              tile = game._new_plant(crop, 0, 24)
+              farm={'tiles':[[tile]],'farmer':[0,0],'hands':[]}
+              private={'inventories':[{}],'shed':{},'seeds':{}}
+              got=[]
+              for day in range(max(case['harvest'])+1):
+                  live=farm['tiles'][0][0]
+                  if not isinstance(live,dict) or live.get('kind')=='WEED':
+                      return None
+                  inv=private['inventories'][0]
+                  inv.clear()
+                  # Match validated within-day order from crop_schedules.py.
+                  if case['ongoing'] and day in case['harvest'] and live.get('yield_units',0):
+                      got.append(live.get('yield_units',0))
+                      game._apply_unit_action(farm,private,0,['HARVEST'],1,day,24)
+                  if day in case['fertilize']:
+                      inv['FERTILIZER']=1
+                      game._apply_unit_action(farm,private,0,['FERTILIZE'],1,day,24)
+                  if day in waters:
+                      game._apply_unit_action(farm,private,0,['WATER'],1,day,24)
+                  if (not case['ongoing']) and day in case['harvest']:
+                      got.append(live.get('yield_units',0))
+                      game._apply_unit_action(farm,private,0,['HARVEST'],1,day,24)
+                  if day < max(case['harvest']):
+                      game._daily_refresh_plants(farm,day,24)
+              return got
+
+          for (crop,fert),case in CASES.items():
+              last=max(case['harvest'])
+              k=len(case['water'])
+              valid=[]
+              # age0 WATER is required immediately after planting in the real agent;
+              # keep it fixed and search the remaining k-1 water days.
+              for rest in combinations(range(1,last+1),k-1):
+                  w={0,*rest}
+                  if simulate(crop,fert,w)==case['expected_yields']:
+                      valid.append(w)
+              inter=set.intersection(*(set(x) for x in valid)) if valid else set()
+              union=set.union(*(set(x) for x in valid)) if valid else set()
+              print('WATERSPACE',crop,'fert='+str(fert),'count='+str(len(valid)),
+                    'mandatory='+str(sorted(inter)),'flex='+str(sorted(union-inter)),flush=True)
+              for w in valid[:12]:
+                  print('  schedule',sorted(w),flush=True)
+          PY
