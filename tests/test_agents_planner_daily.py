@@ -4,9 +4,10 @@ from collections import Counter
 
 import pytest
 
+from agents import planner
 from agents.forecast import MarketForecast, Production
 from agents.horizon import PLANNER_HORIZON_DAYS, planner_cycle_end
-from agents.planner import _choose_daily, _daily_candidates
+from agents.planner import TargetProfit, _choose_daily, _daily_candidates
 from kaggle_environments.envs.kaggriculture import kaggriculture as game
 
 
@@ -87,3 +88,43 @@ def test_profit_per_day_can_beat_higher_absolute_cycle_profit():
     # WHEAT: (4*25-10)/4 = 22.5/day.
     # CARROT: (3*30-20)/3 = 23.33/day.
     assert choice == ("CARROT", False)
+
+
+def _stub_daily_results(monkeypatch, results):
+    monkeypatch.setattr(
+        planner,
+        "evaluate_daily_targets",
+        lambda *_args, **_kwargs: results,
+    )
+
+
+def test_light_concentration_penalty_breaks_a_near_tie(monkeypatch):
+    wheat_output = Production()
+    carrot_output = Production()
+    _stub_daily_results(monkeypatch, [
+        TargetProfit(("WHEAT", False), wheat_output, 100, 0, 0, 4),
+        TargetProfit(("CARROT", False), carrot_output, 99, 0, 0, 4),
+    ])
+
+    choice, output = _choose_daily(
+        None, None, None, Counter({"WHEAT": 1})
+    )
+
+    assert choice == ("CARROT", False)
+    assert output is carrot_output
+
+
+def test_concentration_penalty_does_not_override_a_large_edge(monkeypatch):
+    wheat_output = Production()
+    carrot_output = Production()
+    _stub_daily_results(monkeypatch, [
+        TargetProfit(("WHEAT", False), wheat_output, 120, 0, 0, 4),
+        TargetProfit(("CARROT", False), carrot_output, 100, 0, 0, 4),
+    ])
+
+    choice, output = _choose_daily(
+        None, None, None, Counter({"WHEAT": 1})
+    )
+
+    assert choice == ("WHEAT", False)
+    assert output is wheat_output
