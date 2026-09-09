@@ -1,0 +1,54 @@
+name: AB Endgame Pruning
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/ab-endgame-pruning.yml]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: feat/planner-capacity-v4, fetch-depth: 0}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Patch endgame only
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('agents/schedules.py'); s=p.read_text()
+          marker='''ANIMAL_CARE_DAYS = {\n    "GOOSE": set(range(28)),\n    "COW": {1, *range(3, 27)},\n    "SHEEP": set(range(26)),\n}\n'''
+          add=marker+'''\nANIMAL_HARVEST_DAYS = {\n    "GOOSE": {4, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29},\n    "COW": {8, 12, 16, 21, 25, 29},\n    "SHEEP": {6, 9, 12, 17, 18, 21, 24, 27},\n}\n\ndef animal_has_future_harvest(animal, age, remaining_days):\n    end_age = age + max(0, remaining_days)\n    return any(age < h <= end_age for h in ANIMAL_HARVEST_DAYS[animal])\n'''
+          assert marker in s; p.write_text(s.replace(marker,add,1))
+          p=Path('agents/farm_tasks.py'); s=p.read_text()
+          s=s.replace('''    ONGOING_CROPS, cycle_finished, is_maintenance_day, should_care_animal,\n    should_feed_animal, should_fertilize_today,\n)''','''    ONGOING_CROPS, animal_has_future_harvest, cycle_finished, is_maintenance_day,\n    should_care_animal, should_feed_animal, should_fertilize_today,\n)''',1)
+          old='''            age = day - tile["placed_day"]\n            feed_today = should_feed_animal(live_animal, age)\n            care_today = should_care_animal(live_animal, age)\n            harvest_ready = tile.get("yield_units", 0) > 0\n'''
+          new='''            age = day - tile["placed_day"]\n            remaining_days = obs.get('_planning_end_day', SEASON_END_DAY) - day\n            feed_today = should_feed_animal(live_animal, age) and remaining_days > 0\n            care_today = should_care_animal(live_animal, age) and animal_has_future_harvest(live_animal, age, remaining_days)\n            harvest_ready = tile.get("yield_units", 0) > 0\n'''
+          assert old in s; p.write_text(s.replace(old,new,1))
+          PY
+      - name: Install
+        run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
+      - name: Tests
+        run: python -m pytest -q tests/test_agents_farm_tasks.py tests/test_agents_scheduler.py experiments/animal_yields.py
+      - name: Restore opponent
+        run: |
+          git fetch origin tmp/benchmark-v5-seeds1-5
+          mkdir -p .tmp public
+          for i in 0 1 2; do git show origin/tmp/benchmark-v5-seeds1-5:.tmp/opp.part$i > .tmp/opp.part$i; done
+          cat .tmp/opp.part0 .tmp/opp.part1 .tmp/opp.part2 | base64 -d | gzip -d > public/A.py
+      - name: Exact 10
+        run: |
+          python - <<'PY'
+          import importlib.util,json
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+          from experiments.play_match import configuration,END_DAY
+          spec=importlib.util.spec_from_file_location('opp','public/A.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          opp=getattr(m,'agent',None) or getattr(m,'main',None) or [v for v in m.__dict__.values() if callable(v) and getattr(v,'__module__',None)==m.__name__][0]
+          rows=[]
+          for seed in range(1,11):
+              e=make('kaggriculture',configuration=configuration(seed),debug=False); e.run([make_agent(END_DAY-1,seed=seed),opp])
+              a=float(e.steps[-1][0].reward); b=float(e.steps[-1][1].reward); rows.append((a,b)); print('END10',seed,a,b,a-b,flush=True)
+          print('END10_SUMMARY',json.dumps({'ours_mean':sum(a for a,b in rows)/10,'opp_mean':sum(b for a,b in rows)/10,'margin':sum(a-b for a,b in rows)/10,'wins':sum(a>b for a,b in rows)}),flush=True)
+          PY
