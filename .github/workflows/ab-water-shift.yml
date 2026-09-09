@@ -1,0 +1,62 @@
+name: AB Water Shift
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/ab-water-shift.yml]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: feat/planner-capacity-v4, fetch-depth: 0}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Patch water shifting only
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('agents/schedules.py'); s=p.read_text()
+          s=s.replace('from __future__ import annotations\n','from __future__ import annotations\n\nfrom kaggle_environments.envs.kaggriculture import kaggriculture as official_game\n',1)
+          anchor='''def is_maintenance_day(crop, age, fertilized):\n    return age in CROP_WATER_DAYS[(crop, fertilized)]\n'''
+          repl=anchor+'''\n\ndef water_requirement(crop, age, fertilized, consecutive_unwatered=0):\n    schedule = CROP_WATER_DAYS[(crop, fertilized)]\n    first_yield = official_game.CROPS[crop]["first_yield_day"]\n    if age == 0:\n        return "MANDATORY"\n    if age >= first_yield:\n        return "MANDATORY" if age in schedule else "NONE"\n    if consecutive_unwatered >= 1:\n        return "MANDATORY"\n    if age + 1 < first_yield and age + 1 in schedule:\n        return "OPTIONAL"\n    return "NONE"\n'''
+          assert anchor in s; p.write_text(s.replace(anchor,repl,1))
+          p=Path('agents/farm_tasks.py'); s=p.read_text()
+          s=s.replace('should_feed_animal, should_fertilize_today,\n)','should_feed_animal, should_fertilize_today, water_requirement,\n)',1)
+          s=s.replace('''    prioritize_fertilizer_drop=False,\n):''','''    prioritize_fertilizer_drop=False,\n    include_optional_water=False,\n):''',1)
+          old='''            if is_maintenance_day(crop, age, fertilize_commit) and not tile.get("watered_today"):\n                actions.append(["WATER"])\n                # Every scheduled WATER is protective work. Waiting until a\n                # crop has already missed once leaves no scheduling margin:\n                # one more miss turns it into a WEED at day end.\n                urgent = True\n'''
+          new='''            water_need = water_requirement(crop, age, fertilize_commit, tile.get("consecutive_unwatered", 0))\n            if not tile.get("watered_today") and (water_need == "MANDATORY" or (include_optional_water and water_need == "OPTIONAL")):\n                actions.append(["WATER"])\n                urgent = water_need == "MANDATORY"\n'''
+          assert old in s; p.write_text(s.replace(old,new,1))
+          p=Path('agents/expansion_agent.py'); s=p.read_text()
+          s=s.replace('from agents.schedules import is_maintenance_day, should_care_animal, should_feed_animal\n','from agents.schedules import is_maintenance_day, should_care_animal, should_feed_animal, water_requirement\n',1)
+          s=s.replace('''        return is_maintenance_day(crop, age, current_fertilized)\n\n    def _replan_all_from_actual''','''        return water_requirement(crop, age, current_fertilized, tile.get("consecutive_unwatered", 0)) == "MANDATORY"\n\n    def _crop_can_prewater(tile, name, fertilize_commit, day):\n        if not (isinstance(tile, dict) and tile.get("kind") == "PLANT") or tile.get("watered_today"):\n            return False\n        crop = tile["crop"]; age = day - tile["planted_day"]\n        current_fertilized = fertilize_commit if crop == name else tile.get("fertilized_until_day", -1) >= tile["planted_day"]\n        return water_requirement(crop, age, current_fertilized, tile.get("consecutive_unwatered", 0)) == "OPTIONAL"\n\n    def _replan_all_from_actual''',1)
+          s=s.replace('''            elif _crop_still_needs_water(tile, name, fertilize_commit, day):\n                pending_targets[position] = target\n''','''            elif _crop_still_needs_water(tile, name, fertilize_commit, day):\n                pending_targets[position] = target\n            elif _crop_can_prewater(tile, name, fertilize_commit, day):\n                pending_targets[position] = target\n''',1)
+          s=s.replace('''        tasks = build_tasks(\n            obs,\n            pending_targets,\n            prioritize_fertilizer_drop=state["opening_active"],\n        )\n''','''        tasks = build_tasks(\n            obs,\n            pending_targets,\n            prioritize_fertilizer_drop=state["opening_active"],\n            include_optional_water=True,\n        )\n''',1)
+          p.write_text(s)
+          PY
+      - name: Install
+        run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
+      - name: Tests
+        run: python -m pytest -q tests/test_agents_farm_tasks.py tests/test_agents_scheduler.py experiments/crop_schedules.py
+      - name: Restore opponent
+        run: |
+          git fetch origin tmp/benchmark-v5-seeds1-5
+          mkdir -p .tmp public
+          for i in 0 1 2; do git show origin/tmp/benchmark-v5-seeds1-5:.tmp/opp.part$i > .tmp/opp.part$i; done
+          cat .tmp/opp.part0 .tmp/opp.part1 .tmp/opp.part2 | base64 -d | gzip -d > public/A.py
+      - name: Exact 10
+        run: |
+          python - <<'PY'
+          import importlib.util,json
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+          from experiments.play_match import configuration,END_DAY
+          spec=importlib.util.spec_from_file_location('opp','public/A.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          opp=getattr(m,'agent',None) or getattr(m,'main',None) or [v for v in m.__dict__.values() if callable(v) and getattr(v,'__module__',None)==m.__name__][0]
+          rows=[]
+          for seed in range(1,11):
+              e=make('kaggriculture',configuration=configuration(seed),debug=False); e.run([make_agent(END_DAY-1,seed=seed),opp])
+              a=float(e.steps[-1][0].reward); b=float(e.steps[-1][1].reward); rows.append((a,b)); print('WATER10',seed,a,b,a-b,flush=True)
+          print('WATER10_SUMMARY',json.dumps({'ours_mean':sum(a for a,b in rows)/10,'opp_mean':sum(b for a,b in rows)/10,'margin':sum(a-b for a,b in rows)/10,'wins':sum(a>b for a,b in rows)}),flush=True)
+          PY
