@@ -68,6 +68,11 @@ ANIMAL_CARE_DAYS = {
     "COW": {1, *range(3, 27)},
     "SHEEP": set(range(26)),
 }
+ANIMAL_HARVEST_DAYS = {
+    "GOOSE": {4, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29},
+    "COW": {8, 12, 16, 21, 25, 29},
+    "SHEEP": {6, 9, 12, 17, 18, 21, 24, 27},
+}
 
 
 def water_days(crop, fertilized):
@@ -88,6 +93,19 @@ def should_feed_animal(animal, age):
 
 def should_care_animal(animal, age):
     return age in ANIMAL_CARE_DAYS[animal]
+
+
+def animal_maintenance_can_still_pay(animal, age, day, end_day):
+    """Whether FEED/CARE today can still contribute to a harvest we can sell.
+
+    Animal production becomes harvestable on a later calendar day, so a
+    maintenance action has end-game value only when a validated harvest age
+    strictly after ``age`` still lands on or before the last actionable day.
+    """
+    return any(
+        harvest_age > age and day + (harvest_age - age) <= end_day
+        for harvest_age in ANIMAL_HARVEST_DAYS[animal]
+    )
 
 
 def cycle_finished(crop, age, tile):

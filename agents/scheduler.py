@@ -122,6 +122,16 @@ def _task_queue(start, bucket, shed_access):
     return queue, current
 
 
+def _mandatory_queue(start, bucket, shed_access):
+    """Mandatory route including the final shed DROP for liquidation work."""
+    queue, current = _task_queue(start, bucket, shed_access)
+    if any(task.must_liquidate for task in bucket):
+        shed = nearest_shed(current, shed_access)
+        queue += route(current, shed) + [["DROP"]]
+        current = shed
+    return queue, current
+
+
 def _tail_queue(start, task, shed_access):
     """Route one optional replacement after all mandatory work is complete."""
     actions = _optional_actions(task)
@@ -165,7 +175,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
     buckets = [[] for _ in worker_starts]
 
     def work_length(start, bucket):
-        return len(_task_queue(start, bucket, shed_access)[0])
+        return len(_mandatory_queue(start, bucket, shed_access)[0])
 
     def hard_crop_harvest(task):
         return (
@@ -176,6 +186,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
     ordered = sorted(
         tasks,
         key=lambda task: (
+            not task.must_liquidate,
             not hard_crop_harvest(task),
             not task.urgent,
             not (task.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(task))),
@@ -190,8 +201,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
                 for start in worker_starts
             ),
             -len(_mandatory_actions(task)),
-            task.position[1],
-            task.position[0],
+            task.position[1], task.position[0],
         ),
     )
     unassigned = []
@@ -199,9 +209,12 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
     for task in ordered:
         candidates = []
         for worker, bucket in enumerate(buckets):
+            if task.pinned_worker is not None and worker != task.pinned_worker:
+                continue
             for insertion in range(len(bucket) + 1):
                 candidate = bucket[:insertion] + [task] + bucket[insertion:]
                 priority = lambda queued: (
+                    not queued.must_liquidate,
                     not hard_crop_harvest(queued),
                     not queued.urgent,
                     not (queued.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(queued))),
@@ -223,6 +236,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
                     time_sensitive = (
                         task.urgent or task.animal_harvest
                         or task.deadline is not None or task.immediate_drop
+                        or task.must_liquidate
                     )
                     cost = projected if time_sensitive else projected - lengths[worker]
                     candidates.append((cost, projected, worker, insertion))
@@ -296,12 +310,15 @@ def build_queues(
         if not bucket:
             plans.append(WorkerPlan(start, []))
             continue
-        queue, current = _task_queue(start, bucket, shed_access)
-        queue, current = _append_optional_tails(
-            queue, current, bucket, budget, shed_access
-        )
+        queue, current = _mandatory_queue(start, bucket, shed_access)
+        # A liquidation bucket deliberately ends at the shed. Never append a
+        # replacement tail after that DROP; those actions cannot pay back now.
+        if not any(task.must_liquidate for task in bucket):
+            queue, current = _append_optional_tails(
+                queue, current, bucket, budget, shed_access
+            )
         carries_sellable = any(task.sells and not task.immediate_drop for task in bucket)
-        if carries_sellable:
+        if carries_sellable and not any(task.must_liquidate for task in bucket):
             shed = nearest_shed(current, shed_access)
             trip_home = route(current, shed) + [["DROP"]]
             if len(queue) + len(trip_home) <= budget:

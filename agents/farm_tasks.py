@@ -22,8 +22,9 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import ANIMALS as ENV_
 from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 
 from agents.schedules import (
-    ONGOING_CROPS, cycle_finished, is_maintenance_day, should_care_animal,
-    should_feed_animal, should_fertilize_today,
+    ONGOING_CROPS, animal_maintenance_can_still_pay, cycle_finished,
+    is_maintenance_day, should_care_animal, should_feed_animal,
+    should_fertilize_today,
 )
 
 CROPS = ("WHEAT", "CARROT", "MELON", "TOMATO", "STRAWBERRY")
@@ -32,6 +33,9 @@ BUILD = {"GOOSE": "BUILD_COOP", "COW": "BUILD_PASTURE", "SHEEP": "BUILD_PASTURE"
 ANIMAL_STRUCTURE = {"GOOSE": "COOP", "COW": "PASTURE", "SHEEP": "PASTURE"}
 SEED_COST = {"WHEAT": 10, "CARROT": 20, "MELON": 80, "TOMATO": 50, "STRAWBERRY": 100}
 ANIMAL_COST = {name: data["cost"] for name, data in ENV_ANIMALS.items()}
+SELLABLE_PRODUCTS = set(CROPS) | {
+    ENV_ANIMALS[name]["product"] for name in ANIMALS
+} | {"FERTILIZER"}
 
 
 @dataclass
@@ -46,6 +50,8 @@ class Task:
     refinance_feed: bool = False  # opening-only fertilizer sale -> wheat -> feed
     animal_harvest: bool = False  # ready animal output outranks all other tile work
     deadline: int | None = None  # absolute engine step before a crop decays
+    must_liquidate: bool = False  # final-day work must end with a shed DROP
+    pinned_worker: int | None = None  # final-day carried stock belongs to this worker
 
 
 def _new_planting_actions(name, fertilize_commit, seeds_available, animals_available, wheat_available,
@@ -98,6 +104,8 @@ def build_tasks(
     claimed) are skipped entirely -- an unclaimed tile generates no task.
     """
     day = obs["day"]
+    end_day = obs.get("_planning_end_day", SEASON_END_DAY)
+    final_day = day >= end_day
     farm = obs["farms"][obs["player"]]
     shed = obs["private"]["shed"]
     seeds_left = Counter(obs["private"]["seeds"])
@@ -124,12 +132,73 @@ def build_tasks(
     prices = obs["market"]["prices"]
     tasks = []
 
+    # On the final actionable day, inventory already carried in the field is
+    # itself liquidation work. Pin one shed-return task to each carrier so the
+    # scheduler cannot accidentally give that DROP to a different worker.
+    if final_day:
+        worker_positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
+        for index, (position, inventory) in enumerate(
+            zip(worker_positions, obs["private"]["inventories"])
+        ):
+            carried = Counter({
+                item: inventory.get(item, 0)
+                for item in SELLABLE_PRODUCTS
+                if inventory.get(item, 0) > 0
+            })
+            if carried:
+                tasks.append(Task(
+                    position,
+                    [],
+                    urgent=True,
+                    sells=carried,
+                    must_liquidate=True,
+                    pinned_worker=index,
+                ))
+
     for position, target in targets.items():
+        x, y = position
+        tile = farm["tiles"][y][x]
+
+        # Final-day liquidation mode: no WATER/FERTILIZE/DIG/PLANT/PLACE/
+        # FEED/CARE can create bankable money after the terminal boundary.
+        # Harvest whatever is already ready, collect already-created animal
+        # fertilizer, and make the route include a real shed DROP.
+        if final_day:
+            if isinstance(tile, dict) and tile.get("kind") == "PLANT":
+                crop = tile["crop"]
+                quantity = tile.get("yield_units", 0)
+                if quantity > 0:
+                    tasks.append(Task(
+                        position,
+                        [["HARVEST"]],
+                        urgent=True,
+                        sells=Counter({crop: quantity}),
+                        must_liquidate=True,
+                    ))
+            elif isinstance(tile, dict) and tile.get("animal"):
+                actions, sells = [], Counter()
+                harvest_ready = tile.get("yield_units", 0) > 0
+                if harvest_ready:
+                    product = ENV_ANIMALS[tile["animal"]]["product"]
+                    actions.append(["HARVEST"])
+                    sells[product] += tile["yield_units"]
+                if tile.get("fertilizer_available"):
+                    actions.append(["COLLECT_FERTILIZER"])
+                    sells["FERTILIZER"] += 1
+                if actions:
+                    tasks.append(Task(
+                        position,
+                        actions,
+                        urgent=True,
+                        sells=sells,
+                        animal_harvest=harvest_ready,
+                        must_liquidate=True,
+                    ))
+            continue
+
         if target is None:
             # An idle target must not abandon already-grown output or buy a
             # fallback seed just to trigger a harvest.
-            x, y = position
-            tile = farm["tiles"][y][x]
             if isinstance(tile, dict) and tile.get("kind") == "PLANT":
                 crop = tile["crop"]
                 if tile.get("yield_units", 0) > 0:
@@ -140,8 +209,6 @@ def build_tasks(
                     tasks.append(Task(position, [["DIG"]], ends_cycle=True))
             continue
         name, fertilize_commit = target
-        x, y = position
-        tile = farm["tiles"][y][x]
         actions, needs, sells = [], Counter(), Counter()
         urgent, ends_cycle = False, False
         immediate_drop, refinance_feed = False, False
@@ -149,8 +216,11 @@ def build_tasks(
 
         if live_animal:
             age = day - tile["placed_day"]
-            feed_today = should_feed_animal(live_animal, age)
-            care_today = should_care_animal(live_animal, age)
+            maintenance_can_pay = animal_maintenance_can_still_pay(
+                live_animal, age, day, end_day
+            )
+            feed_today = maintenance_can_pay and should_feed_animal(live_animal, age)
+            care_today = maintenance_can_pay and should_care_animal(live_animal, age)
             harvest_ready = tile.get("yield_units", 0) > 0
             # Animal output is capped on-tile. Harvesting as soon as it is
             # available prevents a later production tick from being clipped,
@@ -269,7 +339,7 @@ def build_tasks(
                     wheat_left + (1 if harvested_feed else 0),
                     False,
                     wheat_needs_pickup=not harvested_feed,
-                    day=day, end_day=obs.get('_planning_end_day', SEASON_END_DAY),
+                    day=day, end_day=end_day,
                 )
                 if new_actions:
                     if name in CROPS:
@@ -294,7 +364,7 @@ def build_tasks(
                 name, fertilize_commit, 0, available, wheat_left,
                 needs_dig=isinstance(tile, dict) and not already_built,
                 needs_build=not already_built,
-                day=day, end_day=obs.get('_planning_end_day', SEASON_END_DAY),
+                day=day, end_day=end_day,
             )
             if new_actions:
                 if new_needs[name]:
@@ -308,7 +378,7 @@ def build_tasks(
         ):
             new_actions, new_needs = _new_planting_actions(
                 name, fertilize_commit, seeds_left[name], 0, 0, isinstance(tile, dict),
-                day=day, end_day=obs.get('_planning_end_day', SEASON_END_DAY),
+                day=day, end_day=end_day,
             )
             if new_actions:
                 seeds_left[name] -= 1
@@ -347,6 +417,7 @@ def _animal_and_seed_demand(
     will already provide toward that, what's missing to fill every animal
     target, and what crop seeds are missing."""
     day = obs["day"]
+    end_day = obs.get("_planning_end_day", SEASON_END_DAY)
     farm = obs["farms"][obs["player"]]
     shed = obs["private"]["shed"]
     seeds_left = Counter(obs["private"]["seeds"])
@@ -386,7 +457,11 @@ def _animal_and_seed_demand(
                     seed_demand[name] += 1
         elif name in ANIMALS:
             if isinstance(tile, dict) and tile.get("animal") == name:
-                if not tile.get("fed_today"):
+                age = day - tile["placed_day"]
+                if (
+                    not tile.get("fed_today")
+                    and animal_maintenance_can_still_pay(name, age, day, end_day)
+                ):
                     live_animals += 1
             elif can_start_today(name, obs):
                 animal_missing[name] += 1
@@ -404,6 +479,28 @@ def _animal_and_seed_demand(
         wheat_incoming,
         carried["WHEAT"],
     )
+
+
+def _tomorrow_feed_need(obs, farm, active_positions, animal_missing):
+    """Reserve only feed whose next-day maintenance can still reach a sale."""
+    day = obs["day"]
+    end_day = obs.get("_planning_end_day", SEASON_END_DAY)
+    if day < 3 or day >= end_day or sum(animal_missing.values()):
+        return 0
+    tomorrow = day + 1
+    total = 0
+    for position in active_positions:
+        tile = farm["tiles"][position[1]][position[0]]
+        if not isinstance(tile, dict) or not tile.get("animal"):
+            continue
+        animal = tile["animal"]
+        age = tomorrow - tile["placed_day"]
+        if (
+            should_feed_animal(animal, age)
+            and animal_maintenance_can_still_pay(animal, age, tomorrow, end_day)
+        ):
+            total += 1
+    return total
 
 
 def feed_wheat_order(obs, targets, active_positions):
@@ -427,12 +524,7 @@ def feed_wheat_order(obs, targets, active_positions):
     )
     shed = obs["private"]["shed"]
     farm = obs["farms"][obs["player"]]
-    tomorrow_feed = (obs["day"] >= 3 and not sum(animal_missing.values())) * sum(
-        1
-        for position in active_positions
-        if isinstance(farm["tiles"][position[1]][position[0]], dict)
-        and farm["tiles"][position[1]][position[0]].get("animal")
-    )
+    tomorrow_feed = _tomorrow_feed_need(obs, farm, active_positions, animal_missing)
     wheat_needed = max(
         0,
         live_animals + pending_feed + tomorrow_feed
@@ -451,6 +543,7 @@ def purchase_orders(
     build_tasks only PICKUPs what's already in the shed -- this is what puts
     it there."""
     farm = obs["farms"][obs["player"]]
+    end_day = obs.get("_planning_end_day", SEASON_END_DAY)
     (
         seed_demand,
         animal_missing,
@@ -471,12 +564,7 @@ def purchase_orders(
     # placement/refinance, while build_tasks decides the exact ages on which
     # FEED and CARE actions actually run.
     wheat_inventory = obs["market"]["inventory"].get("WHEAT", 0)
-    tomorrow_feed = (obs["day"] >= 3 and not sum(animal_missing.values())) * sum(
-        1
-        for position in active_positions
-        if isinstance(farm["tiles"][position[1]][position[0]], dict)
-        and farm["tiles"][position[1]][position[0]].get("animal")
-    )
+    tomorrow_feed = _tomorrow_feed_need(obs, farm, active_positions, animal_missing)
     wheat_needed_now = max(
         0,
         live_animals
@@ -544,10 +632,11 @@ def purchase_orders(
     # nearly all starting capital, and every newly placed animal produces
     # fertilizer that the now-safe refinance route can turn into day-1 feed.
     # From day 1 onward keep cash feed coverage instead of relying entirely
-    # on that just-in-time loop.
+    # on that just-in-time loop. Near the season boundary, stop reserving
+    # tomorrow's feed once tomorrow's maintenance cannot reach another sale.
     next_day_feed_reserve = (
         0
-        if obs["day"] == 0
+        if obs["day"] == 0 or obs["day"] >= end_day - 1
         else wheat_cost(live_animals + pending_feed + new_animal_feed)
     )
 
