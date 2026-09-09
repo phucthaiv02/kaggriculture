@@ -237,9 +237,10 @@ def build_tasks(
             # own 4-day clock). Never pre-empt an ongoing crop this way --
             # that would forfeit entire future production cycles, not a few
             # bonus units.
-            early_exit = (
-                crop not in ONGOING_CROPS and name != crop and tile.get("yield_units", 0) > 0
-            )
+            # Target changes wait until the current one-time crop reaches
+            # its verified max-yield age. Early harvest sacrifices yield; a
+            # late harvest enters decay.
+            early_exit = False
             if cycle_finished(crop, age, tile) or early_exit:
                 ends_cycle = True
                 if crop not in ONGOING_CROPS:

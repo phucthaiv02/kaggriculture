@@ -185,30 +185,39 @@ def test_one_time_crop_harvests_and_replants_on_last_age():
     ]
 
 
-def test_wheat_conversion_builds_pasture_immediately_after_harvest_without_inputs():
+def test_wheat_conversion_waits_for_exact_max_yield_day():
     obs = make_obs(
         day=1,
         tiles={(0, 0): plant("WHEAT", planted_day=0, day=1, yield_units=1)},
         shed={},
     )
-    task = one_task(build_tasks(obs, {(0, 0): ("COW", False)}))
-    assert task.actions == [["WATER"], ["HARVEST"], ["BUILD_PASTURE"]]
-    assert task.ends_cycle
-    assert not task.needs
+    assert build_tasks(obs, {(0, 0): ("COW", False)}) == []
 
 
-def test_wheat_conversion_does_not_feed_cow_on_placement_day():
+def test_wheat_conversion_keeps_maintenance_before_max_yield():
     obs = make_obs(
         day=2,
         tiles={(0, 0): plant("WHEAT", planted_day=0, day=2, yield_units=1)},
         shed={"COW": 1},
     )
     task = one_task(build_tasks(obs, {(0, 0): ("COW", False)}))
+    assert task.actions == [["WATER"]]
+    assert not task.ends_cycle
+    assert not task.needs
+
+
+def test_wheat_conversion_happens_on_exact_max_yield_day():
+    obs = make_obs(
+        day=4,
+        tiles={(0, 0): plant("WHEAT", planted_day=0, day=4, yield_units=4)},
+        shed={"COW": 1},
+    )
+    task = one_task(build_tasks(obs, {(0, 0): ("COW", False)}))
     assert task.actions == [
         ["WATER"], ["HARVEST"], ["BUILD_PASTURE"], ["PLACE", "COW"]
     ]
+    assert task.ends_cycle
     assert task.needs == {"COW": 1}
-    assert task.sells == {}
 
 
 def test_water_is_urgent_once_a_day_was_already_missed():

@@ -350,6 +350,37 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         )
         return is_maintenance_day(crop, age, current_fertilized)
 
+    def _replan_all_from_actual(obs, farm, day, hour):
+        """Rebuild every unfinished route from live worker positions at hour 2."""
+        if hour != 2:
+            return
+        tasks = build_tasks(
+            obs, targets, prioritize_fertilizer_drop=state["opening_active"]
+        )
+        state["deferred_expansion_positions"] = {
+            position for position in state["deferred_expansion_positions"]
+            if not isinstance(farm["tiles"][position[1]][position[0]], dict)
+        }
+        tasks = [
+            task for task in tasks
+            if task.position not in state["deferred_expansion_positions"]
+        ]
+        actual_hands = tuple(map(tuple, farm["hands"]))
+        remaining = 24 - hour
+        plans, admitted, unassigned, protective_debt = _capacity_safe_queues(
+            tasks, tuple(farm["farmer"]), len(actual_hands), actual_hands,
+            _open_shed_access(farm), pending_hand_budget=remaining,
+            existing_hand_budget=remaining,
+        )
+        state["plans"] = plans
+        state["reserved"] = reserved_items(admitted)
+        state["protective_debt_positions"] = {task.position for task in protective_debt}
+        state["scheduled_placements"] = {
+            task.position for task in admitted
+            if any(action[0] in ("PLANT", "PLACE") for action in task.actions)
+        }
+        state["unverified_hand_indices"] = set()
+
     def _schedule_late_placements(obs, farm, day, hour):
         """Use newly bought animals, and rescue any live animal whose
         FEED/CARE/HARVEST fell through, once the morning queue has gone
@@ -619,6 +650,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
 
         if state["unverified_hand_indices"]:
             _validate_predicted_hands(farm, hour)
+        _replan_all_from_actual(obs, farm, day, hour)
         # Morning hires already have pending orders/plans. Extra hires here
         # are only for newly available work after that pass has settled.
         hire_costs = (

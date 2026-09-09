@@ -167,9 +167,16 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
     def work_length(start, bucket):
         return len(_task_queue(start, bucket, shed_access)[0])
 
+    def hard_crop_harvest(task):
+        return (
+            task.ends_cycle
+            and any(action and action[0] == "HARVEST" for action in _mandatory_actions(task))
+        )
+
     ordered = sorted(
         tasks,
         key=lambda task: (
+            not hard_crop_harvest(task),
             not task.urgent,
             not (task.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(task))),
             not task.animal_harvest,
@@ -195,6 +202,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
             for insertion in range(len(bucket) + 1):
                 candidate = bucket[:insertion] + [task] + bucket[insertion:]
                 priority = lambda queued: (
+                    not hard_crop_harvest(queued),
                     not queued.urgent,
                     not (queued.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(queued))),
                     not queued.animal_harvest,
