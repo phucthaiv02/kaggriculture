@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections import Counter
 
-from agents.schedules import animal_maintenance_can_still_pay, should_feed_animal
+from agents.maintenance import should_feed
+from agents.schedules import animal_maintenance_can_still_pay
 
 
 CASH_CROPS = ("WHEAT", "CARROT", "MELON", "TOMATO", "STRAWBERRY")
@@ -18,27 +19,28 @@ def sell_orders(obs, reserved):
     final_day = obs.get("day", -1) >= end_day
 
     # Reserve only feed that can still contribute to a harvest before the
-    # terminal boundary. This mirrors farm_tasks' end-game FEED/CARE pruning
-    # instead of keeping dead WHEAT out of the market for another day.
+    # terminal boundary. Position-aware COW phases mirror build_tasks so the
+    # seller never dumps wheat assigned to a staggered FEED day.
     if "farms" in obs and not final_day:
         feed = 0
         day = obs["day"]
-        for row in obs["farms"][obs["player"]]["tiles"]:
-            for tile in row:
+        for y, row in enumerate(obs["farms"][obs["player"]]["tiles"]):
+            for x, tile in enumerate(row):
                 if not isinstance(tile, dict) or not tile.get("animal"):
                     continue
                 animal = tile["animal"]
                 age = day - tile["placed_day"]
+                position = (x, y)
                 feed += int(
                     animal_maintenance_can_still_pay(animal, age, day, end_day)
-                    and should_feed_animal(animal, age)
+                    and should_feed(animal, age, position)
                     and not tile.get("fed_today")
                 )
                 feed += int(
                     animal_maintenance_can_still_pay(
                         animal, age + 1, day + 1, end_day
                     )
-                    and should_feed_animal(animal, age + 1)
+                    and should_feed(animal, age + 1, position)
                 )
         reserved["WHEAT"] = max(reserved.get("WHEAT", 0), feed)
 
