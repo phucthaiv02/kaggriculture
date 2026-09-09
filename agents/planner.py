@@ -20,6 +20,7 @@ SEED_COST = {name: official_game.CROPS[name]["seed"] for name in CROPS}
 ANIMAL_COST = {name: official_game.ANIMALS[name]["cost"] for name in ANIMALS}
 LAND_ORDER = official_game.LAND_ORDER
 LAND_BUY_UTILIZATION = 0.75
+TARGET_CONCENTRATION_PENALTY = 0.03
 
 # A standard 720-turn season has 30 days, indexed 0 through 29 by the engine.
 
@@ -145,11 +146,9 @@ def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
 def evaluate_daily_targets(market, baseline, candidates, labor=None, position=(4, 4)):
     """Evaluate fresh targets on per-type horizons and normalize by elapsed day.
 
-    Crops are scoped to their max-yield age. Animal windows are GOOSE=15,
-    COW=14 and SHEEP=12 elapsed days, corresponding to first yield plus the
-    requested six/three/two additional harvests. Near season end the window is
-    truncated to the last playable day, but a target still must reach at least
-    its first yield.
+    Crops are scoped to their max-yield age. Animals use their configured fresh
+    target windows. Near season end the window is truncated to the last playable
+    day, but a target still must reach at least its first yield.
     """
     labor = labor or LaborForecast()
     results = []
@@ -212,7 +211,12 @@ def _choose(market, baseline, candidates, counts, labor=None, position=(4, 4)):
 
 
 def _choose_daily(market, baseline, candidates, counts, labor=None, position=(4, 4)):
-    """Choose the highest positive marginal net profit per elapsed day."""
+    """Choose positive marginal profit/day with a light concentration haircut.
+
+    MarketForecast already prices the next unit against projected shared supply.
+    This extra haircut is deliberately small: it only makes a near-tie prefer a
+    less-concentrated producer instead of repeatedly leaning on one forecast.
+    """
     profitable = [
         result
         for result in evaluate_daily_targets(
@@ -225,6 +229,8 @@ def _choose_daily(market, baseline, candidates, counts, labor=None, position=(4,
     result = max(
         profitable,
         key=lambda r: (
+            r.profit_per_day
+            / (1.0 + TARGET_CONCENTRATION_PENALTY * counts[r.choice[0]]),
             r.profit_per_day,
             r.profit,
             -counts[r.choice[0]],
@@ -286,8 +292,9 @@ def plan_targets(obs, targets, active_positions, end_day):
     Existing crops are forecast from their real age, held yield and watering
     state, including visible opponent crops. Unsown choices are reconsidered
     each day. Fresh choices use target-specific horizons and are ranked by
-    marginal net profit/day, while shared baseline saturation and route load
-    are updated after every accepted tile.
+    marginal net profit/day with a light same-producer concentration haircut;
+    shared baseline saturation and route load are updated after every accepted
+    tile.
 
     Capacity comes from LaborForecast itself. Every accepted target enters the
     shared baseline, and later candidates are rejected naturally if the
@@ -310,7 +317,6 @@ def plan_targets(obs, targets, active_positions, end_day):
         if isinstance(tile, dict) and tile.get("kind") == "PLANT":
             if not cycle_finished(tile["crop"], day - tile["planted_day"], tile):
                 continue
-            # Preserve a conversion already scheduled by the opening.
             if (
                 current
                 and current[0] != tile["crop"]
@@ -320,7 +326,6 @@ def plan_targets(obs, targets, active_positions, end_day):
         replanning.append(position)
 
     for player, other_farm in enumerate(obs["farms"]):
-        # Hand-built test observations may alias the same farm twice.
         if player != obs["player"] and other_farm is farm:
             continue
         for y, row in enumerate(other_farm["tiles"]):
@@ -334,7 +339,6 @@ def plan_targets(obs, targets, active_positions, end_day):
                     continue
                 target = targets.get((x, y)) if player == obs["player"] else None
                 fertilize = bool(target and target[0] == name and target[1])
-                # Opponent future fertilizer decisions are not observable.
                 destination = baseline if player == obs["player"] else external
                 if player == obs["player"] and (x, y) not in replanning:
                     future, _ = _rotation(name, fertilize, day, end_day, tile)
@@ -344,7 +348,6 @@ def plan_targets(obs, targets, active_positions, end_day):
                 if player == obs["player"] and (x, y) not in replanning:
                     counts[name] += 1
 
-    # Include unsold goods exactly once, separately from remaining tile output.
     baseline.sales[day].update({
         p: n
         for p, n in obs["private"]["shed"].items()
@@ -394,11 +397,6 @@ def plan_targets(obs, targets, active_positions, end_day):
         if farm["tiles"][p[1]][p[0]] != "LOCKED"
     ))
 
-    # Assign near the shed first so greedy marginal allocation spends route
-    # capacity on cheaper-to-service positions before distant ones. Every
-    # accepted target changes market saturation and labor load for the next
-    # position; the score itself is marginal net profit/day on that target's
-    # own horizon.
     for position in sorted(
         replanning, key=lambda p: (distance(p), p[1], p[0])
     ):
