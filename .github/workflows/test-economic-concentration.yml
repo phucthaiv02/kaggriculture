@@ -1,4 +1,4 @@
-name: Test Economic Concentration
+name: Final Economic Diversification Gate
 on:
   push:
     branches: [feat/planner-capacity-v4]
@@ -16,21 +16,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Patch concentration-aware ranking
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('agents/planner.py')
-          s=p.read_text()
-          old='''        key=lambda r: (\n            r.profit_per_day,\n            r.profit,\n            -counts[r.choice[0]],\n            r.choice,\n        ),\n'''
-          new='''        key=lambda r: (\n            r.profit_per_day / (1.0 + 0.03 * counts[r.choice[0]]),\n            r.profit_per_day,\n            r.profit,\n            -counts[r.choice[0]],\n            r.choice,\n        ),\n'''
-          assert old in s
-          p.write_text(s.replace(old,new,1))
-          PY
       - name: Install engine
         run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
       - name: Focused tests
-        run: python -m pytest -q tests/test_agents_planner.py tests/test_agents_opening_book.py
+        run: python -m pytest -q tests/test_agents_planner_daily.py tests/test_agents_planner.py tests/test_agents_opening_book.py tests/test_agents_farm_tasks.py
       - name: Restore exact opponent
         run: |
           git fetch origin tmp/benchmark-v5-seeds1-5
@@ -58,11 +47,18 @@ jobs:
               env.run([make_agent(END_DAY-1, seed=seed), opp])
               ours=float(env.steps[-1][0].reward); theirs=float(env.steps[-1][1].reward)
               row={'seed':seed,'ours':ours,'opponent':theirs,'margin':ours-theirs}
-              rows.append(row); print('CONC10 '+json.dumps(row), flush=True)
-          print('CONC10_SUMMARY '+json.dumps({
+              rows.append(row); print('FINAL10 '+json.dumps(row), flush=True)
+          summary={
               'ours_mean':sum(r['ours'] for r in rows)/10,
               'opponent_mean':sum(r['opponent'] for r in rows)/10,
               'margin_mean':sum(r['margin'] for r in rows)/10,
               'wins':sum(r['margin']>0 for r in rows)
-          }), flush=True)
+          }
+          print('FINAL10_SUMMARY '+json.dumps(summary), flush=True)
+          if summary['ours_mean'] < 65000:
+              raise SystemExit('ours_mean regression')
+          if summary['margin_mean'] < -40000:
+              raise SystemExit('margin regression')
+          if summary['wins'] < 1:
+              raise SystemExit('win-count regression')
           PY
