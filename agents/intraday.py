@@ -15,6 +15,12 @@ TILE_ACTIONS = {
     "BUILD_COOP", "BUILD_PASTURE", "FEED", "CARE", "COLLECT_FERTILIZER",
 }
 PROTECTIVE_OPS = {"WATER", "HARVEST", "FEED", "CARE"}
+# A horizon-limited commitment scan is used only by survival rescue/hiring.
+# Being scheduled for HARVEST/DIG/PLANT on a tile does *not* mean that a
+# missing WATER or FEED/CARE is covered there.  The replay showed exactly this
+# failure mode: a SHEEP/COW had HARVEST queued, rescue skipped the position,
+# FEED never ran for a second day, and the animal disappeared at dawn.
+SURVIVAL_COVER_OPS = {"WATER", "FEED", "CARE"}
 
 
 def _has_pending_protective_work(queue):
@@ -23,7 +29,15 @@ def _has_pending_protective_work(queue):
 
 
 def queue_commitments(positions, plans, max_steps=None):
-    """Recover destinations and input reservations from remaining commands."""
+    """Recover destinations and input reservations from remaining commands.
+
+    With ``max_steps=None`` this is the normal occupancy scan used by planting
+    and purchasing, so every tile mutation reserves the position.  A finite
+    ``max_steps`` is used by late survival rescue: in that mode a position is
+    considered covered only when WATER/FEED/CARE itself is still executable
+    before dusk.  Other work on the same tile must not suppress missing
+    survival maintenance.
+    """
     endpoints, occupied = [], set()
     seeds, supplies = Counter(), Counter()
     positions = [*positions, *(plan.start for plan in plans[len(positions):])]
@@ -38,7 +52,8 @@ def queue_commitments(positions, plans, max_steps=None):
                 dx, dy = MOVES[op]
                 x, y = x + dx, y + dy
             elif op in TILE_ACTIONS:
-                occupied.add((x, y))
+                if max_steps is None or op in SURVIVAL_COVER_OPS:
+                    occupied.add((x, y))
                 if op == "PLANT":
                     seeds[operation[1]] += 1
             elif op == "PICKUP":
