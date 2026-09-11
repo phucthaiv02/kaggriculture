@@ -1,0 +1,59 @@
+name: Scheduler Compaction Check
+
+on:
+  push:
+    branches:
+      - feat/planner-capacity-v4
+    paths:
+      - .github/workflows/scheduler-compaction-check.yml
+      - agents/scheduler.py
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile and exercise compaction
+        run: |
+          python -m py_compile agents/scheduler.py
+          python - <<'PY'
+          from collections import Counter
+          from dataclasses import dataclass, field
+          from agents.scheduler import SHED, build_queues, hands_needed
+
+          @dataclass
+          class Task:
+              position: tuple[int, int]
+              actions: list
+              needs: Counter = field(default_factory=Counter)
+              urgent: bool = False
+              sells: Counter = field(default_factory=Counter)
+              ends_cycle: bool = False
+              immediate_drop: bool = False
+              refinance_feed: bool = False
+              animal_harvest: bool = False
+              deadline: int | None = None
+              must_liquidate: bool = False
+              pinned_worker: int | None = None
+              immediate_transition: bool = False
+
+          tasks = [
+              Task((0, 9), [["WATER"]]),
+              Task((6, 0), [["WATER"]] * 2),
+              Task((7, 4), [["WATER"]] * 4),
+              Task((1, 2), [["WATER"]] * 3),
+              Task((0, 6), [["WATER"]] * 7),
+          ]
+          count, missing = hands_needed(tasks, farmer_start=SHED)
+          assert count == 1, (count, missing)
+          assert not missing
+          plans, missing = build_queues(
+              tasks, farmer_start=SHED, hand_count=1, hand_starts=((5, 4),)
+          )
+          assert not missing
+          assert [len(plan.queue) for plan in plans] == [17, 23]
+          print("scheduler compaction regression: PASS")
+          PY
