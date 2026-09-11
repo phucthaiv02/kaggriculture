@@ -13,8 +13,13 @@ on:
 
 jobs:
   seed-1-vs-a:
+    name: seed-1 penalty-${{ matrix.penalty }}
+    strategy:
+      fail-fast: false
+      matrix:
+        penalty: [0, 0.001, 0.005, 0.01, 0.02, 0.05]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,9 +27,9 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7'
-      - name: Sweep concentration penalty on seed 1 vs A
+      - name: Run seed 1 vs A
         run: >-
           python -m experiments.sweep_concentration
           --opponent public/A.ipynb
           --seeds 1
-          --penalties 0 0.001 0.005 0.01 0.02 0.05
+          --penalties ${{ matrix.penalty }}
