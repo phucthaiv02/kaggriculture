@@ -10,6 +10,7 @@ on:
       - experiments/sweep_concentration.py
       - agents/planner.py
       - agents/expansion_agent.py
+      - agents/scheduler.py
 
 jobs:
   multi-seed-vs-a:
