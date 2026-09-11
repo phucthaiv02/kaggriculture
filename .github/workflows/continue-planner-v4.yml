@@ -24,6 +24,7 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          from textwrap import indent
 
           p = Path('agents/expansion_agent.py')
           s = p.read_text()
@@ -78,10 +79,9 @@ jobs:
           )
 
           needle = '            missing_hands = max(0, hand_count - len(existing_hands))\n'
-          insertion = '''            if should_buy_land_on_schedule(obs, farm):
-              # On calendar day 7, finishing cash work by dusk is too late: land
-              # must unlock early enough to buy inputs and start production today.
-              # Size the cash-only workload against an early-day route budget.
+          block = '''if should_buy_land_on_schedule(obs, farm):
+              # Calendar day 7 must finish cash work early enough to unlock land,
+              # buy inputs and start production before dusk.
               cash_tasks = [task for task in tasks if task.cash_priority < 2]
               if cash_tasks:
                   cash_hand_count, _ = hands_needed(
@@ -93,6 +93,7 @@ jobs:
                   )
                   hand_count = max(hand_count, cash_hand_count)
           '''
+          insertion = indent(block, '            ')
           if needle not in s:
               raise SystemExit('hour-1 insertion point not found')
           s = s.replace(needle, insertion + needle, 1)
