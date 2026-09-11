@@ -1,0 +1,51 @@
+{
+  "baseline_source": "experiments/results/concentration_multiseed_vs_A.json",
+  "baseline_head": "3b9192e646690c5712a4b3cfb615cea7ee57bb42",
+  "candidate_head": "21c9a824bb6a51fe252c3f7cc12fccc1f0c5dd0d",
+  "workflow_run_id": 34566478073,
+  "configuration": {
+    "seeds": [0, 1, 7, 42],
+    "opponent": "public/A.ipynb",
+    "opening_version": "melon_v2",
+    "planner_version": "concentration",
+    "concentration_penalty": 0.001
+  },
+  "baseline": [
+    {"seed": 0, "current_cash": 36757.0, "hire_cost": 26889, "days_14_plus_hands": 13, "days_16_hands": 5, "drops": 296},
+    {"seed": 1, "current_cash": 63289.0, "hire_cost": 27083, "days_14_plus_hands": 13, "days_16_hands": 5, "drops": 411},
+    {"seed": 7, "current_cash": 30753.0, "hire_cost": 44420, "days_14_plus_hands": 16, "days_16_hands": 16, "drops": 371},
+    {"seed": 42, "current_cash": 18967.0, "hire_cost": 30413, "days_14_plus_hands": 15, "days_16_hands": 6, "drops": 308}
+  ],
+  "candidate": [
+    {"seed": 0, "current_cash": 37015.0, "hire_cost": 23231, "days_14_plus_hands": 12, "days_16_hands": 4, "drops": 269},
+    {"seed": 1, "current_cash": 57472.0, "hire_cost": 17563, "days_14_plus_hands": 8, "days_16_hands": 2, "drops": 323},
+    {"seed": 7, "current_cash": 34650.0, "hire_cost": 31675, "days_14_plus_hands": 13, "days_16_hands": 9, "drops": 253},
+    {"seed": 42, "current_cash": 26675.0, "hire_cost": 29703, "days_14_plus_hands": 13, "days_16_hands": 7, "drops": 298}
+  ],
+  "aggregate": {
+    "baseline": {
+      "mean_cash": 37441.5,
+      "mean_hire_cost": 32201.25,
+      "mean_days_14_plus_hands": 14.25,
+      "mean_days_16_hands": 8.0,
+      "mean_drops": 346.5
+    },
+    "candidate": {
+      "mean_cash": 38953.0,
+      "mean_hire_cost": 25543.0,
+      "mean_days_14_plus_hands": 11.5,
+      "mean_days_16_hands": 5.5,
+      "mean_drops": 285.75
+    },
+    "delta": {
+      "mean_cash": 1511.5,
+      "mean_cash_percent": 4.04,
+      "mean_hire_cost": -6658.25,
+      "mean_hire_cost_percent": -20.68,
+      "mean_days_14_plus_hands": -2.75,
+      "mean_days_16_hands": -2.5,
+      "mean_drops": -60.75
+    }
+  },
+  "interpretation": "When the historical near-first pack leaves mandatory work unassigned, retrying with constrained/hard-to-place work first avoids false extra hires. At the production concentration penalty, the 4-seed benchmark reduces mean hire cost by 20.68% while increasing mean final cash by 4.04%."
+}
