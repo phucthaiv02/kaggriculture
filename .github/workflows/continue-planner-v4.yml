@@ -61,7 +61,9 @@ jobs:
                   return []
 
               price = LAND_PRICES[len(farm["unlocked_quadrants"]) - 1]
-              cash = farm["money"] + _sale_revenue(obs, sales)
+              cash = farm["money"]
+              if cash < price and sales:
+                  cash += _sale_revenue(obs, sales)
               return [["BUY_LAND"]] if cash >= price else []
           '''
           if old not in s:
@@ -127,16 +129,19 @@ jobs:
               'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 169,
           }, debug=False)
           agent = make_agent(opening_version='classic')
-          def traced(obs):
-              action = agent(obs)
-              if obs.day == 6:
+          env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
+          for i, step in enumerate(env.steps):
+              entry = step[0]
+              obs = entry.observation
+              action = entry.action or {}
+              if obs.day >= 5 and (
+                  obs.day == 6 or any(order[0] == 'BUY_LAND' for order in action.get('market', []))
+              ):
                   farm = obs.farms[0]
-                  if action.get('market') or obs.hour in (0, 1, 2, 22, 23):
-                      print('DAY7_TRACE', obs.hour, round(farm.money, 2),
-                            list(farm.unlocked_quadrants), dict(obs.private.shed),
-                            action.get('market', []))
-              return action
-          env.run([traced, lambda obs: {'farmer': ['PASS'], 'market': []}])
+                  print('FRAME', i, 'day', obs.day, 'hour', obs.hour,
+                        'money', round(farm.money, 2), 'land', list(farm.unlocked_quadrants),
+                        'shed', dict(obs.private.shed), 'farmer', action.get('farmer'),
+                        'hands', action.get('hands'), 'market', action.get('market', []))
           farm = env.steps[-1][0].observation.farms[0]
           produced = [
               (x, y) for y in range(5) for x in range(5, 10)
