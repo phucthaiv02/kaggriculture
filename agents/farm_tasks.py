@@ -50,10 +50,12 @@ def _remove_current_water(tasks, position):
         return
 
 
-def _ensure_current_water(tasks, position):
+def _ensure_current_water(tasks, position, survival_debt=False):
     position_tasks = _tasks_at(tasks, position)
     for task in position_tasks:
         if _current_water_index(task) is not None:
+            if survival_debt:
+                task.survival_debt = True
             return
 
     # If the core already has work on this crop, keep FERTILIZE before WATER
@@ -67,9 +69,14 @@ def _ensure_current_water(tasks, position):
                 break
         task.actions.insert(insertion, ["WATER"])
         task.urgent = True
+        if survival_debt:
+            task.survival_debt = True
         return
 
-    tasks.append(_core.Task(position, [["WATER"]], urgent=True))
+    task = _core.Task(position, [["WATER"]], urgent=True)
+    if survival_debt:
+        task.survival_debt = True
+    tasks.append(task)
 
 
 def _animal_maintenance_task(tasks, position):
@@ -110,7 +117,9 @@ def _remove_cow_maintenance(tasks, position, tile, remove_feed, remove_care):
         tasks.remove(task)
 
 
-def _ensure_cow_maintenance(tasks, position, tile, want_feed, want_care):
+def _ensure_cow_maintenance(
+    tasks, position, tile, want_feed, want_care, survival_debt=False
+):
     if (not want_feed or tile.get("fed_today")) and (
         not want_care or tile.get("cared_today")
     ):
@@ -138,6 +147,8 @@ def _ensure_cow_maintenance(tasks, position, tile, want_feed, want_care):
     if want_care and not tile.get("cared_today") and "CARE" not in existing:
         task.actions.insert(insert_at, ["CARE"])
     task.urgent = True
+    if survival_debt:
+        task.survival_debt = True
 
 
 def _cow_feed_delta(obs, targets, active_positions, when):
@@ -194,11 +205,18 @@ def _feed_need_adjustment(
         desired_total = desired_now + max(
             0, tomorrow_feed + tomorrow_delta - wheat_incoming
         )
+    elif obs.get("hour", 0) >= 23:
+        # The last market pass must not turn next-day hiring cash into a WHEAT
+        # buffer. Hands disappear at dawn and must be rehired before that
+        # reserve is useful. Buy only today's still-missing feed here; the
+        # normal morning purchase pass can rebuild future coverage after
+        # labor sizing has claimed its cash.
+        baseline_total = baseline_now
+        desired_total = desired_now
     else:
-        # Intraday feed orders must use the same incoming-harvest credit as
-        # purchase_orders. Otherwise this earlier order spends the seed
-        # budget on a reserve that today's WHEAT harvest already covers.
-        # Keep today's feed protected until the harvest actually arrives.
+        # Earlier intraday passes may still build the conservative reserve,
+        # after the morning labor decision has already happened. Keep today's
+        # feed protected until an expected WHEAT harvest actually arrives.
         baseline_total = baseline_now + max(0, tomorrow_feed - wheat_incoming)
         desired_total = desired_now + max(
             0, tomorrow_feed + tomorrow_delta - wheat_incoming
@@ -248,7 +266,7 @@ def build_tasks(
         baseline = age in CROP_WATER_DAYS[(crop, fertilized)]
         desired = _maintenance.should_water(crop, age, fertilized, position)
         if tile.get("consecutive_unwatered", 0) and not tile.get("watered_today"):
-            _ensure_current_water(tasks, position)
+            _ensure_current_water(tasks, position, survival_debt=True)
         elif baseline and not desired:
             _remove_current_water(tasks, position)
         elif desired and not baseline:
@@ -293,12 +311,16 @@ def build_tasks(
             )
 
     # A missed action invalidates the minimum-care schedule's assumptions.
-    # Rescue the animal even when today was originally a planned rest day.
+    # Rescue the animal even when today was originally a planned rest day,
+    # and mark it as survival debt so routing cannot trade it behind ordinary
+    # harvest or first-miss irrigation work.
     for position, target in targets.items():
         tile = farm["tiles"][position[1]][position[0]]
         if (target and isinstance(tile, dict) and tile.get("animal")
                 and tile.get("consecutive_unfed", 0) and not tile.get("fed_today")):
-            _ensure_cow_maintenance(tasks, position, tile, True, False)
+            _ensure_cow_maintenance(
+                tasks, position, tile, True, False, survival_debt=True
+            )
     return tasks
 
 
