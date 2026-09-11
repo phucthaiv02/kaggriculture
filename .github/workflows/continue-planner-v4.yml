@@ -2,8 +2,7 @@ name: Continue Planner Capacity V4
 
 on:
   push:
-    branches:
-      - feat/planner-capacity-v4
+    branches: [feat/planner-capacity-v4]
 
 permissions:
   contents: write
@@ -77,6 +76,33 @@ jobs:
               '                + _land_orders(obs, farm)\n                + [o for o in market if o[0] in ("BUY_PRODUCT", "HIRE")]',
               '                + _land_orders(obs, farm, sales)\n                + [o for o in market if o[0] in ("BUY_PRODUCT", "HIRE")]',
           )
+
+          needle = '''            hand_count, _dropped = hands_needed(
+              tasks,
+              tuple(farm["farmer"]),
+              existing_hands,
+              shed_access,
+              pending_hand_budget=22,
+          )
+          '''
+          replacement = needle + '''            if should_buy_land_on_schedule(obs, farm):
+              # On calendar day 7, finishing cash work by dusk is too late: land
+              # must unlock early enough to buy inputs and start production today.
+              # Size the cash-only workload against an early-day route budget.
+              cash_tasks = [task for task in tasks if task.cash_priority < 2]
+              if cash_tasks:
+                  cash_hand_count, _ = hands_needed(
+                      cash_tasks,
+                      tuple(farm["farmer"]),
+                      existing_hands,
+                      shed_access,
+                      pending_hand_budget=12,
+                  )
+                  hand_count = max(hand_count, cash_hand_count)
+          '''
+          if needle not in s:
+              raise SystemExit('hour-1 hand sizing block not found')
+          s = s.replace(needle, replacement, 1)
           p.write_text(s)
 
           p = Path('tests/test_survival_debt_regression.py')
@@ -92,7 +118,7 @@ jobs:
               assert feed_wheat_order(earlier, targets, list(positions)) == []
           '''
           if old not in s:
-              raise SystemExit('expected survival-debt expectation not found')
+              raise SystemExit('expected future-feed expectation not found')
           p.write_text(s.replace(old, new))
 
           p = Path('tests/test_agents_opening_book.py')
@@ -134,14 +160,11 @@ jobs:
               entry = step[0]
               obs = entry.observation
               action = entry.action or {}
-              if obs.day >= 5 and (
-                  obs.day == 6 or any(order[0] == 'BUY_LAND' for order in action.get('market', []))
-              ):
+              if obs.day == 6:
                   farm = obs.farms[0]
-                  print('FRAME', i, 'day', obs.day, 'hour', obs.hour,
-                        'money', round(farm.money, 2), 'land', list(farm.unlocked_quadrants),
-                        'shed', dict(obs.private.shed), 'farmer', action.get('farmer'),
-                        'hands', action.get('hands'), 'market', action.get('market', []))
+                  if action.get('market') or obs.hour in (0, 1, 2, 20, 21, 22, 23):
+                      print('FRAME', i, 'hour', obs.hour, 'money', round(farm.money, 2),
+                            'land', list(farm.unlocked_quadrants), 'market', action.get('market', []))
           farm = env.steps[-1][0].observation.farms[0]
           produced = [
               (x, y) for y in range(5) for x in range(5, 10)
