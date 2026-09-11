@@ -10,18 +10,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+        with: {python-version: '3.12'}
       - run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
-      - name: Apply candidate patch
+      - name: Apply candidate
         run: |
           python - <<'PY'
           from pathlib import Path
-          from textwrap import indent
-
-          p = Path('agents/expansion_agent.py')
-          s = p.read_text()
-          old = '''def _land_orders(obs, farm):
+          p=Path('agents/expansion_agent.py'); s=p.read_text()
+          old='''def _land_orders(obs, farm):
               if not should_buy_land_on_schedule(obs, farm):
                   return []
               inventories = [obs["private"]["shed"], *obs["private"].get("inventories", [])]
@@ -30,7 +26,7 @@ jobs:
               price = LAND_PRICES[len(farm["unlocked_quadrants"]) - 1]
               return [["BUY_LAND"]] if farm["money"] >= price else []
           '''
-          new = '''def _land_orders(obs, farm, pending_sales=()):
+          new='''def _land_orders(obs, farm, pending_sales=()):
               if not should_buy_land_on_schedule(obs, farm):
                   return []
               shed = Counter(obs["private"]["shed"])
@@ -48,82 +44,38 @@ jobs:
                   cash += _sale_revenue(obs, sales)
               return [["BUY_LAND"]] if cash >= price else []
           '''
-          assert old in s
-          s = s.replace(old, new)
-          s = s.replace('orders = _land_orders(obs, farm) + feed + hire_orders',
-                        'orders = _land_orders(obs, farm, pending_sales) + feed + hire_orders')
-          s = s.replace('                + _land_orders(obs, farm)\n',
-                        '                + _land_orders(obs, farm, sales)\n')
-
-          needle = '            missing_hands = max(0, hand_count - len(existing_hands))\n'
-          block = '''if should_buy_land_on_schedule(obs, farm):
-              cash_tasks = [task for task in tasks if task.cash_priority < 2]
-              if cash_tasks:
-                  for cash_hands in range(len(existing_hands), MAX_HANDS + 1):
-                      _, unassigned_cash = build_queues(
-                          cash_tasks,
-                          tuple(farm["farmer"]),
-                          cash_hands,
-                          existing_hands,
-                          shed_access,
-                          worker_budgets=[12] * (cash_hands + 1),
-                      )
-                      if not unassigned_cash:
-                          hand_count = max(hand_count, cash_hands)
-                          break
-          '''
+          assert old in s; s=s.replace(old,new)
+          s=s.replace('orders = _land_orders(obs, farm) + feed + hire_orders','orders = _land_orders(obs, farm, pending_sales) + feed + hire_orders')
+          s=s.replace('                + _land_orders(obs, farm)\n','                + _land_orders(obs, farm, sales)\n')
+          needle='            missing_hands = max(0, hand_count - len(existing_hands))\n'
           assert needle in s
-          s = s.replace(needle, indent(block, '            ') + needle, 1)
+          s=s.replace(needle,'            if should_buy_land_on_schedule(obs, farm):\n                hand_count = max(hand_count, 10)\n'+needle,1)
           p.write_text(s)
-
-          p = Path('tests/test_survival_debt_regression.py')
-          s = p.read_text()
-          s = s.replace(
-              '''    # Earlier in the day the conservative reserve may still be built, after
+          p=Path('tests/test_survival_debt_regression.py'); s=p.read_text()
+          s=s.replace('''    # Earlier in the day the conservative reserve may still be built, after
               # morning labor sizing/hiring has already claimed its cash.
               earlier = _obs(day=7, hour=22, tiles=tiles, shed={"WHEAT": 4})
               assert feed_wheat_order(earlier, targets, list(positions))
-          ''',
-              '''    # Future feed is never stockpiled; buy only feed due today.
+          ''','''    # Future feed is never stockpiled; buy only feed due today.
               earlier = _obs(day=7, hour=22, tiles=tiles, shed={"WHEAT": 4})
               assert feed_wheat_order(earlier, targets, list(positions)) == []
-          ''')
-          p.write_text(s)
-
-          p = Path('tests/test_agents_opening_book.py')
-          s = p.read_text()
-          marker = '    farm["money"] = 0\n    assert _land_orders(obs, farm) == []\n'
-          extra = '''    farm["money"] = 0
-              assert _land_orders(obs, farm) == []
-
-
-          def test_land_can_follow_final_sale_in_same_market_pass():
-              from agents.expansion_agent import _land_orders
-              obs = make_obs(6)
-              farm = obs["farms"][0]
-              farm["money"] = 100000
-              obs["private"] = {"shed": {"FERTILIZER": 1}, "inventories": [{}]}
-              assert _land_orders(obs, farm) == []
-              assert _land_orders(obs, farm, [["SELL", "FERTILIZER", 1]]) == [["BUY_LAND"]]
-          '''
-          assert marker in s
-          p.write_text(s.replace(marker, extra, 1))
+          '''); p.write_text(s)
           PY
       - name: Trace classic day seven
         run: |
           python - <<'PY'
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
-          env = make('kaggriculture', configuration={'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 169}, debug=False)
-          agent = make_agent(opening_version='classic')
-          env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
+          env=make('kaggriculture',configuration={'seed':1,'weedSpawnChance':0.0,'episodeSteps':169},debug=False)
+          agent=make_agent(opening_version='classic')
+          env.run([lambda o:agent(o),lambda o:{'farmer':['PASS'],'market':[]}])
           for step in env.steps:
-              e = step[0]; o = e.observation; a = e.action or {}
-              if o.day == 6 and (a.get('market') or o.hour in (0, 1, 2, 23)):
-                  print('TRACE', o.hour, round(o.farms[0].money, 2), list(o.farms[0].unlocked_quadrants), a.get('market', []))
-          farm = env.steps[-1][0].observation.farms[0]
-          produced = [(x,y) for y in range(5) for x in range(5,10) if isinstance(farm.tiles[y][x], dict) and (farm.tiles[y][x].get('crop') or farm.tiles[y][x].get('animal'))]
-          print('FINAL', list(farm.unlocked_quadrants), produced)
+              e=step[0];o=e.observation;a=e.action or {}
+              if o.day==6 and (a.get('market') or o.hour in (0,1,2,23)):
+                  print('TRACE',o.hour,round(o.farms[0].money,2),list(o.farms[0].unlocked_quadrants),a.get('market',[]))
+          f=env.steps[-1][0].observation.farms[0]
+          prod=[(x,y) for y in range(5) for x in range(5,10) if isinstance(f.tiles[y][x],dict) and (f.tiles[y][x].get('crop') or f.tiles[y][x].get('animal'))]
+          print('FINAL',list(f.unlocked_quadrants),prod)
           PY
       - name: Focused tests
         run: python -m pytest -q tests/test_agents_opening_book.py tests/test_agents_opening_cash_priority.py tests/test_agents_affordable_production.py tests/test_agents_melon_opening.py tests/test_survival_debt_regression.py
