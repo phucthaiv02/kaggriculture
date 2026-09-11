@@ -77,15 +77,8 @@ jobs:
               '                + _land_orders(obs, farm, sales)\n                + [o for o in market if o[0] in ("BUY_PRODUCT", "HIRE")]',
           )
 
-          needle = '''            hand_count, _dropped = hands_needed(
-              tasks,
-              tuple(farm["farmer"]),
-              existing_hands,
-              shed_access,
-              pending_hand_budget=22,
-          )
-          '''
-          replacement = needle + '''            if should_buy_land_on_schedule(obs, farm):
+          needle = '            missing_hands = max(0, hand_count - len(existing_hands))\n'
+          insertion = '''            if should_buy_land_on_schedule(obs, farm):
               # On calendar day 7, finishing cash work by dusk is too late: land
               # must unlock early enough to buy inputs and start production today.
               # Size the cash-only workload against an early-day route budget.
@@ -101,8 +94,8 @@ jobs:
                   hand_count = max(hand_count, cash_hand_count)
           '''
           if needle not in s:
-              raise SystemExit('hour-1 hand sizing block not found')
-          s = s.replace(needle, replacement, 1)
+              raise SystemExit('hour-1 insertion point not found')
+          s = s.replace(needle, insertion + needle, 1)
           p.write_text(s)
 
           p = Path('tests/test_survival_debt_regression.py')
