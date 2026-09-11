@@ -78,14 +78,23 @@ def _investment_sales(obs, reservations, selling_state, targets, hires):
     return sales
 
 
-def _land_orders(obs, farm):
+def _land_orders(obs, farm, pending_sales=()):
     if not should_buy_land_on_schedule(obs, farm):
         return []
-    inventories = [obs["private"]["shed"], *obs["private"].get("inventories", [])]
-    if any(inv.get(item, 0) > 0 for inv in inventories for item in SELLABLE if item != "WHEAT"):
+    shed = Counter(obs["private"]["shed"])
+    sales = [order for order in pending_sales if order[0] == "SELL"]
+    for _op, item, quantity in sales:
+        shed[item] = max(0, shed.get(item, 0) - int(quantity))
+    carried = obs["private"].get("inventories", [])
+    if any(inv.get(item, 0) > 0 for inv in carried for item in SELLABLE if item != "WHEAT"):
+        return []
+    if any(shed.get(item, 0) > 0 for item in SELLABLE if item != "WHEAT"):
         return []
     price = LAND_PRICES[len(farm["unlocked_quadrants"]) - 1]
-    return [["BUY_LAND"]] if farm["money"] >= price else []
+    cash = farm["money"]
+    if cash < price and sales:
+        cash += _sale_revenue(obs, sales)
+    return [["BUY_LAND"]] if cash >= price else []
 
 
 def _protect_animal_structures(farm, operations):
@@ -316,7 +325,7 @@ def _hire_and_buy_orders(
         orders = feed + animals + seeds + hire_orders
     if should_buy_land_on_schedule(obs, farm):
         # Liquidate existing stock before committing expansion capital.
-        orders = _land_orders(obs, farm) + feed + hire_orders
+        orders = _land_orders(obs, farm, pending_sales) + feed + hire_orders
 
     return orders
 
@@ -765,6 +774,8 @@ def make_agent(
                 shed_access,
                 pending_hand_budget=22,
             )
+            if should_buy_land_on_schedule(obs, farm):
+                hand_count = max(hand_count, 10)
             missing_hands = max(0, hand_count - len(existing_hands))
             affordable_hands = _affordable_hires(
                 farm, missing_hands, farm["money"]
@@ -1025,7 +1036,7 @@ def make_agent(
         if should_buy_land_on_schedule(obs, farm):
             market = (
                 [o for o in market if o[0] == "SELL"]
-                + _land_orders(obs, farm)
+                + _land_orders(obs, farm, sales)
                 + [o for o in market if o[0] in ("BUY_PRODUCT", "HIRE")]
             )
         return {"farmer": farmer_op, "hands": hand_ops, "market": market[:10]}

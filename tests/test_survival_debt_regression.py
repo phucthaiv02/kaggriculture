@@ -116,10 +116,9 @@ def test_hour_23_does_not_buy_tomorrows_cow_feed_with_hire_cash():
     last_hour = _obs(day=7, hour=23, tiles=tiles, shed={"WHEAT": 4})
     assert feed_wheat_order(last_hour, targets, list(positions)) == []
 
-    # Earlier in the day the conservative reserve may still be built, after
-    # morning labor sizing/hiring has already claimed its cash.
+    # Future feed is never stockpiled; buy only feed due today.
     earlier = _obs(day=7, hour=22, tiles=tiles, shed={"WHEAT": 4})
-    assert feed_wheat_order(earlier, targets, list(positions))
+    assert feed_wheat_order(earlier, targets, list(positions)) == []
 
 
 def test_hour_23_still_buys_feed_needed_today():
