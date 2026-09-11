@@ -10,8 +10,8 @@ from agents.schedules import animal_maintenance_can_still_pay
 
 
 CASH_CROPS = ("WHEAT", "CARROT", "MELON", "TOMATO", "STRAWBERRY")
-SELLABLE = CASH_CROPS + ("EGG", "MILK", "WOOL", "FERTILIZER")
-# WHEAT keeps the surplus-selling policy after feed/task reservations.
+SELLABLE = ("FERTILIZER",) + CASH_CROPS + ("EGG", "MILK", "WOOL")
+# WHEAT is retained until the terminal liquidation.
 TIMED_SALE_CROPS = ("CARROT", "MELON", "TOMATO", "STRAWBERRY")
 
 
@@ -44,7 +44,7 @@ def opponent_ready_crops(obs):
 
 
 def sell_orders(obs, reserved, *, selling_state=None, needs_investment=False):
-    """Hold opening crops until competition or investment requires a sale."""
+    """Sell non-WHEAT output immediately, with fertilizer ordered first."""
     reserved = dict(reserved)
     end_day = obs.get("_planning_end_day", 29)
     final_day = obs.get("day", -1) >= end_day
@@ -82,17 +82,13 @@ def sell_orders(obs, reserved, *, selling_state=None, needs_investment=False):
             carried.update(inventory)
 
     shed = obs["private"]["shed"]
-    opening = (selling_state["opening"] if selling_state is not None
-               else shed if obs.get("hour", 0) == 0 else {})
-    ready = (selling_state["ready"] if selling_state is not None
-             else opponent_ready_crops(obs))
     orders = []
     for item in SELLABLE:
+        if item == "WHEAT" and not final_day:
+            continue
         quantity = shed.get(item, 0) - reserved.get(item, 0)
-        if final_day or item == "FERTILIZER":
+        if final_day or item != "WHEAT":
             quantity += carried.get(item, 0)
-        elif item in TIMED_SALE_CROPS and "farms" in obs and not needs_investment and item not in ready:
-            quantity = min(quantity, max(0, shed.get(item, 0) - opening.get(item, 0)))
         if quantity > 0:
             orders.append(["SELL", item, quantity])
     return orders

@@ -7,42 +7,32 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as official_gam
 LAND_ORDER = official_game.LAND_ORDER
 
 # 19 WHEAT + 2 COW + 2 SHEEP + 2 GOOSE = 25 (NW's whole board).
-# purchase_orders buys feed alongside missing animals on day 0; that currently
-# reserves one WHEAT per purchased animal, which is conservative because COW
-# does not need its first FEED until age 1. The result is therefore guaranteed
-# to cover every day-0 feed action for the two SHEEP and two GOOSE.
+# Buy only feed needed on placement day; harvested WHEAT is retained.
 OPENING_COUNTS = {"WHEAT": 19, "COW": 2, "SHEEP": 2, "GOOSE": 2}
 MELON_OPENING_COUNTS = {"WHEAT": 9, "COW": 2, "SHEEP": 2, "MELON": 12}
 OPENING_VERSIONS = {"classic": OPENING_COUNTS, "melon_v2": MELON_OPENING_COUNTS}
 
 OPENING_SIZE = sum(OPENING_COUNTS.values())
 
-# Engine days are zero-indexed. The classic book governs days 0 through 6;
-# melon_v2 hands off on index 4 so its first WHEAT harvest is repriced before
-# replacement seeds are bought.
+# Engine days are zero-indexed. Both books govern indices 0 through 5;
+# finished WHEAT plots are repriced separately before replacement purchases.
 OPENING_REFINANCE_DAY = 1
-PLANNER_HANDOFF_DAY = 7
-MELON_PLANNER_HANDOFF_DAY = 4
+PLANNER_HANDOFF_DAY = 6
+MELON_PLANNER_HANDOFF_DAY = PLANNER_HANDOFF_DAY
 
 # Expansion is deliberately fixed rather than utilization-driven: submit
-# exactly two scheduled BUY_LAND attempts, one on day 7 and one on day 10.
+# at most two purchases: calendar day 7 (index 6), then the existing index 10.
 # No later day may buy the third remaining quadrant.
-LAND_BUY_DAYS = (7, 10)
+LAND_BUY_DAYS = (6, 10)
 MAX_SCHEDULED_LAND_PURCHASES = 2
 
 
 def should_buy_land_on_schedule(obs, farm):
-    """Submit BUY_LAND only at hour 0 on day 7 or day 10.
-
-    Affordability itself is left to the engine (BUY_LAND is simply a no-op if
-    the farm cannot cover the cost at that instant). The strategy never owns
-    more than two extra quadrants through this schedule, so no third BUY_LAND
-    is emitted even if another scheduled day is added accidentally later.
-    """
+    """Retry the scheduled expansion throughout the day, once per quadrant."""
     n_extra = len(farm["unlocked_quadrants"]) - 1
     return (
         obs["day"] in LAND_BUY_DAYS
-        and obs.get("hour", 0) == 0
+        and n_extra < LAND_BUY_DAYS.index(obs["day"]) + 1
         and n_extra < min(MAX_SCHEDULED_LAND_PURCHASES, len(LAND_ORDER))
     )
 
@@ -74,7 +64,7 @@ def build_opening_targets(positions, version="classic"):
 
 
 def make_opening_controller(version="classic"):
-    """Create a stateful opening controller, active until engine day 7.
+    """Create a stateful opening controller, active until calendar day 7 (engine index 6).
 
     The returned callable mutates ``targets`` while the opening governs the
     farm and returns ``True`` so the caller skips the dynamic planner. It hands

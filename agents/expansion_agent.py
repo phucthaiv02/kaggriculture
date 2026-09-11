@@ -34,14 +34,16 @@ from agents.farm_tasks import (
     purchase_orders,
     reserved_items,
 )
-from agents.opening_book import make_opening_controller, should_buy_land_on_schedule
-from agents.intraday import queue_commitments, schedule_open_tiles, schedule_idle_drops
+from agents.opening_book import PLANNER_HANDOFF_DAY, make_opening_controller, should_buy_land_on_schedule
+from agents.intraday import (
+    queue_commitments, schedule_open_tiles, schedule_idle_drops, schedule_priority_drops,
+)
 from agents.planner import SEASON_END_DAY, plan_targets
 from agents.horizon import can_start_today
 from agents.scheduler import MAX_HANDS, build_queues, hands_needed
-from agents.schedules import is_maintenance_day, should_care_animal, should_feed_animal
+from agents.schedules import is_maintenance_day, should_care_animal, should_feed_animal, cycle_finished
 from agents.maintenance import should_feed, should_care, should_water
-from agents.selling import sell_orders, update_selling_state
+from agents.selling import SELLABLE, sell_orders, update_selling_state
 
 
 def _investment_sales(obs, reservations, selling_state, targets, hires):
@@ -74,6 +76,17 @@ def _investment_sales(obs, reservations, selling_state, targets, hires):
     if cost > farm["money"] + _sale_revenue(obs, sales):
         sales = liquidated
     return sales
+
+
+def _land_orders(obs, farm):
+    if not should_buy_land_on_schedule(obs, farm):
+        return []
+    inventories = [obs["private"]["shed"], *obs["private"].get("inventories", [])]
+    if any(inv.get(item, 0) > 0 for inv in inventories for item in SELLABLE if item != "WHEAT"):
+        return []
+    price = LAND_PRICES[len(farm["unlocked_quadrants"]) - 1]
+    return [["BUY_LAND"]] if farm["money"] >= price else []
+
 
 def _protect_animal_structures(farm, operations):
     """Discard stale DIG/PLANT commands on permanent animal structures."""
@@ -302,9 +315,9 @@ def _hire_and_buy_orders(
         # buying these before optional labor prevents a queued PLANT no-op.
         orders = feed + animals + seeds + hire_orders
     if should_buy_land_on_schedule(obs, farm):
-        # This debug purchase must claim its cash before optional hires and
-        # inputs; putting it last can submit the order yet leave it unfunded.
-        orders.insert(0, ["BUY_LAND"])
+        # Liquidate existing stock before committing expansion capital.
+        orders = _land_orders(obs, farm) + feed + hire_orders
+
     return orders
 
 
@@ -317,6 +330,7 @@ def make_agent(
     state = {
         "day": -1, "hand_target": 0, "plans": [], "reserved": {},
         "opening_active": False, "scheduled_placements": set(),
+        "opening_dynamic_positions": set(), "last_reprice": None,
         "unverified_hand_indices": set(),
         "deferred_expansion_positions": set(),
         "protective_debt_positions": set(),
@@ -563,6 +577,11 @@ def make_agent(
         ]
         if not placement_tasks:
             return
+        for task in placement_tasks:
+            if not task.sells and any(op[0] == "PLACE" for op in task.actions):
+                # An already delivered animal needs no empty liquidation trip.
+                task.immediate_drop = False
+                task.must_liquidate = False
         shed_access = _open_shed_access(farm)
         remaining = 24 - hour
         if idle_indices:
@@ -618,11 +637,8 @@ def make_agent(
             effective_end = min(effective_end, last_action_day)
         obs = dict(obs, _planning_end_day=effective_end)
         day, hour = obs["day"], obs["hour"]
-        if opening_version == "melon_v2" and day == 4:
-            # The day-5 planner needs animal fertilizer as working capital for
-            # replacement seeds. Collect and bank it before harvest/transition
-            # routes consume the remaining turns.
-            obs["_liquidate_fertilizer_first"] = True
+        # Calendar days 1-7 include engine index 6, even after planner handoff.
+        obs["_opening_cash_first"] = 0 <= day <= PLANNER_HANDOFF_DAY
         farm = obs["farms"][obs["player"]]
 
         if state["opening_active"]:
@@ -634,20 +650,18 @@ def make_agent(
         # mid-day or after the opening has already handed off.
         if hour > 0 and any(position not in targets for position in _active_positions(farm)):
             positions = _active_positions(farm)
-            state["deferred_expansion_positions"].update(
-                position for position in positions if position not in targets
-            )
             state["opening_active"] = opening_governs(obs, targets, positions)
-            if not state["opening_active"]:
-                plan_targets(
-                    obs, targets, positions, effective_end, planner_version
-                )
+            plan_targets(
+                obs, targets,
+                positions if not state["opening_active"] else [p for p in positions if p not in targets],
+                effective_end, planner_version,
+            )
 
         if hour == 0:
             positions = _active_positions(farm)
             # The hand-specified NW opening (agents/opening_book.py) governs
-            # targets in place until the first BUY_LAND succeeds; from then
-            # on the ROI planner takes over.
+            # targets through index 5; finished WHEAT is repriced below.
+            # On calendar day 7 (index 6), the planner takes over the farm.
             state["opening_active"] = opening_governs(obs, targets, positions)
             if not state["opening_active"]:
                 plan_targets(
@@ -668,9 +682,23 @@ def make_agent(
                         obs, targets, new_positions, effective_end,
                         planner_version,
                     )
+            if state["opening_active"]:
+                finished_wheat = [
+                    p for p in positions
+                    if isinstance((tile := farm["tiles"][p[1]][p[0]]), dict)
+                    and tile.get("crop") == "WHEAT"
+                    and cycle_finished("WHEAT", day - tile["planted_day"], tile)
+                    and (targets.get(p) or (None,))[0] == "WHEAT"
+                ]
+                state["opening_dynamic_positions"].update(finished_wheat)
+                if state["opening_dynamic_positions"]:
+                    plan_targets(
+                        obs, targets, positions, effective_end, planner_version,
+                        replan_positions=state["opening_dynamic_positions"],
+                    )
             tasks = build_tasks(
                 obs, targets,
-                assume_crop_seeds=day > 0,
+                assume_crop_seeds=day > 0 and not should_buy_land_on_schedule(obs, farm),
                 assume_animal_inputs=state["opening_active"] and (opening_version != "melon_v2" or day == 0),
                 prioritize_fertilizer_drop=True,
             )  # include the PLANT + WATER enabled by today's seed purchases
@@ -767,6 +795,39 @@ def make_agent(
                 if any(action[0] in ("PLANT", "PLACE") for action in task.actions)
             }
 
+        # Reconsider uncommitted vacancies when sales or a harvest changes
+        # available capital. Keep the fixed opening and in-flight routes intact.
+        positions = _active_positions(farm)
+        workers = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
+        committed = queue_commitments(workers, state["plans"])[1]
+        available_animals = Counter(obs["private"]["shed"])
+        for inventory in obs["private"].get("inventories", []):
+            available_animals.update(inventory)
+        reconsider = set()
+        for position in positions:
+            if position in committed:
+                continue
+            if state["opening_active"] and position not in state["opening_dynamic_positions"]:
+                continue
+            tile = farm["tiles"][position[1]][position[0]]
+            if isinstance(tile, dict) and (tile.get("crop") or tile.get("animal")):
+                continue
+            target = targets.get(position)
+            if target is None or (
+                target[0] in ANIMALS and not available_animals[target[0]]
+                and farm["money"] < ANIMAL_COST[target[0]]
+            ):
+                reconsider.add(position)
+        reprice_key = (day, farm["money"], tuple(sorted(reconsider)),
+                       tuple(sorted(obs["private"]["seeds"].items())),
+                       tuple(sorted(available_animals.items())))
+        if reconsider and reprice_key != state["last_reprice"]:
+            state["last_reprice"] = reprice_key
+            plan_targets(
+                obs, targets, positions, effective_end, planner_version,
+                replan_positions=reconsider,
+            )
+
         if state["unverified_hand_indices"]:
             _validate_predicted_hands(farm, hour)
         _replan_all_from_actual(obs, farm, day, hour)
@@ -792,6 +853,11 @@ def make_agent(
                 obs, targets, state["plans"], _open_shed_access(farm)
             )
             expansion_hires = max(expansion_hires, maintenance_hires)
+        if should_buy_land_on_schedule(obs, farm):
+            # Hire workers needed to bank output and maintain live production,
+            # but keep optional expansion labor behind the land purchase.
+            expansion_hires = maintenance_hires
+        schedule_priority_drops(obs, state["plans"], _open_shed_access(farm))
         schedule_idle_drops(obs, state["plans"], _open_shed_access(farm))
         # Remaining PICKUPs, including newly appended work, must be protected
         # from the same turn's sales.
@@ -956,6 +1022,12 @@ def make_agent(
                                    if order[0] != "SELL"), len(market))
             market[first_purchase:first_purchase] = [["HIRE"]] * maintenance_hires
         market += [["HIRE"] for _ in range(expansion_hires - maintenance_hires)]
+        if should_buy_land_on_schedule(obs, farm):
+            market = (
+                [o for o in market if o[0] == "SELL"]
+                + _land_orders(obs, farm)
+                + [o for o in market if o[0] in ("BUY_PRODUCT", "HIRE")]
+            )
         return {"farmer": farmer_op, "hands": hand_ops, "market": market[:10]}
 
     return agent

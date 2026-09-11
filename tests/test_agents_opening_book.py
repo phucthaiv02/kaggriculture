@@ -84,14 +84,14 @@ def test_day_zero_purchase_plan_covers_every_required_feed_action():
 
 def test_land_purchase_schedule_is_exactly_day_seven_and_day_ten():
     farm = {"unlocked_quadrants": ["NW"]}
-    assert LAND_BUY_DAYS == (7, 10)
+    assert LAND_BUY_DAYS == (6, 10)
     assert MAX_SCHEDULED_LAND_PURCHASES == 2
-    for day in (0, 6, 8, 9, 11, 20, 29):
+    for day in (0, 5, 7, 8, 9, 11, 20, 29):
         assert should_buy_land_on_schedule({"day": day, "hour": 0}, farm) is False
-    assert should_buy_land_on_schedule({"day": 7, "hour": 0}, farm) is True
+    assert should_buy_land_on_schedule({"day": 6, "hour": 0}, farm) is True
     assert should_buy_land_on_schedule({"day": 10, "hour": 0}, farm) is True
-    assert should_buy_land_on_schedule({"day": 7, "hour": 1}, farm) is False
-    assert should_buy_land_on_schedule({"day": 10, "hour": 1}, farm) is False
+    assert should_buy_land_on_schedule({"day": 6, "hour": 1}, farm) is True
+    assert should_buy_land_on_schedule({"day": 10, "hour": 1}, farm) is True
 
 
 def test_day_ten_can_buy_second_quadrant_but_never_a_third():
@@ -131,7 +131,7 @@ def test_hands_off_to_planner_only_on_day_seven():
     governs = make_opening_controller()
     targets = {}
     governs(make_obs(day=0), targets, NW_POSITIONS)
-    assert PLANNER_HANDOFF_DAY == 7
+    assert PLANNER_HANDOFF_DAY == 6
     assert governs(make_obs(day=PLANNER_HANDOFF_DAY), targets, NW_POSITIONS) is False
 
 
@@ -152,7 +152,7 @@ def test_handoff_is_permanent():
     assert governs(make_obs(day=1), targets, NW_POSITIONS) is False
 
 
-def test_melon_v2_hands_off_before_day_five_seed_purchases():
+def test_melon_v2_stays_in_opening_until_day_seven():
     governs = make_opening_controller("melon_v2")
     targets = {}
     for day in range(MELON_PLANNER_HANDOFF_DAY):
@@ -171,3 +171,50 @@ def test_melon_v2_hands_off_before_day_five_seed_purchases():
 def test_unknown_opening_version_is_rejected():
     with pytest.raises(ValueError, match="unknown opening version"):
         make_opening_controller("missing")
+
+
+def test_day_seven_does_not_buy_twice():
+    assert not should_buy_land_on_schedule(
+        {"day": 6, "hour": 12}, {"unlocked_quadrants": ["NW", "NE"]}
+    )
+
+
+def test_land_waits_for_liquidation_and_cash():
+    from agents.expansion_agent import _land_orders
+    obs = make_obs(6)
+    farm = obs["farms"][0]
+    farm["money"] = 100000
+    obs["private"] = {"shed": {"WHEAT": 100, "MILK": 1}, "inventories": [{}]}
+    assert _land_orders(obs, farm) == []
+    obs["private"]["shed"].pop("MILK")
+    obs["private"]["inventories"] = [{"FERTILIZER": 1}]
+    assert _land_orders(obs, farm) == []
+    obs["private"]["inventories"] = [{}]
+    assert _land_orders(obs, farm) == [["BUY_LAND"]]
+    farm["money"] = 0
+    assert _land_orders(obs, farm) == []
+
+
+@pytest.mark.parametrize("version", ["classic", "melon_v2"])
+def test_day_seven_expands_and_starts_new_production(version):
+    from kaggle_environments import make
+    from agents.expansion_agent import make_agent
+
+    env = make("kaggriculture", configuration={
+        "seed": 1, "weedSpawnChance": 0.0, "episodeSteps": 169,
+    }, debug=False)
+    agent = make_agent(opening_version=version)
+    env.run([lambda obs: agent(obs), lambda obs: {"farmer": ["PASS"], "market": []}])
+    assert len(env.steps) == 169
+    farm = env.steps[-1][0].observation.farms[0]
+    assert len(farm.unlocked_quadrants) == 2
+    assert any(
+        isinstance(farm.tiles[y][x], dict)
+        and (farm.tiles[y][x].get("crop") or farm.tiles[y][x].get("animal"))
+        for y in range(5) for x in range(5, 10)
+    )
+    for frame in env.steps:
+        assert not any(
+            order[:2] == ["SELL", "WHEAT"]
+            for order in (frame[0].action or {}).get("market", [])
+        )

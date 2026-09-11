@@ -72,12 +72,12 @@ def test_empty_tile_places_animal_when_shed_has_animal_and_wheat():
     assert not task.urgent
 
 
-def test_empty_animal_target_builds_pasture_before_inputs_are_affordable():
-    obs = make_obs(day=0, shed={})
-    task = one_task(build_tasks(obs, {(0, 0): ("COW", False)}))
-    assert task.actions == [["BUILD_PASTURE"]]
-    assert not task.needs
-    assert not task.urgent
+def test_empty_animal_target_waits_for_animal_and_placement_feed():
+    for shed in ({}, {"SHEEP": 1}, {"WHEAT": 1}):
+        obs = make_obs(day=5, money=200, shed=shed)
+        assert build_tasks(obs, {(0, 0): ("SHEEP", False)}) == []
+    obs = make_obs(day=5, money=200)
+    assert build_tasks(obs, {(0, 0): ("COW", False)}) == []
 
 
 def test_animal_onto_existing_empty_structure_skips_redundant_build():
@@ -325,7 +325,7 @@ def test_purchase_orders_funds_cheapest_seed_type_first_when_cash_is_short():
 def test_feed_wheat_order_covers_the_shortfall_for_live_animals():
     obs = make_obs(day=3, tiles={(0, 0): animal_tile("SHEEP", placed_day=0)}, shed={})
     orders = feed_wheat_order(obs, {(0, 0): ("SHEEP", False)}, [(0, 0)])
-    assert orders == [["BUY_PRODUCT", "WHEAT", 2]]
+    assert orders == [["BUY_PRODUCT", "WHEAT", 1]]
 
 
 def test_intraday_feed_credits_ripe_wheat_only_against_future_reserve():
@@ -339,17 +339,17 @@ def test_intraday_feed_credits_ripe_wheat_only_against_future_reserve():
     assert feed_wheat_order(obs, targets, list(targets)) == []
 
 
-def test_feed_wheat_order_keeps_one_next_day_unit_after_covering_today():
+def test_feed_wheat_order_stops_when_today_is_covered():
     """Regression test: this must be safe to call every turn of the day
     (not just hour 0/1) so a mid-day FERTILIZER sale can fund the same
     day's feed -- calling it again after the shortfall is already covered
     must not re-request wheat that's already on hand."""
     obs = make_obs(day=3, tiles={(0, 0): animal_tile("SHEEP", placed_day=0)}, shed={"WHEAT": 1})
     orders = feed_wheat_order(obs, {(0, 0): ("SHEEP", False)}, [(0, 0)])
-    assert orders == [["BUY_PRODUCT", "WHEAT", 1]]
+    assert orders == []
 
 
-def test_feed_wheat_order_counts_carried_wheat_but_still_builds_buffer():
+def test_feed_wheat_order_counts_carried_wheat_without_a_buffer():
     obs = make_obs(
         day=3,
         tiles={(0, 0): animal_tile("SHEEP", placed_day=0)},
@@ -357,7 +357,7 @@ def test_feed_wheat_order_counts_carried_wheat_but_still_builds_buffer():
         inventories=[{}, {"WHEAT": 1}],
     )
     orders = feed_wheat_order(obs, {(0, 0): ("SHEEP", False)}, [(0, 0)])
-    assert orders == [["BUY_PRODUCT", "WHEAT", 1]]
+    assert orders == []
 
 
 def test_purchase_orders_requests_seeds_for_empty_crop_tiles():
@@ -421,11 +421,12 @@ def test_purchase_orders_buys_affordable_cow_before_costlier_sheep():
     assert animal_orders == [["BUY_ANIMAL", "COW", 1]]
 
 
-def test_purchase_orders_does_not_buy_seeds_while_animal_target_is_unfunded():
+def test_purchase_orders_buys_seeds_while_animal_target_is_unfunded():
     obs = make_obs(day=3, money=100.0)
     targets = {(0, 0): ("SHEEP", False), (1, 0): ("WHEAT", False)}
     orders = purchase_orders(obs, targets, list(targets))
-    assert not any(order[0] == "BUY_SEED" for order in orders)
+    assert ["BUY_SEED", "WHEAT", 1] in orders
+    assert not any(order[0] == "BUY_ANIMAL" for order in orders)
 
 
 def test_seed_orders_preserve_next_days_animal_feed_money():
@@ -433,7 +434,8 @@ def test_seed_orders_preserve_next_days_animal_feed_money():
     targets = {(0, 0): ("COW", False), (1, 0): ("WHEAT", False)}
     orders = purchase_orders(obs, targets, list(targets))
     assert ["BUY_ANIMAL", "COW", 1] in orders
-    assert not any(order[0] == "BUY_SEED" for order in orders)
+    assert ["BUY_SEED", "WHEAT", 1] in orders
+    assert not any(order[0] == "BUY_PRODUCT" for order in orders)
 
 
 def test_cow_feed_and_care_follow_verified_age_schedule():
@@ -544,9 +546,9 @@ def test_early_wheat_returns_to_shed_before_next_task():
     assert end == (4, 4)
 
 
-def test_four_day_feed_top_up_after_opening_placements():
+def test_no_future_feed_top_up_after_opening_placements():
     obs = make_obs(day=4, tiles={(0, 0): animal_tile('SHEEP', 0)}, shed={'WHEAT': 1})
-    assert feed_wheat_order(obs, {(0, 0): ('SHEEP', False)}, [(0, 0)]) == [['BUY_PRODUCT', 'WHEAT', 3]]
+    assert feed_wheat_order(obs, {(0, 0): ('SHEEP', False)}, [(0, 0)]) == []
 
 
 def test_missed_water_is_rescued_on_scheduled_rest_day():

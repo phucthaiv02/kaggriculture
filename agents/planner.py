@@ -7,6 +7,8 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as official_gam
 from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 from agents.forecast import MarketForecast, Production, production
 from agents.labor import LaborForecast
+from agents.maintenance import should_feed
+from agents.schedules import should_feed_animal, animal_maintenance_can_still_pay
 from agents.schedules import CROP_LAST_AGE, ONGOING_CROPS, cycle_finished
 from agents.horizon import (
     SEASON_END_DAY, cycle_end as _cycle_end,
@@ -324,7 +326,8 @@ def should_buy_land(farm, active_positions):
 
 
 def plan_targets(
-    obs, targets, active_positions, end_day, planner_version="concentration"
+    obs, targets, active_positions, end_day, planner_version="concentration",
+    *, replan_positions=None,
 ):
     """Reprice targets against actual production and route-feasible commitments.
 
@@ -337,7 +340,8 @@ def plan_targets(
 
     Capacity comes from LaborForecast itself. Every accepted target enters the
     shared baseline, and later candidates are rejected naturally if the
-    combined visits cannot fit the farmer plus maximum hands.
+    combined visits cannot fit the farmer plus maximum hands. Fresh targets
+    also share the actual cash/input budget after today's standing feed need.
     """
     if planner_version not in PLANNER_VERSIONS:
         raise ValueError(f"unknown planner version: {planner_version}")
@@ -381,12 +385,14 @@ def plan_targets(
             if not cycle_finished(tile["crop"], day - tile["planted_day"], tile):
                 continue
             if (
-                current
+                current and current[0] in CROPS
                 and current[0] != tile["crop"]
+                and obs["private"].get("seeds", {}).get(current[0], 0) > 0
                 and can_start(current[0], day, end_day)
             ):
                 continue
-        replanning.append(position)
+        if replan_positions is None or position in replan_positions:
+            replanning.append(position)
 
     for player, other_farm in enumerate(obs["farms"]):
         if player != obs["player"] and other_farm is farm:
@@ -460,6 +466,72 @@ def plan_targets(
         if farm["tiles"][p[1]][p[0]] != "LOCKED"
     ))
 
+    # Reserve actual input stock and today's live feed before allocating fresh
+    # plots. The budget is shared across plots, never reset per candidate.
+    inputs = Counter(obs["private"]["shed"])
+    for carried in obs["private"].get("inventories", []):
+        inputs.update(carried)
+    seeds = Counter(obs["private"].get("seeds", {}))
+    cash = farm["money"]
+    wheat_bought = 0
+    wheat_stock = obs["market"]["inventory"].get("WHEAT", 0)
+
+    def feed_cost(units):
+        missing = max(0, units - inputs["WHEAT"])
+        return sum(
+            market_price("WHEAT", wheat_stock - wheat_bought - i - 1,
+                         obs["market"].get("params"))
+            for i in range(missing)
+        ), missing
+
+    def reserve_feed(units):
+        nonlocal cash, wheat_bought
+        cost, missing = feed_cost(units)
+        cash -= cost
+        wheat_bought += missing
+        inputs["WHEAT"] = max(0, inputs["WHEAT"] - units)
+
+    for y, row in enumerate(farm["tiles"]):
+        for x, tile in enumerate(row):
+            if not isinstance(tile, dict) or not tile.get("animal"):
+                continue
+            name = tile["animal"]
+            age = day - tile["placed_day"]
+            if (not tile.get("fed_today")
+                    and animal_maintenance_can_still_pay(name, age, day, end_day)
+                    and (should_feed(name, age, (x, y)) or tile.get("consecutive_unfed", 0))):
+                reserve_feed(1)
+
+    def start_cost(choice):
+        name = choice[0]
+        if name in CROPS:
+            return 0 if seeds[name] > 0 else SEED_COST[name]
+        return ((0 if inputs[name] > 0 else ANIMAL_COST[name])
+                + feed_cost(int(should_feed_animal(name, 0)))[0])
+
+    def reserve_start(choice):
+        nonlocal cash
+        name = choice[0]
+        if name in CROPS:
+            if seeds[name] > 0:
+                seeds[name] -= 1
+            else:
+                cash -= SEED_COST[name]
+        else:
+            if inputs[name] > 0:
+                inputs[name] -= 1
+            else:
+                cash -= ANIMAL_COST[name]
+            reserve_feed(int(should_feed_animal(name, 0)))
+
+    for position, target in targets.items():
+        if not target or position in replanning:
+            continue
+        tile = farm["tiles"][position[1]][position[0]]
+        actual = (tile.get("animal") or tile.get("crop")) if isinstance(tile, dict) else None
+        if actual != target[0] and start_cost(target) <= max(0, cash):
+            reserve_start(target)
+
     for position in sorted(
         replanning, key=lambda p: (distance(p), p[1], p[0])
     ):
@@ -474,6 +546,7 @@ def plan_targets(
                 and official_game.ANIMALS[c[0][0]]["structure"] == tile["kind"]
             ]
 
+        allowed = [candidate for candidate in allowed if start_cost(candidate[0]) <= max(0, cash)]
         selector = (
             _choose_daily_mirrored
             if planner_version == "mirror_v2"
@@ -486,6 +559,7 @@ def plan_targets(
         if not choice:
             continue
 
+        reserve_start(choice)
         baseline.add(output, position)
         if planner_version == "mirror_v2":
             # Keep the rival's mirrored commitment in later tile decisions;

@@ -62,6 +62,39 @@ def queue_commitments(positions, plans, max_steps=None):
     return endpoints, occupied, seeds, supplies
 
 
+def schedule_priority_drops(obs, plans, shed_access):
+    """Return opening cash cargo before continuing a worker's field route."""
+    if not obs.get("_opening_cash_first"):
+        return
+    farm = obs["farms"][obs["player"]]
+    positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
+    cash_products = SELLABLE_PRODUCTS - {"WHEAT"}
+    remaining = 24 - obs["hour"]
+    for index, (position, inventory) in enumerate(zip(positions, obs["private"]["inventories"])):
+        if index >= len(plans) or not any(inventory.get(item, 0) for item in cash_products):
+            continue
+        queue = plans[index].queue
+        # Do not keep inserting another return in front of an existing one.
+        prefix = 0
+        while prefix < len(queue) and queue[prefix][0] in ("HARVEST", "COLLECT_FERTILIZER"):
+            prefix += 1  # bank both outputs when they share the current tile
+        while prefix < len(queue) and queue[prefix][0] in MOVES:
+            prefix += 1
+        if prefix < len(queue) and queue[prefix] == ["DROP"]:
+            continue
+        shed = nearest_shed(position, shed_access)
+        home = route(position, shed) + [["DROP"]]
+        if len(home) > remaining:
+            continue
+        if queue:
+            # DROP unloads inputs too. Restore those inputs before resuming the
+            # original relative route from its original position.
+            home += [["PICKUP", item, quantity] for item, quantity in inventory.items()
+                     if quantity > 0 and item not in cash_products]
+            home += route(shed, position)
+        plans[index].queue = home + queue
+
+
 def schedule_idle_drops(obs, plans, shed_access):
     """Return carried harvest after other work, only if DROP fits today.
 

@@ -321,7 +321,56 @@ def build_tasks(
             _ensure_cow_maintenance(
                 tasks, position, tile, True, False, survival_debt=True
             )
-    return tasks
+    return _opening_cash_tasks(obs, tasks) if obs.get("_opening_cash_first") else tasks
+
+
+def _opening_cash_tasks(obs, tasks):
+    """Bank ready output before maintenance and fresh production in days 1-7."""
+    cash_tasks = {}
+    remaining = []
+    for task in tasks:
+        collect = ["COLLECT_FERTILIZER"] in task.actions
+        animal_harvest = task.animal_harvest and ["HARVEST"] in task.actions
+        if collect or animal_harvest:
+            cash = cash_tasks.setdefault(task.position, _core.Task(
+                task.position, [], urgent=True, immediate_drop=True,
+                must_liquidate=True, cash_priority=1,
+            ))
+            if collect:
+                cash.actions.insert(0, ["COLLECT_FERTILIZER"])
+                cash.sells["FERTILIZER"] += task.sells.get("FERTILIZER", 0)
+                cash.cash_priority = 0
+            if animal_harvest:
+                cash.actions.append(["HARVEST"])
+                cash.animal_harvest = True
+                cash.sells.update({k: v for k, v in task.sells.items() if k != "FERTILIZER"})
+            task.actions = [op for op in task.actions if op[0] != "COLLECT_FERTILIZER"
+                            and not (animal_harvest and op[0] == "HARVEST")]
+            task.sells = Counter()
+            if task.refinance_feed:
+                # The cash trip no longer embeds its subsequent FEED visit.
+                tile = obs["farms"][obs["player"]]["tiles"][task.position[1]][task.position[0]]
+                name = tile["animal"]
+                age = obs["day"] - tile["placed_day"]
+                if ["FEED"] not in task.actions:
+                    task.actions.append(["FEED"])
+                    task.needs["WHEAT"] += 1
+                if _maintenance.should_care(name, age, task.position) and ["CARE"] not in task.actions:
+                    task.actions.append(["CARE"])
+            task.refinance_feed = False
+            task.immediate_drop = False
+            task.must_liquidate = False
+            if task.actions:
+                remaining.append(task)
+        else:
+            if any(n > 0 for name, n in task.sells.items() if name != "WHEAT"):
+                task.cash_priority = 1
+                task.immediate_drop = True
+                task.must_liquidate = True
+                # Replacement work waits until this crop's cash is banked.
+                task.immediate_transition = False
+            remaining.append(task)
+    return [*cash_tasks.values(), *remaining]
 
 
 def feed_wheat_order(obs, targets, active_positions):

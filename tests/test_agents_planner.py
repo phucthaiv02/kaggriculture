@@ -9,13 +9,13 @@ from agents.planner import _expected_price, best_target, plan_targets, should_bu
 BASE_INVENTORY = {p: MARKET_I0 for p in PRODUCTS}
 
 
-def make_obs(day, tiles=(), unlocked_quadrants=("NW",), inventory=None):
+def make_obs(day, tiles=(), unlocked_quadrants=("NW",), inventory=None, money=3000):
     board = [[None] * 10 for _ in range(10)]
     for (x, y), tile in dict(tiles).items():
         board[y][x] = tile
     farm = {
         "tiles": board, "unlocked_quadrants": list(unlocked_quadrants),
-        "farmer": [4, 4], "hands": [],
+        "farmer": [4, 4], "hands": [], "money": money,
     }
     resolved_inventory = dict(inventory or BASE_INVENTORY)
     return {

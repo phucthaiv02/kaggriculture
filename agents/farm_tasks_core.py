@@ -53,6 +53,7 @@ class Task:
     must_liquidate: bool = False  # cash-critical work must end with a shed DROP
     pinned_worker: int | None = None  # final-day carried stock belongs to this worker
     immediate_transition: bool = False  # opening harvest/build stays in one visit
+    cash_priority: int = 2  # opening fertilizer=0, other cash harvest=1
 
 
 def _new_planting_actions(name, fertilize_commit, seeds_available, animals_available, wheat_available,
@@ -74,12 +75,11 @@ def _new_planting_actions(name, fertilize_commit, seeds_available, animals_avail
         return actions, Counter()
     build_step = [[BUILD[name]]] if needs_build else []
     actions = ([["DIG"]] if needs_dig else []) + build_step
-    # Building the structure does not require the animal or its feed. Do it
-    # immediately when a crop frees the target tile; PLACE can follow now if
-    # inputs are ready, or on a later day without rebuilding the pasture.
+    # A permanent structure must not lock a crop tile while its animal is
+    # still only a purchase intention. Admit BUILD and PLACE together.
     feed_on_placement = should_feed_animal(name, 0)
     if not (animals_available and (wheat_available or not feed_on_placement)):
-        return (actions or None), Counter()
+        return None, Counter()
     actions += [["PLACE", name]]
     needs = Counter({name: 1})
     if feed_on_placement:
@@ -239,6 +239,7 @@ def build_tasks(
                         urgent=True,
                         sells=Counter({product: tile["yield_units"]}),
                         animal_harvest=True,
+                        must_liquidate=True,
                     )
                 )
             fed_from_refinance = False
@@ -411,8 +412,7 @@ def build_tasks(
                             and (immediate_drop or (name in ANIMALS and not live_animal))
                         )
                         or (
-                            obs.get("_liquidate_fertilizer_first")
-                            and sells.get("FERTILIZER", 0) > 0
+                            any(n > 0 for item, n in sells.items() if item != "WHEAT")
                         )
                     ),
                     animal_harvest=False,
@@ -480,15 +480,20 @@ def _animal_and_seed_demand(
                 if (
                     not tile.get("fed_today")
                     and animal_maintenance_can_still_pay(name, age, day, end_day)
+                    and (should_feed_animal(name, age) or tile.get("consecutive_unfed", 0))
                 ):
                     live_animals += 1
             elif can_start_today(name, obs):
                 animal_missing[name] += 1
-    animal_slots = sum(animal_missing.values())
+    animal_slots = sum(
+        n for name, n in animal_missing.items() if should_feed_animal(name, 0)
+    )
     for name in ANIMALS:
         available = shed.get(name, 0) + carried[name]
         animal_missing[name] = max(0, animal_missing[name] - available)
-    pending_feed = animal_slots - sum(animal_missing.values())
+    pending_feed = animal_slots - sum(
+        n for name, n in animal_missing.items() if should_feed_animal(name, 0)
+    )
     seed_demand = Counter({name: max(0, n - seeds_left[name]) for name, n in seed_demand.items()})
     return (
         seed_demand,
@@ -501,26 +506,8 @@ def _animal_and_seed_demand(
 
 
 def _tomorrow_feed_need(obs, farm, active_positions, animal_missing):
-    """Top up a four-day feed window after the opening animal purchases."""
-    day = obs["day"]
-    end_day = obs.get("_planning_end_day", SEASON_END_DAY)
-    from agents.maintenance import should_feed
-    # Build the opening first; retain harvested reserves without buying them
-    # ahead of the scheduled animal placements.
-    if day < 3 or sum(animal_missing.values()):
-        return 0
-    total = 0
-    for position in active_positions:
-        tile = farm["tiles"][position[1]][position[0]]
-        if not isinstance(tile, dict) or not tile.get("animal"):
-            continue
-        animal = tile["animal"]
-        for when in range(day + 1, min(day + (2 if day == 3 else 4), end_day + 1)):
-            age = when - tile["placed_day"]
-            if (should_feed(animal, age, position)
-                    and animal_maintenance_can_still_pay(animal, age, when, end_day)):
-                total += 1
-    return total
+    """Never buy inventory for future feed days."""
+    return 0
 
 
 def feed_wheat_order(obs, targets, active_positions):
@@ -621,8 +608,11 @@ def purchase_orders(
             continue
         quantity = 0
         for _ in range(n):
-            prior_new_feed = sum(int(order[2]) for order in animal_orders) + quantity
-            total_new_feed = prior_new_feed + 1
+            prior_new_feed = sum(
+                int(order[2]) for order in animal_orders
+                if should_feed_animal(order[1], 0)
+            ) + quantity * int(should_feed_animal(name, 0))
+            total_new_feed = prior_new_feed + int(should_feed_animal(name, 0))
             prior_wheat = max(
                 0,
                 live_animals + pending_feed + prior_new_feed
@@ -642,8 +632,10 @@ def purchase_orders(
         if quantity:
             animal_orders.append(["BUY_ANIMAL", name, quantity])
 
-    new_animal_feed = sum(int(order[2]) for order in animal_orders)
-    unfunded_animals = sum(animal_missing.values()) - new_animal_feed
+    new_animal_feed = sum(
+        int(order[2]) for order in animal_orders if should_feed_animal(order[1], 0)
+    )
+    purchased_animals = sum(int(order[2]) for order in animal_orders)
     # Do not turn every last coin into seeds. Animals must be fed again
     # tomorrow before today's fertilizer can be collected and sold; without
     # this reserve an opening that is affordable on paper loses an animal
@@ -657,7 +649,7 @@ def purchase_orders(
     next_day_feed_reserve = (
         0
         if obs["day"] == 0 or obs["day"] >= end_day - 1
-        else wheat_cost(live_animals + pending_feed + new_animal_feed)
+        else wheat_cost(live_animals + pending_feed + purchased_animals)
     )
 
     # Same affordability-capping as animals, and for the same reason: with
@@ -668,12 +660,8 @@ def purchase_orders(
     # get planted with what's left, rather than funding whichever crop
     # happened to be listed first.
     seed_orders = []
-    # Complete animal targets before spending their accumulating fertilizer
-    # proceeds on replacement seeds. In the opening this is what preserves
-    # enough cash to buy and PLACE the sixth animal on day index 3.
-    for name, n in (() if unfunded_animals > 0 else sorted(
-        seed_demand.items(), key=lambda item: SEED_COST[item[0]]
-    )):
+    # Missing animals do not block affordable seeds on other plots.
+    for name, n in sorted(seed_demand.items(), key=lambda item: SEED_COST[item[0]]):
         if not n:
             continue
         spendable = max(0, money - next_day_feed_reserve)

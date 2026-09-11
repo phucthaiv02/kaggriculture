@@ -185,6 +185,7 @@ def _task_priority(task):
     this debt outranks ordinary harvests and first-miss maintenance work.
     """
     return (
+        task.cash_priority,
         not task.must_liquidate,
         not getattr(task, "survival_debt", False),
         not _hard_crop_harvest(task),
