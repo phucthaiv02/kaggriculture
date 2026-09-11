@@ -1,0 +1,43 @@
+{
+  "branch_head_tested": "3b9192e646690c5712a4b3cfb615cea7ee57bb42",
+  "workflow_run_id": 34564039607,
+  "configuration": {
+    "seeds": [0, 1, 7, 42],
+    "opponent": "public/A.ipynb",
+    "opening_version": "melon_v2",
+    "planner_version": "concentration",
+    "penalties": [0.0, 0.0005, 0.001, 0.002]
+  },
+  "results": [
+    {"seed": 0, "penalty": 0.0, "current_cash": 23241.0, "opponent_cash": 81105.0, "margin": -57864.0, "hire_cost": 31036, "days_14_plus_hands": 14, "days_16_hands": 7, "drops": 316},
+    {"seed": 0, "penalty": 0.0005, "current_cash": 23241.0, "opponent_cash": 81105.0, "margin": -57864.0, "hire_cost": 31036, "days_14_plus_hands": 14, "days_16_hands": 7, "drops": 316},
+    {"seed": 0, "penalty": 0.001, "current_cash": 36757.0, "opponent_cash": 83143.0, "margin": -46386.0, "hire_cost": 26889, "days_14_plus_hands": 13, "days_16_hands": 5, "drops": 296},
+    {"seed": 0, "penalty": 0.002, "current_cash": 32112.0, "opponent_cash": 83248.0, "margin": -51136.0, "hire_cost": 29795, "days_14_plus_hands": 13, "days_16_hands": 7, "drops": 298},
+
+    {"seed": 1, "penalty": 0.0, "current_cash": 60694.0, "opponent_cash": 112669.0, "margin": -51975.0, "hire_cost": 25164, "days_14_plus_hands": 12, "days_16_hands": 5, "drops": 403},
+    {"seed": 1, "penalty": 0.0005, "current_cash": 63289.0, "opponent_cash": 110662.0, "margin": -47373.0, "hire_cost": 27083, "days_14_plus_hands": 13, "days_16_hands": 5, "drops": 411},
+    {"seed": 1, "penalty": 0.001, "current_cash": 63289.0, "opponent_cash": 110662.0, "margin": -47373.0, "hire_cost": 27083, "days_14_plus_hands": 13, "days_16_hands": 5, "drops": 411},
+    {"seed": 1, "penalty": 0.002, "current_cash": 30396.0, "opponent_cash": 66922.0, "margin": -36526.0, "hire_cost": 33544, "days_14_plus_hands": 15, "days_16_hands": 8, "drops": 330},
+
+    {"seed": 7, "penalty": 0.0, "current_cash": 38633.0, "opponent_cash": 81263.0, "margin": -42630.0, "hire_cost": 26612, "days_14_plus_hands": 10, "days_16_hands": 7, "drops": 271},
+    {"seed": 7, "penalty": 0.0005, "current_cash": 30753.0, "opponent_cash": 83172.0, "margin": -52419.0, "hire_cost": 44420, "days_14_plus_hands": 16, "days_16_hands": 16, "drops": 371},
+    {"seed": 7, "penalty": 0.001, "current_cash": 30753.0, "opponent_cash": 83172.0, "margin": -52419.0, "hire_cost": 44420, "days_14_plus_hands": 16, "days_16_hands": 16, "drops": 371},
+    {"seed": 7, "penalty": 0.002, "current_cash": 30753.0, "opponent_cash": 83172.0, "margin": -52419.0, "hire_cost": 44420, "days_14_plus_hands": 16, "days_16_hands": 16, "drops": 371},
+
+    {"seed": 42, "penalty": 0.0, "current_cash": 17600.0, "opponent_cash": 51068.0, "margin": -33468.0, "hire_cost": 31400, "days_14_plus_hands": 15, "days_16_hands": 7, "drops": 303},
+    {"seed": 42, "penalty": 0.0005, "current_cash": 17600.0, "opponent_cash": 51068.0, "margin": -33468.0, "hire_cost": 31400, "days_14_plus_hands": 15, "days_16_hands": 7, "drops": 303},
+    {"seed": 42, "penalty": 0.001, "current_cash": 18967.0, "opponent_cash": 51057.0, "margin": -32090.0, "hire_cost": 30413, "days_14_plus_hands": 15, "days_16_hands": 6, "drops": 308},
+    {"seed": 42, "penalty": 0.002, "current_cash": 19958.0, "opponent_cash": 56331.0, "margin": -36373.0, "hire_cost": 31350, "days_14_plus_hands": 16, "days_16_hands": 8, "drops": 321}
+  ],
+  "aggregate": [
+    {"penalty": 0.0, "mean_cash": 35042.0, "median_cash": 30937.0, "mean_margin": -46484.25, "median_margin": -47302.5, "mean_hire_cost": 28553.0, "mean_days_14_plus_hands": 12.75, "mean_days_16_hands": 6.5, "mean_drops": 323.25},
+    {"penalty": 0.0005, "mean_cash": 33720.75, "median_cash": 26997.0, "mean_margin": -47781.0, "median_margin": -49896.0, "mean_hire_cost": 33484.75, "mean_days_14_plus_hands": 14.5, "mean_days_16_hands": 8.75, "mean_drops": 350.25},
+    {"penalty": 0.001, "mean_cash": 37441.5, "median_cash": 33755.0, "mean_margin": -44567.0, "median_margin": -46879.5, "mean_hire_cost": 32201.25, "mean_days_14_plus_hands": 14.25, "mean_days_16_hands": 8.0, "mean_drops": 346.5},
+    {"penalty": 0.002, "mean_cash": 28304.75, "median_cash": 30574.5, "mean_margin": -44113.5, "median_margin": -43831.0, "mean_hire_cost": 34777.25, "mean_days_14_plus_hands": 15.0, "mean_days_16_hands": 9.75, "mean_drops": 330.0}
+  ],
+  "recommendation": {
+    "production_default": 0.001,
+    "change_default": false,
+    "reason": "0.001 has the highest mean and median current cash among the tested small penalties, but it does not reduce labor versus no concentration penalty. Stronger penalties were non-monotonic and often increased peak-hand usage. Keep the current default; address labor economics separately rather than increasing concentration pressure."
+  }
+}
