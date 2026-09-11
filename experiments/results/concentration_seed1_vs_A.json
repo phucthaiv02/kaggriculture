@@ -1,0 +1,19 @@
+{
+  "branch_head_tested": "c7c130372d72290c85b618b7b474f68c1a9e79ac",
+  "configuration": {
+    "seed": 1,
+    "opponent": "public/A.ipynb",
+    "opening_version": "melon_v2",
+    "planner_version": "concentration"
+  },
+  "results": [
+    {"penalty": 0.0, "current_cash": 60694.0, "opponent_cash": 112669.0, "margin": -51975.0, "hire_cost": 25164, "days_14_plus_hands": 12, "days_16_hands": 5, "drops": 403, "final_producers": {"COW": 4, "STRAWBERRY": 8, "TOMATO": 5}},
+    {"penalty": 0.001, "current_cash": 63289.0, "opponent_cash": 110662.0, "margin": -47373.0, "hire_cost": 27083, "days_14_plus_hands": 13, "days_16_hands": 5, "drops": 411, "final_producers": {"SHEEP": 3, "STRAWBERRY": 4, "TOMATO": 12}},
+    {"penalty": 0.005, "current_cash": 32976.0, "opponent_cash": 99800.0, "margin": -66824.0, "hire_cost": 37361, "days_14_plus_hands": 15, "days_16_hands": 12, "drops": 321, "final_producers": {"COW": 4, "SHEEP": 3, "STRAWBERRY": 11, "TOMATO": 4}},
+    {"penalty": 0.01, "current_cash": 24258.0, "opponent_cash": 61578.0, "margin": -37320.0, "hire_cost": 36806, "days_14_plus_hands": 17, "days_16_hands": 10, "drops": 395, "final_producers": {"COW": 4, "SHEEP": 3, "STRAWBERRY": 4, "TOMATO": 8}},
+    {"penalty": 0.02, "current_cash": 44020.0, "opponent_cash": 83927.0, "margin": -39907.0, "hire_cost": 20692, "days_14_plus_hands": 10, "days_16_hands": 3, "drops": 375, "final_producers": {"COW": 3, "SHEEP": 2, "STRAWBERRY": 5, "TOMATO": 2}},
+    {"penalty": 0.05, "current_cash": 46879.0, "opponent_cash": 136987.0, "margin": -90108.0, "hire_cost": 41516, "days_14_plus_hands": 16, "days_16_hands": 14, "drops": 357, "final_producers": {"COW": 5, "SHEEP": 1, "STRAWBERRY": 14, "TOMATO": 5}}
+  ],
+  "seed1_best_by_current_cash": 0.001,
+  "note": "The response is discontinuous: stronger concentration penalties do not monotonically reduce labor. Validate the small-penalty region across multiple seeds before changing the production default."
+}
