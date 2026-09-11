@@ -21,7 +21,7 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7' pytest
-      - name: Diagnose opening WHEAT and run seeds 1 to 5 vs pass
+      - name: Diagnose producer health and run seeds 1 to 5 vs pass
         run: |
           python - <<'PY'
           import json
@@ -70,6 +70,41 @@ jobs:
                   snapshots.append(summary)
               print('WHEAT_DIAG ' + json.dumps({'seed': seed, 'snapshots': snapshots}, sort_keys=True), flush=True)
 
+              animal_losses = []
+              weed_transitions = []
+              for previous_states, current_states in zip(env.steps, env.steps[1:]):
+                  previous = previous_states[0].observation
+                  current = current_states[0].observation
+                  previous_tiles = previous['farms'][0]['tiles']
+                  current_tiles = current['farms'][0]['tiles']
+                  for y, row in enumerate(previous_tiles):
+                      for x, old in enumerate(row):
+                          new = current_tiles[y][x]
+                          if isinstance(old, dict) and old.get('animal'):
+                              if not (isinstance(new, dict) and new.get('animal')):
+                                  animal_losses.append({
+                                      'day': int(current['day']), 'hour': int(current['hour']),
+                                      'position': [x, y], 'animal': old.get('animal'),
+                                      'placed_day': old.get('placed_day'),
+                                      'consecutive_unfed': old.get('consecutive_unfed', 0),
+                                  })
+                          if (
+                              isinstance(old, dict) and old.get('kind') == 'PLANT'
+                              and isinstance(new, dict) and new.get('kind') == 'WEED'
+                          ):
+                              weed_transitions.append({
+                                  'day': int(current['day']), 'hour': int(current['hour']),
+                                  'position': [x, y], 'crop': old.get('crop'),
+                                  'planted_day': old.get('planted_day'),
+                                  'consecutive_unwatered': old.get('consecutive_unwatered', 0),
+                              })
+
+              print('HEALTH_RESULT ' + json.dumps({
+                  'seed': seed,
+                  'animal_losses': animal_losses,
+                  'weed_transitions': weed_transitions,
+              }, sort_keys=True), flush=True)
+
               final = env.steps[-1]
               row = {
                   'seed': seed,
@@ -78,10 +113,16 @@ jobs:
                   'margin': float(final[0].reward) - float(final[1].reward),
                   'statuses': [state.status for state in final],
                   'frames': len(env.steps),
+                  'animal_losses': len(animal_losses),
+                  'weed_transitions': len(weed_transitions),
               }
               print('SEED_RESULT ' + json.dumps(row, sort_keys=True), flush=True)
               if row['statuses'] != ['DONE', 'DONE']:
                   raise RuntimeError(f"seed {seed} did not finish normally: {row['statuses']}")
+              if animal_losses:
+                  raise RuntimeError(f"seed {seed} lost animals: {animal_losses}")
+              if weed_transitions:
+                  raise RuntimeError(f"seed {seed} produced weeds: {weed_transitions}")
               results.append(row)
 
           avg = sum(r['current_cash'] for r in results) / len(results)
@@ -96,4 +137,4 @@ jobs:
           }, sort_keys=True), flush=True)
           PY
       - name: Run focused tests
-        run: python -m pytest -q tests/test_agents_farm_tasks.py tests/test_agents_scheduler.py tests/test_scheduler_compaction.py tests/test_agents_intraday.py tests/test_agents_opening_book.py tests/test_agents_harvest_priority.py tests/test_agents_planner_daily.py
+        run: python -m pytest -q tests/test_agents_farm_tasks.py tests/test_agents_scheduler.py tests/test_scheduler_compaction.py tests/test_agents_intraday.py tests/test_agents_opening_book.py tests/test_agents_harvest_priority.py tests/test_agents_planner_daily.py tests/test_replay_health_regressions.py
