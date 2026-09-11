@@ -109,7 +109,15 @@ def animal_maintenance_can_still_pay(animal, age, day, end_day):
 
 
 def cycle_finished(crop, age, tile):
-    """Return whether a crop will never yield again and its tile can be reused."""
-    if crop not in ONGOING_CROPS:
-        return age >= CROP_LAST_AGE[crop]
-    return age >= CROP_LAST_AGE[crop] and not tile.get("yield_units", 0)
+    """Whether today's visit must retire this crop before the next dawn.
+
+    For ongoing crops, waiting for ``yield_units`` to become zero before
+    scheduling DIG is one turn too late at the final production age: the
+    worker HARVESTs during that day, then the engine can convert the exhausted
+    PLANT to WEED on the next hour-0 transition before our hour-1 execution
+    queues exist.  Treat the final production age itself as cycle-finished;
+    build_tasks already orders WATER/HARVEST before DIG, so the last yield is
+    collected and the tile is cleared in the same visit.
+    """
+    del tile  # cycle end is age-defined; current yield is harvested before DIG
+    return age >= CROP_LAST_AGE[crop]
