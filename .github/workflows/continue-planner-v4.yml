@@ -2,11 +2,11 @@ name: Continue Planner Capacity V4
 on:
   push:
     branches: [feat/planner-capacity-v4]
+    paths: ['.github/workflows/continue-planner-v4.yml']
 permissions:
   contents: write
 jobs:
   land-fix:
-    if: github.event.head_commit.message != 'fix: finish day-seven land expansion'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -50,14 +50,10 @@ jobs:
           if old in s:
               s = s.replace(old, new)
           assert 'def _land_orders(obs, farm, pending_sales=()):' in s
-          s = s.replace(
-              'orders = _land_orders(obs, farm) + feed + hire_orders',
-              'orders = _land_orders(obs, farm, pending_sales) + feed + hire_orders',
-          )
-          s = s.replace(
-              '                + _land_orders(obs, farm)\n',
-              '                + _land_orders(obs, farm, sales)\n',
-          )
+          s = s.replace('orders = _land_orders(obs, farm) + feed + hire_orders',
+                        'orders = _land_orders(obs, farm, pending_sales) + feed + hire_orders')
+          s = s.replace('                + _land_orders(obs, farm)\n',
+                        '                + _land_orders(obs, farm, sales)\n')
           needle = '            missing_hands = max(0, hand_count - len(existing_hands))\n'
           boost = '            if should_buy_land_on_schedule(obs, farm):\n                hand_count = max(hand_count, 10)\n'
           if boost not in s:
