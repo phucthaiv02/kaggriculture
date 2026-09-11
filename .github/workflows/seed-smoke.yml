@@ -137,4 +137,4 @@ jobs:
           }, sort_keys=True), flush=True)
           PY
       - name: Run focused tests
-        run: python -m pytest -q tests/test_agents_farm_tasks.py tests/test_agents_scheduler.py tests/test_scheduler_compaction.py tests/test_agents_intraday.py tests/test_agents_opening_book.py tests/test_agents_harvest_priority.py tests/test_agents_planner_daily.py tests/test_replay_health_regressions.py
+        run: python -m pytest -q tests/test_agents_farm_tasks.py tests/test_agents_scheduler.py tests/test_scheduler_compaction.py tests/test_agents_intraday.py tests/test_agents_opening_book.py tests/test_agents_harvest_priority.py tests/test_agents_planner_daily.py tests/test_replay_health_regressions.py tests/test_survival_debt_regression.py
