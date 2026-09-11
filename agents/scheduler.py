@@ -178,9 +178,15 @@ def _hard_crop_harvest(task):
 
 
 def _task_priority(task):
-    """Ordering constraints that must never be traded away for shorter travel."""
+    """Ordering constraints that must never be traded away for shorter travel.
+
+    ``survival_debt`` is attached by the maintenance wrapper when a tile has
+    already missed FEED/WATER once. One more miss destroys the producer, so
+    this debt outranks ordinary harvests and first-miss maintenance work.
+    """
     return (
         not task.must_liquidate,
+        not getattr(task, "survival_debt", False),
         not _hard_crop_harvest(task),
         not task.urgent,
         not (
