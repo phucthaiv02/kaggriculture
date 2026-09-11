@@ -170,40 +170,78 @@ def _append_optional_tails(queue, current, bucket, budget, shed_access):
     return queue, current
 
 
-def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
-    """Greedy bin-pack using exact mandatory queue length."""
+def _hard_crop_harvest(task):
+    return (
+        task.ends_cycle
+        and any(action and action[0] == "HARVEST" for action in _mandatory_actions(task))
+    )
+
+
+def _task_priority(task):
+    """Ordering constraints that must never be traded away for shorter travel."""
+    return (
+        not task.must_liquidate,
+        not _hard_crop_harvest(task),
+        not task.urgent,
+        not (
+            task.urgent
+            and any(action and action[0] == "WATER" for action in _mandatory_actions(task))
+        ),
+        not task.animal_harvest,
+        not (
+            task.actions
+            and task.actions[0][0] in ("FEED", "CARE", "COLLECT_FERTILIZER")
+        ),
+        task.deadline if task.deadline is not None else float("inf"),
+        not task.immediate_drop,
+    )
+
+
+def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):
+    """Greedy exact-route pack for one task ordering.
+
+    The normal ordering preserves the historical near-first behavior.  The
+    hard-first ordering is only used as a repair attempt when near-first leaves
+    work unassigned: constrained/pinned work is considered first, then work
+    whose cheapest one-task route consumes the most of a worker's day.  This
+    avoids occupying every worker with easy local work before a remote cluster
+    is considered -- a classic bin-packing false negative that otherwise makes
+    hands_needed() pay for another Fibonacci-priced worker even when the same
+    workforce can fit the day.
+    """
     buckets = [[] for _ in worker_starts]
 
     def work_length(start, bucket):
         return len(_mandatory_queue(start, bucket, shed_access)[0])
 
-    def hard_crop_harvest(task):
-        return (
-            task.ends_cycle
-            and any(action and action[0] == "HARVEST" for action in _mandatory_actions(task))
+    def nearest_distance(task):
+        return min(
+            abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
+            for start in worker_starts
         )
 
-    ordered = sorted(
-        tasks,
-        key=lambda task: (
-            not task.must_liquidate,
-            not hard_crop_harvest(task),
-            not task.urgent,
-            not (task.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(task))),
-            not task.animal_harvest,
-            not (
-                task.actions
-                and task.actions[0][0] in ("FEED", "CARE", "COLLECT_FERTILIZER")
-            ),
-            task.deadline if task.deadline is not None else float("inf"),
-            min(
-                abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
-                for start in worker_starts
-            ),
-            -len(_mandatory_actions(task)),
-            task.position[1], task.position[0],
-        ),
-    )
+    if hard_first:
+        def ordering(task):
+            solo = min(work_length(start, [task]) for start in worker_starts)
+            return (
+                *_task_priority(task)[:-1],
+                task.pinned_worker is None,
+                -solo,
+                -len(_mandatory_actions(task)),
+                task.position[1],
+                task.position[0],
+            )
+    else:
+        def ordering(task):
+            return (
+                *_task_priority(task)[:-1],
+                nearest_distance(task),
+                -len(_mandatory_actions(task)),
+                task.position[1],
+                task.position[0],
+            )
+
+    ordered = sorted(tasks, key=ordering)
     unassigned = []
     lengths = [0] * len(worker_starts)
     for task in ordered:
@@ -213,21 +251,8 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
                 continue
             for insertion in range(len(bucket) + 1):
                 candidate = bucket[:insertion] + [task] + bucket[insertion:]
-                priority = lambda queued: (
-                    not queued.must_liquidate,
-                    not hard_crop_harvest(queued),
-                    not queued.urgent,
-                    not (queued.urgent and any(action and action[0] == "WATER" for action in _mandatory_actions(queued))),
-                    not queued.animal_harvest,
-                    not (
-                        queued.actions
-                        and queued.actions[0][0] in ("FEED", "CARE", "COLLECT_FERTILIZER")
-                    ),
-                    queued.deadline if queued.deadline is not None else float("inf"),
-                    not queued.immediate_drop,
-                )
                 if any(
-                    priority(candidate[index]) > priority(candidate[index + 1])
+                    _task_priority(candidate[index]) > _task_priority(candidate[index + 1])
                     for index in range(len(candidate) - 1)
                 ):
                     continue
@@ -247,6 +272,22 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
             break
         else:
             unassigned.append(task)
+    return buckets, unassigned
+
+
+def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
+    """Pack mandatory work, retrying a harder-first layout before adding labor."""
+    buckets, unassigned = _pack_once(
+        tasks, worker_starts, budgets, shed_access, hard_first=False
+    )
+    if not unassigned or len(worker_starts) <= 1:
+        return buckets, unassigned
+
+    compact_buckets, compact_unassigned = _pack_once(
+        tasks, worker_starts, budgets, shed_access, hard_first=True
+    )
+    if len(compact_unassigned) < len(unassigned):
+        return compact_buckets, compact_unassigned
     return buckets, unassigned
 
 
