@@ -12,12 +12,14 @@ on:
       - agents/expansion_agent.py
 
 jobs:
-  seed-1-vs-a:
-    name: seed-1 penalty-${{ matrix.penalty }}
+  multi-seed-vs-a:
+    name: seed-${{ matrix.seed }} penalty-${{ matrix.penalty }}
     strategy:
       fail-fast: false
+      max-parallel: 16
       matrix:
-        penalty: [0, 0.001, 0.005, 0.01, 0.02, 0.05]
+        seed: [0, 1, 7, 42]
+        penalty: [0, 0.0005, 0.001, 0.002]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -27,9 +29,9 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check 'kaggle-environments==1.32.7'
-      - name: Run seed 1 vs A
+      - name: Run match vs A
         run: >-
           python -m experiments.sweep_concentration
           --opponent public/A.ipynb
-          --seeds 1
+          --seeds ${{ matrix.seed }}
           --penalties ${{ matrix.penalty }}
