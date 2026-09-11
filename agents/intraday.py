@@ -6,7 +6,8 @@ from agents.horizon import can_start_today
 from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 
 from agents.farm_tasks import ANIMAL_COST, CROPS, SEED_COST, build_tasks, purchase_orders
-from agents.scheduler import WorkerPlan, build_queues, predicted_hand_starts
+from agents.scheduler import WorkerPlan, build_queues, predicted_hand_starts, nearest_shed, route
+from agents.farm_tasks import SELLABLE_PRODUCTS
 
 MOVES = {"EAST": (1, 0), "WEST": (-1, 0), "SOUTH": (0, 1), "NORTH": (0, -1)}
 TILE_ACTIONS = {
@@ -21,7 +22,7 @@ def _has_pending_protective_work(queue):
     return any(operation and operation[0] in PROTECTIVE_OPS for operation in queue)
 
 
-def queue_commitments(positions, plans):
+def queue_commitments(positions, plans, max_steps=None):
     """Recover destinations and input reservations from remaining commands."""
     endpoints, occupied = [], set()
     seeds, supplies = Counter(), Counter()
@@ -29,6 +30,8 @@ def queue_commitments(positions, plans):
     for index, position in enumerate(positions):
         x, y = position
         queue = plans[index].queue if index < len(plans) else []
+        if max_steps is not None:
+            queue = queue[:max(0, max_steps)]
         for operation in queue:
             op = operation[0]
             if op in MOVES:
@@ -42,6 +45,29 @@ def queue_commitments(positions, plans):
                 supplies[operation[1]] += operation[2]
         endpoints.append((x, y))
     return endpoints, occupied, seeds, supplies
+
+
+def schedule_idle_drops(obs, plans, shed_access):
+    """Return carried harvest after other work, only if DROP fits today.
+
+    Rebuilt routes may no longer contain the HARVEST that produced a worker's
+    inventory. Read actual cargo rather than relying on today's task sales.
+    Call after assigning maintenance and planting so those jobs take priority.
+    """
+    farm = obs["farms"][obs["player"]]
+    positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
+    remaining = 24 - obs["hour"]
+    for index, (position, inventory) in enumerate(
+        zip(positions, obs["private"].get("inventories", []))
+    ):
+        if index >= len(plans) or plans[index].queue:
+            continue
+        if not any(inventory.get(item, 0) > 0 for item in SELLABLE_PRODUCTS):
+            continue
+        shed = nearest_shed(position, shed_access)
+        home = route(position, shed) + [["DROP"]]
+        if len(home) <= remaining:
+            plans[index].queue.extend(home)
 
 
 def schedule_open_tiles(obs, targets, plans, shed_access, hire_costs=()):

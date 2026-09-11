@@ -20,7 +20,8 @@ SEED_COST = {name: official_game.CROPS[name]["seed"] for name in CROPS}
 ANIMAL_COST = {name: official_game.ANIMALS[name]["cost"] for name in ANIMALS}
 LAND_ORDER = official_game.LAND_ORDER
 LAND_BUY_UTILIZATION = 0.75
-TARGET_CONCENTRATION_PENALTY = 0.03
+TARGET_CONCENTRATION_PENALTY = 0.001
+PLANNER_VERSIONS = ("concentration", "mirror_v2")
 
 # A standard 720-turn season has 30 days, indexed 0 through 29 by the engine.
 
@@ -143,7 +144,10 @@ def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
     return results
 
 
-def evaluate_daily_targets(market, baseline, candidates, labor=None, position=(4, 4)):
+def evaluate_daily_targets(
+    market, baseline, candidates, labor=None, position=(4, 4),
+    mirror_opponent=False,
+):
     """Evaluate fresh targets on per-type horizons and normalize by elapsed day.
 
     Crops are scoped to their max-yield age. Animals use their configured fresh
@@ -175,13 +179,20 @@ def evaluate_daily_targets(market, baseline, candidates, labor=None, position=(4
         scoped_output = scoped(output, end)
         baseline_cost = labor.cost(scoped_baseline.visits)
         baseline_value = scoped_market.value(scoped_baseline)
+        market_cash = (
+            scoped_market.mirrored_marginal_profit(
+                scoped_baseline, scoped_output, 0
+            )
+            if mirror_opponent
+            else scoped_market.marginal_profit(
+                scoped_baseline, scoped_output, 0, baseline_value
+            )
+        )
         results.append(
             TargetProfit(
                 choice,
                 scoped_output,
-                scoped_market.marginal_profit(
-                    scoped_baseline, scoped_output, 0, baseline_value
-                ),
+                market_cash,
                 cost,
                 labor.marginal_cost(
                     scoped_baseline, scoped_output, position, baseline_cost
@@ -240,6 +251,32 @@ def _choose_daily(market, baseline, candidates, counts, labor=None, position=(4,
     return result.choice, result.output
 
 
+def _choose_daily_mirrored(
+    market, baseline, candidates, counts, labor=None, position=(4, 4)
+):
+    """Choose profit/day assuming the opponent adds the same producer."""
+    profitable = [
+        result
+        for result in evaluate_daily_targets(
+            market, baseline, candidates, labor, position,
+            mirror_opponent=True,
+        )
+        if result.profit > 0
+    ]
+    if not profitable:
+        return None, None
+    result = max(
+        profitable,
+        key=lambda r: (
+            r.profit_per_day,
+            r.profit,
+            -counts[r.choice[0]],
+            r.choice,
+        ),
+    )
+    return result.choice, result.output
+
+
 def _score(name, end_day, day, inventory, wheat_price, committed_units, unlocked_shops=()):
     market = MarketForecast(inventory, unlocked_shops, day, end_day)
     baseline = Production()
@@ -286,7 +323,9 @@ def should_buy_land(farm, active_positions):
     return occupied / len(active_positions) >= LAND_BUY_UTILIZATION
 
 
-def plan_targets(obs, targets, active_positions, end_day):
+def plan_targets(
+    obs, targets, active_positions, end_day, planner_version="concentration"
+):
     """Reprice targets against actual production and route-feasible commitments.
 
     Existing crops are forecast from their real age, held yield and watering
@@ -300,6 +339,8 @@ def plan_targets(obs, targets, active_positions, end_day):
     shared baseline, and later candidates are rejected naturally if the
     combined visits cannot fit the farmer plus maximum hands.
     """
+    if planner_version not in PLANNER_VERSIONS:
+        raise ValueError(f"unknown planner version: {planner_version}")
     day = obs["day"]
     end_day = _cycle_end(day, end_day)
     farm = obs["farms"][obs["player"]]
@@ -307,11 +348,33 @@ def plan_targets(obs, targets, active_positions, end_day):
     counts = Counter()
     replanning = []
     external = Production()
+    owned_animals = Counter({
+        name: obs["private"]["shed"].get(name, 0)
+        for name in ANIMALS
+    })
+    for inventory in obs["private"].get("inventories", []):
+        owned_animals.update({
+            name: inventory.get(name, 0)
+            for name in ANIMALS
+            if inventory.get(name, 0) > 0
+        })
 
     for position in active_positions:
         x, y = position
         tile = farm["tiles"][y][x]
         current = targets.get(position)
+        if current and current[0] in ANIMALS and owned_animals[current[0]] > 0:
+            structure = official_game.ANIMALS[current[0]]["structure"]
+            compatible = (
+                not isinstance(tile, dict)
+                or tile.get("kind") == structure
+            )
+            if compatible and can_start(current[0], day, end_day):
+                # A delivered animal is committed capital. Keep its target
+                # stable across dawn until execution can PLACE it instead of
+                # repricing the still-empty tile and stranding it in the shed.
+                owned_animals[current[0]] -= 1
+                continue
         if isinstance(tile, dict) and tile.get("animal"):
             continue
         if isinstance(tile, dict) and tile.get("kind") == "PLANT":
@@ -411,7 +474,12 @@ def plan_targets(obs, targets, active_positions, end_day):
                 and official_game.ANIMALS[c[0][0]]["structure"] == tile["kind"]
             ]
 
-        choice, output = _choose_daily(
+        selector = (
+            _choose_daily_mirrored
+            if planner_version == "mirror_v2"
+            else _choose_daily
+        )
+        choice, output = selector(
             market, baseline, allowed, counts, labor, position
         )
         targets[position] = choice
@@ -419,4 +487,8 @@ def plan_targets(obs, targets, active_positions, end_day):
             continue
 
         baseline.add(output, position)
+        if planner_version == "mirror_v2":
+            # Keep the rival's mirrored commitment in later tile decisions;
+            # each accepted target represents one producer for each player.
+            external.add(output, position)
         counts[choice[0]] += 1

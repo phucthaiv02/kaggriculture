@@ -50,8 +50,9 @@ class Task:
     refinance_feed: bool = False  # opening-only fertilizer sale -> wheat -> feed
     animal_harvest: bool = False  # ready animal output outranks all other tile work
     deadline: int | None = None  # absolute engine step before a crop decays
-    must_liquidate: bool = False  # final-day work must end with a shed DROP
+    must_liquidate: bool = False  # cash-critical work must end with a shed DROP
     pinned_worker: int | None = None  # final-day carried stock belongs to this worker
+    immediate_transition: bool = False  # opening harvest/build stays in one visit
 
 
 def _new_planting_actions(name, fertilize_commit, seeds_available, animals_available, wheat_available,
@@ -204,14 +205,17 @@ def build_tasks(
                 if tile.get("yield_units", 0) > 0:
                     actions = [] if tile.get("watered_today") else [["WATER"]]
                     tasks.append(Task(position, actions + [["HARVEST"]], urgent=True,
-                                      sells=Counter({crop: tile["yield_units"]})))
+                                      sells=Counter({crop: tile["yield_units"]}),
+                                      immediate_drop=position in obs.get("_opening_early_harvest_positions", ()),
+                                      must_liquidate=position in obs.get("_opening_early_harvest_positions", ())))
                 elif cycle_finished(crop, day - tile["planted_day"], tile):
                     tasks.append(Task(position, [["DIG"]], ends_cycle=True))
             continue
         name, fertilize_commit = target
         actions, needs, sells = [], Counter(), Counter()
         urgent, ends_cycle = False, False
-        immediate_drop, refinance_feed = False, False
+        immediate_drop = position in obs.get("_opening_early_harvest_positions", ())
+        refinance_feed = False
         live_animal = tile.get("animal") if isinstance(tile, dict) else None
 
         if live_animal:
@@ -307,10 +311,13 @@ def build_tasks(
             # own 4-day clock). Never pre-empt an ongoing crop this way --
             # that would forfeit entire future production cycles, not a few
             # bonus units.
-            # Target changes wait until the current one-time crop reaches
-            # its verified max-yield age. Early harvest sacrifices yield; a
-            # late harvest enters decay.
-            early_exit = False
+            # Only explicitly designated opening tiles may exit early.
+            # All other target changes wait for the verified max-yield age.
+            early_exit = (
+                position in obs.get("_opening_early_harvest_positions", ())
+                and crop == "WHEAT"
+                and tile.get("yield_units", 0) > 0
+            )
             if cycle_finished(crop, age, tile) or early_exit:
                 ends_cycle = True
                 if crop not in ONGOING_CROPS:
@@ -396,6 +403,18 @@ def build_tasks(
                     ends_cycle,
                     immediate_drop,
                     refinance_feed,
+                    immediate_transition=(position in obs.get("_opening_early_harvest_positions", ())
+                                          or any(a[0] == "PLANT" for a in actions)),
+                    must_liquidate=bool(
+                        (
+                            obs.get("_opening_refinance_first")
+                            and (immediate_drop or (name in ANIMALS and not live_animal))
+                        )
+                        or (
+                            obs.get("_liquidate_fertilizer_first")
+                            and sells.get("FERTILIZER", 0) > 0
+                        )
+                    ),
                     animal_harvest=False,
                     deadline=(tile.get("max_lifespan_step") if ends_cycle and isinstance(tile, dict) else None),
                 )
@@ -482,24 +501,25 @@ def _animal_and_seed_demand(
 
 
 def _tomorrow_feed_need(obs, farm, active_positions, animal_missing):
-    """Reserve only feed whose next-day maintenance can still reach a sale."""
+    """Top up a four-day feed window after the opening animal purchases."""
     day = obs["day"]
     end_day = obs.get("_planning_end_day", SEASON_END_DAY)
-    if day < 3 or day >= end_day or sum(animal_missing.values()):
+    from agents.maintenance import should_feed
+    # Build the opening first; retain harvested reserves without buying them
+    # ahead of the scheduled animal placements.
+    if day < 3 or sum(animal_missing.values()):
         return 0
-    tomorrow = day + 1
     total = 0
     for position in active_positions:
         tile = farm["tiles"][position[1]][position[0]]
         if not isinstance(tile, dict) or not tile.get("animal"):
             continue
         animal = tile["animal"]
-        age = tomorrow - tile["placed_day"]
-        if (
-            should_feed_animal(animal, age)
-            and animal_maintenance_can_still_pay(animal, age, tomorrow, end_day)
-        ):
-            total += 1
+        for when in range(day + 1, min(day + (2 if day == 3 else 4), end_day + 1)):
+            age = when - tile["placed_day"]
+            if (should_feed(animal, age, position)
+                    and animal_maintenance_can_still_pay(animal, age, when, end_day)):
+                total += 1
     return total
 
 
@@ -670,7 +690,7 @@ def purchase_orders(
     wheat_needed = max(
         0,
         live_animals + pending_feed + new_animal_feed
-        - wheat_on_hand - wheat_incoming,
+        + tomorrow_feed - wheat_on_hand - wheat_incoming,
     )
 
     orders = []

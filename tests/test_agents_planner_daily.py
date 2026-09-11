@@ -7,7 +7,9 @@ import pytest
 from agents import planner
 from agents.forecast import MarketForecast, Production
 from agents.horizon import PLANNER_HORIZON_DAYS, planner_cycle_end
-from agents.planner import TargetProfit, _choose_daily, _daily_candidates
+from agents.planner import (
+    TargetProfit, _choose_daily, _choose_daily_mirrored, _daily_candidates,
+)
 from kaggle_environments.envs.kaggriculture import kaggriculture as game
 
 
@@ -126,5 +128,19 @@ def test_concentration_penalty_does_not_override_a_large_edge(monkeypatch):
         None, None, None, Counter({"WHEAT": 1})
     )
 
+    assert choice == ("WHEAT", False)
+    assert output is wheat_output
+
+
+def test_mirrored_version_does_not_apply_concentration_penalty(monkeypatch):
+    wheat_output = Production()
+    melon_output = Production()
+    _stub_daily_results(monkeypatch, [
+        TargetProfit(("WHEAT", False), wheat_output, 110, 10, 0, 4),
+        TargetProfit(("MELON", False), melon_output, 280, 80, 0, 10),
+    ])
+    choice, output = _choose_daily_mirrored(
+        None, None, None, Counter({"WHEAT": 1000})
+    )
     assert choice == ("WHEAT", False)
     assert output is wheat_output

@@ -15,6 +15,7 @@ from agents.opening_book import (
     PLANNER_HANDOFF_DAY,
     build_opening_targets,
     make_opening_controller,
+    MELON_PLANNER_HANDOFF_DAY,
     should_buy_land_on_schedule,
 )
 
@@ -126,21 +127,21 @@ def test_opening_stays_active_through_fertilizer_refinance_day():
     assert Counter(value[0] for value in targets.values()) == Counter(OPENING_COUNTS)
 
 
-def test_hands_off_to_planner_early_on_day_two_index():
+def test_hands_off_to_planner_only_on_day_seven():
     governs = make_opening_controller()
     targets = {}
     governs(make_obs(day=0), targets, NW_POSITIONS)
-    assert PLANNER_HANDOFF_DAY == 2
+    assert PLANNER_HANDOFF_DAY == 7
     assert governs(make_obs(day=PLANNER_HANDOFF_DAY), targets, NW_POSITIONS) is False
 
 
-def test_extra_land_forces_even_earlier_handoff():
+def test_extra_land_does_not_force_early_handoff():
     governs = make_opening_controller()
     targets = {}
     governs(make_obs(day=0), targets, NW_POSITIONS)
     obs = make_obs(day=1)
     obs["farms"][0]["unlocked_quadrants"] = ["NW", "NE"]
-    assert governs(obs, targets, NW_POSITIONS) is False
+    assert governs(obs, targets, NW_POSITIONS) is True
 
 
 def test_handoff_is_permanent():
@@ -149,3 +150,24 @@ def test_handoff_is_permanent():
     governs(make_obs(day=0), targets, NW_POSITIONS)
     assert governs(make_obs(day=PLANNER_HANDOFF_DAY), targets, NW_POSITIONS) is False
     assert governs(make_obs(day=1), targets, NW_POSITIONS) is False
+
+
+def test_melon_v2_hands_off_before_day_five_seed_purchases():
+    governs = make_opening_controller("melon_v2")
+    targets = {}
+    for day in range(MELON_PLANNER_HANDOFF_DAY):
+        obs = make_obs(day)
+        assert governs(obs, targets, NW_POSITIONS)
+        counts = Counter(target[0] for target in targets.values() if target)
+        assert counts == Counter({
+            "WHEAT": 9 if day < 2 else 7, "MELON": 12,
+            "COW": 2 if day < 2 else 3, "SHEEP": 3 if day >= 3 else 2,
+        })
+        if day >= 2:
+            assert len(obs["_opening_early_harvest_positions"]) == 2
+    assert not governs(make_obs(MELON_PLANNER_HANDOFF_DAY), targets, NW_POSITIONS)
+
+
+def test_unknown_opening_version_is_rejected():
+    with pytest.raises(ValueError, match="unknown opening version"):
+        make_opening_controller("missing")

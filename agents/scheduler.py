@@ -63,7 +63,7 @@ def _mandatory_actions(task):
     one Task. The replacement is not allowed to decide whether the harvest
     itself fits. This matters especially for a synchronized WHEAT harvest wall.
     """
-    if task.urgent and task.ends_cycle:
+    if task.urgent and task.ends_cycle and not task.immediate_transition:
         for index, action in enumerate(task.actions):
             if action and action[0] == "HARVEST":
                 return task.actions[:index + 1]

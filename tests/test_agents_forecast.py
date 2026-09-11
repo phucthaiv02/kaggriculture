@@ -197,6 +197,17 @@ def test_extra_supply_accounts_for_price_impact_on_existing_crop():
     candidate.sales[10]['MELON'] = 6
     assert market.marginal_profit(baseline, candidate, 80) < market.marginal_profit(Production(), candidate, 80)
 
+
+def test_mirrored_marginal_profit_adds_an_equivalent_rival_producer():
+    inventory = {p: game.MARKET_I0 for p in game.PRODUCTS}
+    market = MarketForecast(inventory, (), 0, 16)
+    baseline = Production()
+    candidate = Production()
+    candidate.sales[10]["MELON"] = 6
+    assert market.mirrored_marginal_profit(
+        baseline, candidate, 80
+    ) < market.marginal_profit(baseline, candidate, 80)
+
 @pytest.mark.parametrize('custom_params', [False, True])
 def test_sale_budget_matches_engine_for_repeated_orders(custom_params):
     from agents.expansion_agent import _sale_revenue

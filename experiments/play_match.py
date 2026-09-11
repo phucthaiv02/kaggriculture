@@ -12,6 +12,7 @@ from pathlib import Path
 from kaggle_environments import make
 
 from agents.expansion_agent import make_agent
+from agents.opening_book import OPENING_VERSIONS
 from experiments.crop_schedules import pass_agent
 
 
@@ -89,9 +90,15 @@ def _slug(value: str) -> str:
     return slug or "opponent"
 
 
-def run(opponent="pass", seed=1, output_dir=None):
+def run(
+    opponent="pass", seed=1, output_dir=None, opening_version="classic",
+    planner_version="concentration",
+):
     opponent_agent, opponent_name, opponent_meta = resolve_opponent(str(opponent))
-    current = make_agent(END_DAY - 1, seed=seed)
+    current = make_agent(
+        END_DAY - 1, seed=seed, opening_version=opening_version,
+        planner_version=planner_version,
+    )
 
     env = make("kaggriculture", configuration=configuration(seed), debug=False)
     env.run([current, opponent_agent])
@@ -101,6 +108,10 @@ def run(opponent="pass", seed=1, output_dir=None):
 
     final = env.steps[-1]
     stem = f"current_vs_{_slug(opponent_name)}_seed{seed}"
+    if opening_version != "classic":
+        stem += f"_{opening_version}"
+    if planner_version != "concentration":
+        stem += f"_{planner_version}"
     html_path = output_dir / f"{stem}.html"
     replay_path = output_dir / f"{stem}.json"
     result_path = output_dir / f"{stem}.result.json"
@@ -115,6 +126,8 @@ def run(opponent="pass", seed=1, output_dir=None):
     opponent_cash = float(final[1].reward)
     result = {
         "seed": seed,
+        "opening_version": opening_version,
+        "planner_version": planner_version,
         "opponent": opponent_name,
         "current_cash": current_cash,
         "opponent_cash": opponent_cash,
@@ -142,10 +155,18 @@ def main():
         default="pass",
         help="pass, random, or a path to a .py/.ipynb agent (default: pass)",
     )
+    parser.add_argument("--opening", choices=tuple(OPENING_VERSIONS), default="classic")
+    parser.add_argument(
+        "--planner", choices=("concentration", "mirror_v2"),
+        default="concentration",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     args = parser.parse_args()
-    run(args.opponent, args.seed, args.output_dir)
+    run(
+        args.opponent, args.seed, args.output_dir,
+        opening_version=args.opening, planner_version=args.planner,
+    )
 
 
 if __name__ == "__main__":

@@ -219,29 +219,28 @@ def test_conversion_batch_harvests_two_wheat_and_buys_cow_without_market_feed():
     )
 
 
-def test_day_five_buys_seven_wheat_seeds_and_replants_all_harvested_tiles():
-    """UI Day 5 is engine index 4: all 7 opening WHEAT tiles must complete
-    WATER -> HARVEST -> PLANT -> WATER on that exact day, with no spill into
-    index 5."""
+def test_day_five_replacement_seeds_follow_planner_targets():
+    """UI Day 5 is engine index 4: replacement purchases must reflect the
+    planner's repriced targets rather than the seven-WHEAT opening book."""
     env = make("kaggriculture", configuration=configuration(1), debug=False)
-    env.run([make_agent(END_DAY, seed=1), pass_agent])
+    env.run([make_agent(END_DAY, seed=1, opening_version="melon_v2"), pass_agent])
 
     actions = [
         step[0].action or {} for step in env.steps
         if step[0].observation.day == 4
     ]
     market = [order for action in actions for order in action.get("market", [])]
-    assert sum(
+    wheat_seeds = sum(
         int(order[2])
         for order in market
         if order[:2] == ["BUY_SEED", "WHEAT"]
-    ) == 7
+    )
     day_five_end = next(
         step[0].observation
         for step in env.steps
         if step[0].observation.day == 5 and step[0].observation.hour == 0
     )
-    replanted = [
+    replanted_wheat = [
         tile
         for row in day_five_end.farms[0]["tiles"]
         for tile in row
@@ -249,7 +248,8 @@ def test_day_five_buys_seven_wheat_seeds_and_replants_all_harvested_tiles():
         and tile.get("crop") == "WHEAT"
         and tile.get("planted_day") == 4
     ]
-    assert len(replanted) == 7
+    assert len(replanted_wheat) == wheat_seeds
+    assert wheat_seeds < 7
     weeds = [
         tile for step in env.steps if step[0].observation.day in (4, 5)
         for row in step[0].observation.farms[0]["tiles"]

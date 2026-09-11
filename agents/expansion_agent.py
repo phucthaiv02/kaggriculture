@@ -22,23 +22,58 @@ from __future__ import annotations
 
 from collections import Counter
 
-from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
+from kaggle_environments.envs.kaggriculture.kaggriculture import LAND_PRICES, market_price
 
 from agents.farm_tasks import (
     ANIMAL_COST,
     ANIMALS,
+    CROPS,
+    SEED_COST,
     build_tasks,
     feed_wheat_order,
     purchase_orders,
     reserved_items,
 )
 from agents.opening_book import make_opening_controller, should_buy_land_on_schedule
-from agents.intraday import queue_commitments, schedule_open_tiles
+from agents.intraday import queue_commitments, schedule_open_tiles, schedule_idle_drops
 from agents.planner import SEASON_END_DAY, plan_targets
 from agents.horizon import can_start_today
 from agents.scheduler import MAX_HANDS, build_queues, hands_needed
 from agents.schedules import is_maintenance_day, should_care_animal, should_feed_animal
-from agents.selling import sell_orders
+from agents.maintenance import should_feed, should_care, should_water
+from agents.selling import sell_orders, update_selling_state
+
+
+def _investment_sales(obs, reservations, selling_state, targets, hires):
+    """Release held crops when cash cannot cover currently planned inputs."""
+    sales = sell_orders(obs, reservations, selling_state=selling_state)
+    liquidated = sell_orders(
+        obs, reservations, selling_state=selling_state, needs_investment=True,
+    )
+    if sales == liquidated:
+        return sales
+    farm = obs["farms"][obs["player"]]
+    # A finite, nonbinding budget asks the existing purchase planner for
+    # demand before its affordability caps (it converts seed budgets to int).
+    orders = purchase_orders(
+        obs, targets, _active_positions(farm), available_money=10**12,
+        replant_same_crop=True,
+    )
+    cost = _hire_costs(farm, hires)
+    if should_buy_land_on_schedule(obs, farm):
+        cost += LAND_PRICES[len(farm["unlocked_quadrants"]) - 1]
+    for op, item, quantity in orders:
+        if op == "BUY_SEED":
+            cost += SEED_COST[item] * quantity
+        elif op == "BUY_ANIMAL":
+            cost += ANIMAL_COST[item] * quantity
+        elif op == "BUY_PRODUCT":
+            stock = obs["market"]["inventory"].get(item, 0)
+            cost += sum(market_price(item, stock - unit - 1, obs["market"].get("params"))
+                        for unit in range(quantity))
+    if cost > farm["money"] + _sale_revenue(obs, sales):
+        sales = liquidated
+    return sales
 
 def _protect_animal_structures(farm, operations):
     """Discard stale DIG/PLANT commands on permanent animal structures."""
@@ -127,6 +162,39 @@ def _capacity_safe_queues(
     unassigned_ids = {id(task) for task in unassigned}
     admitted = [task for task in active_tasks if id(task) not in unassigned_ids]
     return plans, admitted, unassigned, protective_debt
+
+
+def _maintenance_hires(obs, targets, plans, shed_access):
+    """Fund missing protective routes once intraday proceeds become available."""
+    farm = obs["farms"][obs["player"]]
+    positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
+    endpoints, committed, _, _ = queue_commitments(positions, plans, max_steps=24 - obs["hour"])
+    pending = {position: target for position, target in targets.items()
+               if position not in committed}
+    tasks = [task for task in build_tasks(obs, pending, prioritize_fertilizer_drop=True)
+             if _is_protective_task(task)]
+    if not tasks:
+        return 0
+    remaining = 24 - obs["hour"]
+    budgets = [max(0, remaining - len(plans[i].queue)) for i in range(len(positions))]
+    # Reserve immediate feed before optional hires; the four-day stock top-up
+    # must not consume money needed to prevent today's crops from dying.
+    feed = sum(task.needs.get("WHEAT", 0) for task in tasks)
+    shortfall = max(0, feed - obs["private"]["shed"].get("WHEAT", 0))
+    cash = max(0, farm["money"] - shortfall * obs["market"]["prices"]["WHEAT"])
+    limit = _affordable_hires(farm, MAX_HANDS - len(farm["hands"]), cash)
+    best, debt = 0, None
+    for extra in range(limit + 1):
+        _, missing = build_queues(
+            tasks, endpoints[0], len(farm["hands"]) + extra,
+            tuple(endpoints[1:len(positions)]), shed_access,
+            worker_budgets=budgets + [max(0, remaining - 1)] * extra,
+        )
+        if debt is None or len(missing) < debt:
+            best, debt = extra, len(missing)
+        if not missing:
+            break
+    return best
 
 
 def _sale_revenue(obs, sales):
@@ -240,7 +308,10 @@ def _hire_and_buy_orders(
     return orders
 
 
-def make_agent(end_day=SEASON_END_DAY, seed=0):
+def make_agent(
+    end_day=SEASON_END_DAY, seed=0, opening_version="classic",
+    planner_version="concentration",
+):
     del seed  # every decision reacts to live prices/shed state; nothing to seed
     targets = {}
     state = {
@@ -250,7 +321,8 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         "deferred_expansion_positions": set(),
         "protective_debt_positions": set(),
     }
-    opening_governs = make_opening_controller()
+    opening_governs = make_opening_controller(opening_version)
+    selling_state = {}
 
     def _validate_predicted_hands(farm, hour):
         """Discard a plan built for a hand hired mid-day once that hand
@@ -290,7 +362,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             # must release their tasks and inputs for intraday scheduling.
             del state["plans"][len(hands) + 1:]
 
-    def _animal_still_needs_attention(tile, name, day):
+    def _animal_still_needs_attention(tile, name, day, position):
         """True if a *placed* animal still has real, unfulfilled survival
         work today (feed, care, an overdue harvest, or waiting fertilizer).
 
@@ -304,15 +376,15 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         """
         age = day - tile["placed_day"]
         harvest_ready = tile.get("yield_units", 0) > 0
-        needs_feed = should_feed_animal(name, age) and not tile.get("fed_today")
+        needs_feed = (should_feed(name, age, position) or tile.get("consecutive_unfed", 0)) and not tile.get("fed_today")
         needs_care = (
-            should_care_animal(name, age)
+            should_care(name, age, position)
             and tile.get("fed_today")
             and not tile.get("cared_today")
         )
         return harvest_ready or needs_feed or needs_care
 
-    def _crop_still_needs_water(tile, name, fertilize_commit, day):
+    def _crop_still_needs_water(tile, name, fertilize_commit, day, position):
         """True if a *planted* crop still needs today's WATER and hasn't
         gotten it yet.
 
@@ -348,14 +420,39 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             if crop == name
             else tile.get("fertilized_until_day", -1) >= tile["planted_day"]
         )
-        return is_maintenance_day(crop, age, current_fertilized)
+        return bool(tile.get("consecutive_unwatered", 0)) or should_water(crop, age, current_fertilized, position)
 
     def _replan_all_from_actual(obs, farm, day, hour):
-        """Rebuild every unfinished route from live worker positions at hour 2."""
-        if hour != 2:
+        """Rebuild routes after morning hires or opening input deliveries.
+
+        The Day-4 SHEEP arrives after fertilizer sales. Repack the remaining
+        maintenance and its now-executable PLACE using existing workers;
+        morning labor sizing never assumes this purchase has arrived.
+        Repack same-day harvest work once replacement seeds arrive too, so
+        harvesters can replant during the same visit when the planner retains
+        a WHEAT target.
+        """
+        delivered = (
+            opening_version == "melon_v2" and state["opening_active"] and day == 3
+            and obs["private"]["shed"].get("SHEEP", 0) > 0
+            and not state.get("opening_sheep_delivered")
+        )
+        replant_delivered = (
+            opening_version == "melon_v2" and state["opening_active"]
+            and day == 4 and obs["private"]["seeds"].get("WHEAT", 0) >= sum(
+                target is not None and target[0] == "WHEAT"
+                for target in targets.values()
+            )
+            and not state.get("opening_replant_delivered")
+        )
+        if hour != 2 and not delivered and not replant_delivered:
             return
+        if replant_delivered:
+            state["opening_replant_delivered"] = True
+        if delivered:
+            state["opening_sheep_delivered"] = True
         tasks = build_tasks(
-            obs, targets, prioritize_fertilizer_drop=state["opening_active"]
+            obs, targets, prioritize_fertilizer_drop=True
         )
         state["deferred_expansion_positions"] = {
             position for position in state["deferred_expansion_positions"]
@@ -414,7 +511,11 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 == (targets.get(position) or (None, False))[0]
             )
         }
-        committed = queue_commitments(worker_positions, state["plans"])[1]
+        # Injected harvests and input retries can push a queued WATER past
+        # dusk. Such work is no longer covered and must be rescued now.
+        committed = queue_commitments(
+            worker_positions, state["plans"], max_steps=24 - hour
+        )[1]
         ordered_positions = sorted(
             targets,
             key=lambda position: (
@@ -436,7 +537,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 if not placed:
                     if position not in state["scheduled_placements"]:
                         pending_targets[position] = target
-                elif _animal_still_needs_attention(tile, name, day):
+                elif _animal_still_needs_attention(tile, name, day, position):
                     pending_targets[position] = target
             elif (
                 position in state["deferred_expansion_positions"]
@@ -444,14 +545,14 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 and position not in state["scheduled_placements"]
             ):
                 pending_targets[position] = target
-            elif _crop_still_needs_water(tile, name, fertilize_commit, day):
+            elif _crop_still_needs_water(tile, name, fertilize_commit, day, position):
                 pending_targets[position] = target
         if not pending_targets:
             return
         tasks = build_tasks(
             obs,
             pending_targets,
-            prioritize_fertilizer_drop=state["opening_active"],
+            prioritize_fertilizer_drop=True,
         )
         placement_tasks = [
             task for task in tasks
@@ -517,7 +618,17 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             effective_end = min(effective_end, last_action_day)
         obs = dict(obs, _planning_end_day=effective_end)
         day, hour = obs["day"], obs["hour"]
+        if opening_version == "melon_v2" and day == 4:
+            # The day-5 planner needs animal fertilizer as working capital for
+            # replacement seeds. Collect and bank it before harvest/transition
+            # routes consume the remaining turns.
+            obs["_liquidate_fertilizer_first"] = True
         farm = obs["farms"][obs["player"]]
+
+        if state["opening_active"]:
+            opening_governs(obs, targets, _active_positions(farm))
+
+        update_selling_state(obs, selling_state)
 
         # React to every successful land purchase, including one submitted
         # mid-day or after the opening has already handed off.
@@ -527,7 +638,10 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 position for position in positions if position not in targets
             )
             state["opening_active"] = opening_governs(obs, targets, positions)
-            plan_targets(obs, targets, positions, effective_end)
+            if not state["opening_active"]:
+                plan_targets(
+                    obs, targets, positions, effective_end, planner_version
+                )
 
         if hour == 0:
             positions = _active_positions(farm)
@@ -536,7 +650,9 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             # on the ROI planner takes over.
             state["opening_active"] = opening_governs(obs, targets, positions)
             if not state["opening_active"]:
-                plan_targets(obs, targets, positions, effective_end)
+                plan_targets(
+                    obs, targets, positions, effective_end, planner_version
+                )
             else:
                 # The opening book only ever assigns the original NW tiles
                 # (agents/opening_book.py's build_opening_targets). Without
@@ -548,12 +664,15 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 # touching the opening book's own NW allocation.
                 new_positions = [p for p in positions if p not in targets]
                 if new_positions:
-                    plan_targets(obs, targets, new_positions, effective_end)
+                    plan_targets(
+                        obs, targets, new_positions, effective_end,
+                        planner_version,
+                    )
             tasks = build_tasks(
                 obs, targets,
                 assume_crop_seeds=day > 0,
-                assume_animal_inputs=state["opening_active"],
-                prioritize_fertilizer_drop=state["opening_active"],
+                assume_animal_inputs=state["opening_active"] and (opening_version != "melon_v2" or day == 0),
+                prioritize_fertilizer_drop=True,
             )  # include the PLANT + WATER enabled by today's seed purchases
             tasks = [
                 task for task in tasks
@@ -575,12 +694,12 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             # must stay in the shed for animals that cash can fund today.
             non_wheat_reservations = dict(reservations)
             non_wheat_reservations["WHEAT"] = obs["private"]["shed"].get("WHEAT", 0)
-            non_wheat_sales = sell_orders(obs, non_wheat_reservations)
             hires = max(0, hand_target - len(farm["hands"]))
+            non_wheat_sales = _investment_sales(obs, non_wheat_reservations, selling_state, targets, hires)
             reservations = _reserve_feed_for_affordable_animals(
                 obs, farm, targets, reservations, non_wheat_sales, hires
             )
-            sales = sell_orders(obs, reservations)
+            sales = _investment_sales(obs, reservations, selling_state, targets, hires)
             return {
                 "farmer": ["PASS"], "hands": [["PASS"] for _ in farm["hands"]],
                 "market": (
@@ -599,7 +718,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             tasks = build_tasks(
                 obs,
                 targets,
-                prioritize_fertilizer_drop=state["opening_active"],
+                prioritize_fertilizer_drop=True,
             )
             state["deferred_expansion_positions"] = {
                 position for position in state["deferred_expansion_positions"]
@@ -655,12 +774,25 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         # are only for newly available work after that pass has settled.
         hire_costs = (
             [_hire_costs(farm, count) for count in range(1, MAX_HANDS - len(farm["hands"]) + 1)]
-            if hour >= 2 and not state["unverified_hand_indices"] else []
+            if hour >= 2 and not state["unverified_hand_indices"]
+            and not (state["opening_active"] and opening_version == "melon_v2" and day < 4) else []
         )
         purchase_targets, expansion_hires = schedule_open_tiles(
             obs, targets, state["plans"], _open_shed_access(farm), hire_costs,
         )
+        if state["opening_active"] and opening_version == "melon_v2":
+            # Scheduled animals remain purchase commitments while workers
+            # finish real maintenance; do not drop demand just because their
+            # pasture has not yet been admitted to a route.
+            purchase_targets = targets
         _schedule_late_placements(obs, farm, day, hour)
+        maintenance_hires = 0
+        if hour >= 2 and not (state["opening_active"] and opening_version == "melon_v2" and day < 4):
+            maintenance_hires = _maintenance_hires(
+                obs, targets, state["plans"], _open_shed_access(farm)
+            )
+            expansion_hires = max(expansion_hires, maintenance_hires)
+        schedule_idle_drops(obs, state["plans"], _open_shed_access(farm))
         # Remaining PICKUPs, including newly appended work, must be protected
         # from the same turn's sales.
         positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
@@ -749,7 +881,10 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         # Sell and buy every turn so harvests and fertilizer can fund new
         # production immediately. Vacant-tile purchases are restricted to
         # the capacity admitted by the intraday scheduler.
-        market = sell_orders(obs, state["reserved"])
+        market = _investment_sales(
+            obs, state["reserved"], selling_state, purchase_targets,
+            expansion_hires + (max(0, state["hand_target"] - len(farm["hands"])) if hour == 1 else 0),
+        )
         if hour == 1:
             # Morning top-up hires retain their existing sizing. Input
             # shopping below also covers feasible newly unlocked tiles.
@@ -779,9 +914,19 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             available_money = _maximum_cash_after_sales(
                 obs, farm, sales, expansion_hires + sum(order[0] == "HIRE" for order in market)
             )
+            order_targets = purchase_targets
+            if opening_version == "melon_v2" and day == 4:
+                # Day-5 fertilizer is scarce working capital with only a few
+                # turns left after delivery. Fund cheap crop targets first so
+                # workers can PLANT today; animal targets remain for day 6.
+                order_targets = {
+                    position: target
+                    for position, target in purchase_targets.items()
+                    if target and target[0] in CROPS
+                }
             late_orders = purchase_orders(
                 obs,
-                purchase_targets,
+                order_targets,
                 _active_positions(farm),
                 available_money=available_money,
                 available_wheat=max(
@@ -804,7 +949,13 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
 
         # Inputs precede optional expansion hires. If the ten-order cap cuts
         # off some hires, the next observation schedules only real workers.
-        market += [["HIRE"] for _ in range(expansion_hires)]
+        if maintenance_hires:
+            # Cash is already available and immediate feed was budgeted by
+            # _maintenance_hires. Protect rescue labor before reserve top-ups.
+            first_purchase = next((i for i, order in enumerate(market)
+                                   if order[0] != "SELL"), len(market))
+            market[first_purchase:first_purchase] = [["HIRE"]] * maintenance_hires
+        market += [["HIRE"] for _ in range(expansion_hires - maintenance_hires)]
         return {"farmer": farmer_op, "hands": hand_ops, "market": market[:10]}
 
     return agent

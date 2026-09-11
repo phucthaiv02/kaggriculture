@@ -12,7 +12,7 @@ or fertilizer comes from the market, its own shed, or its own production; and
 we do not know the rival's future cross-product market-order queue positions.
 """
 from collections import Counter, defaultdict
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import zip_longest
@@ -277,3 +277,20 @@ class MarketForecast:
         if baseline_value is None:
             baseline_value = self.value(baseline)
         return self.value(combined) - baseline_value - fixed_cost
+
+    def mirrored_marginal_profit(self, baseline, candidate, fixed_cost):
+        """Value our commitment while a rival adds one equivalent producer."""
+        combined = Production()
+        combined.add(baseline)
+        combined.add(candidate)
+
+        mirrored_external = Production()
+        mirrored_external.add(self.external)
+        mirrored_external.add(candidate)
+        scenario = copy(self)
+        scenario.external = mirrored_external
+        return (
+            scenario.robust_value(combined)
+            - self.robust_value(baseline)
+            - fixed_cost
+        )

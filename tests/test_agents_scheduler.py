@@ -137,6 +137,31 @@ def test_opening_fertilizer_is_dropped_before_the_workers_next_task():
     assert queue.index(["COLLECT_FERTILIZER"]) < queue.index(["DROP"]) < queue.index(["WATER"])
 
 
+def test_cash_first_fertilizer_returns_before_finished_crop_harvest():
+    fertilizer = Task(
+        (4, 3),
+        [["COLLECT_FERTILIZER"]],
+        sells=Counter({"FERTILIZER": 1}),
+        immediate_drop=True,
+        must_liquidate=True,
+    )
+    harvest = Task(
+        (3, 3),
+        [["WATER"], ["HARVEST"]],
+        sells=Counter({"WHEAT": 4}),
+        urgent=True,
+        ends_cycle=True,
+    )
+    plans, unassigned = build_queues(
+        [harvest, fertilizer], farmer_start=(4, 4), hand_count=0,
+        shed_access=((4, 4),),
+    )
+    assert unassigned == []
+    queue = plans[0].queue
+    assert queue.index(["COLLECT_FERTILIZER"]) < queue.index(["DROP"])
+    assert queue.index(["DROP"]) < queue.index(["HARVEST"])
+
+
 def test_hand_hired_at_hour_one_is_limited_to_22_steps():
     """A pending hire cannot execute until hour 2, unlike an existing hand."""
     farmer_filler = Task((4, 4), [["WATER"]] * FARMER_BUDGET)

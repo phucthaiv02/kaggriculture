@@ -185,11 +185,7 @@ def _feed_need_adjustment(
 
     # Match _tomorrow_feed_need's own guards. If the core deliberately does
     # not reserve tomorrow yet, staggering must not invent that reserve either.
-    tomorrow_delta = 0
-    if day >= 3 and day < obs.get("_planning_end_day", _core.SEASON_END_DAY) and not sum(animal_missing.values()):
-        tomorrow_delta = _cow_feed_delta(
-            obs, targets, active_positions, day + 1
-        )
+    tomorrow_delta = 0  # Core reserve already uses the spatial maintenance phase.
 
     baseline_now = live_animals + pending_feed
     desired_now = baseline_now + today_delta
@@ -199,8 +195,14 @@ def _feed_need_adjustment(
             0, tomorrow_feed + tomorrow_delta - wheat_incoming
         )
     else:
-        baseline_total = baseline_now + tomorrow_feed
-        desired_total = desired_now + tomorrow_feed + tomorrow_delta
+        # Intraday feed orders must use the same incoming-harvest credit as
+        # purchase_orders. Otherwise this earlier order spends the seed
+        # budget on a reserve that today's WHEAT harvest already covers.
+        # Keep today's feed protected until the harvest actually arrives.
+        baseline_total = baseline_now + max(0, tomorrow_feed - wheat_incoming)
+        desired_total = desired_now + max(
+            0, tomorrow_feed + tomorrow_delta - wheat_incoming
+        )
     return (
         desired_total - baseline_total,
         desired_total,
@@ -245,7 +247,9 @@ def build_tasks(
         age = day - tile["planted_day"]
         baseline = age in CROP_WATER_DAYS[(crop, fertilized)]
         desired = _maintenance.should_water(crop, age, fertilized, position)
-        if baseline and not desired:
+        if tile.get("consecutive_unwatered", 0) and not tile.get("watered_today"):
+            _ensure_current_water(tasks, position)
+        elif baseline and not desired:
             _remove_current_water(tasks, position)
         elif desired and not baseline:
             _ensure_current_water(tasks, position)
@@ -288,6 +292,13 @@ def build_tasks(
                 want_care=desired_care,
             )
 
+    # A missed action invalidates the minimum-care schedule's assumptions.
+    # Rescue the animal even when today was originally a planned rest day.
+    for position, target in targets.items():
+        tile = farm["tiles"][position[1]][position[0]]
+        if (target and isinstance(tile, dict) and tile.get("animal")
+                and tile.get("consecutive_unfed", 0) and not tile.get("fed_today")):
+            _ensure_cow_maintenance(tasks, position, tile, True, False)
     return tasks
 
 

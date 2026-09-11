@@ -154,6 +154,23 @@ def test_opening_live_animal_prioritizes_fertilizer_refinance():
     assert task.refinance_feed
 
 
+def test_day_five_fertilizer_is_cash_first_liquidation_work():
+    obs = make_obs(
+        day=4,
+        tiles={(0, 0): animal_tile("SHEEP", placed_day=0, fertilizer_available=True)},
+        shed={"WHEAT": 1},
+    )
+    obs["_liquidate_fertilizer_first"] = True
+    task = one_task(build_tasks(
+        obs,
+        {(0, 0): ("SHEEP", False)},
+        prioritize_fertilizer_drop=True,
+    ))
+    assert ["COLLECT_FERTILIZER"] in task.actions
+    assert task.immediate_drop
+    assert task.must_liquidate
+
+
 def test_live_animal_collects_fertilizer_in_addition_to_normal_feed():
     """Regression test: fed normally *and* has a fertilizer bonus sitting on
     the tile -- both are free money and must not be mutually exclusive.
@@ -309,6 +326,17 @@ def test_feed_wheat_order_covers_the_shortfall_for_live_animals():
     obs = make_obs(day=3, tiles={(0, 0): animal_tile("SHEEP", placed_day=0)}, shed={})
     orders = feed_wheat_order(obs, {(0, 0): ("SHEEP", False)}, [(0, 0)])
     assert orders == [["BUY_PRODUCT", "WHEAT", 2]]
+
+
+def test_intraday_feed_credits_ripe_wheat_only_against_future_reserve():
+    targets = {(0, 0): ("SHEEP", False), (1, 0): ("WHEAT", False)}
+    obs = make_obs(day=4, tiles={
+        (0, 0): animal_tile("SHEEP", placed_day=0),
+        (1, 0): plant("WHEAT", planted_day=0, day=4, yield_units=10),
+    })
+    assert feed_wheat_order(obs, targets, list(targets)) == [["BUY_PRODUCT", "WHEAT", 1]]
+    obs["private"]["shed"]["WHEAT"] = 1
+    assert feed_wheat_order(obs, targets, list(targets)) == []
 
 
 def test_feed_wheat_order_keeps_one_next_day_unit_after_covering_today():
@@ -487,3 +515,42 @@ def test_stale_target_never_digs_animal_structures():
         obs = make_obs(day=7, tiles={(0, 0): {"kind": "COOP"}},
                        seeds={"WHEAT": 1}, shed={"COW": 1, "WHEAT": 1})
         assert build_tasks(obs, {(0, 0): (name, False)}) == []
+
+
+def test_melon_opening_cuts_only_the_two_designated_wheat_tiles():
+    positions = [(0, 0), (1, 0), (2, 0)]
+    obs = make_obs(day=2, tiles={pos: plant("WHEAT", 0, 2, yield_units=2) for pos in positions})
+    obs["_opening_early_harvest_positions"] = set(positions[:2])
+    tasks = build_tasks(obs, {positions[0]: ("COW", False), positions[1]: None,
+                              positions[2]: ("WHEAT", False)})
+    harvested = {task.position for task in tasks if ["HARVEST"] in task.actions}
+    assert harvested == set(positions[:2])
+
+
+def test_harvest_replant_water_remains_one_scheduler_visit():
+    from agents.scheduler import _mandatory_actions
+    obs = make_obs(day=4, tiles={(0, 0): plant('WHEAT', 0, 4, 4)}, seeds={'WHEAT': 1})
+    task = one_task(build_tasks(obs, {(0, 0): ('WHEAT', False)}))
+    assert _mandatory_actions(task)[-3:] == [['HARVEST'], ['PLANT', 'WHEAT'], ['WATER']]
+
+
+def test_early_wheat_returns_to_shed_before_next_task():
+    from agents.scheduler import _task_queue
+    obs = make_obs(day=2, tiles={(0, 0): plant('WHEAT', 0, 2, 2)})
+    obs['_opening_early_harvest_positions'] = {(0, 0)}
+    tasks = build_tasks(obs, {(0, 0): None})
+    queue, end = _task_queue((0, 0), tasks, ((4, 4),))
+    assert queue[-1] == ['DROP']
+    assert end == (4, 4)
+
+
+def test_four_day_feed_top_up_after_opening_placements():
+    obs = make_obs(day=4, tiles={(0, 0): animal_tile('SHEEP', 0)}, shed={'WHEAT': 1})
+    assert feed_wheat_order(obs, {(0, 0): ('SHEEP', False)}, [(0, 0)]) == [['BUY_PRODUCT', 'WHEAT', 3]]
+
+
+def test_missed_water_is_rescued_on_scheduled_rest_day():
+    tile = plant('MELON', 0, 1, 0)
+    tile['consecutive_unwatered'] = 1
+    tasks = build_tasks(make_obs(1, {(0, 0): tile}), {(0, 0): ('MELON', False)})
+    assert any(['WATER'] in task.actions and task.urgent for task in tasks)

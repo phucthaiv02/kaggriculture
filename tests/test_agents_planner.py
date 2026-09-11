@@ -102,6 +102,29 @@ def test_plan_targets_diversifies_across_many_tiles_in_one_pass():
     assert names["WHEAT"] < len(targets), names
 
 
+def test_mirror_v2_keeps_each_accepted_rival_commitment(monkeypatch):
+    from agents import planner
+    from agents.forecast import Production
+
+    seen_external = []
+
+    def choose(market, _baseline, _candidates, _counts, _labor, _position):
+        seen_external.append(sum(
+            sum(units.values()) for units in market.external.sales.values()
+        ))
+        output = Production()
+        output.sales[4]["WHEAT"] = 4
+        return ("WHEAT", False), output
+
+    monkeypatch.setattr(planner, "_choose_daily_mirrored", choose)
+    positions = [(0, 0), (1, 0)]
+    plan_targets(
+        make_obs(day=0), {}, positions, end_day=29,
+        planner_version="mirror_v2",
+    )
+    assert seen_external == [0, 4]
+
+
 def test_plan_targets_does_not_touch_a_tile_mid_growth():
     """A WHEAT tile at age 2 of 4 is nowhere near finished -- its target must
     be left exactly as it was, not reconsidered every day."""
@@ -110,6 +133,14 @@ def test_plan_targets_does_not_touch_a_tile_mid_growth():
     targets = {(0, 0): ("WHEAT", False)}
     plan_targets(obs, targets, [(0, 0)], end_day=30)
     assert targets[(0, 0)] == ("WHEAT", False)
+
+
+def test_delivered_animal_keeps_target_until_it_is_placed():
+    obs = make_obs(day=5, tiles={(0, 0): {"kind": "PASTURE"}})
+    obs["private"]["shed"]["SHEEP"] = 1
+    targets = {(0, 0): ("SHEEP", False)}
+    plan_targets(obs, targets, [(0, 0)], end_day=29, planner_version="mirror_v2")
+    assert targets[(0, 0)] == ("SHEEP", False)
 
 
 def test_plan_targets_replans_a_finished_tile():

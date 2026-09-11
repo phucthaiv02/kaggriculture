@@ -33,7 +33,7 @@ Create a virtual environment and install Kaggriculture plus the test runner:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -U kaggle-environments pytest
+python -m pip install kaggle-environments==1.32.7 pytest
 ```
 
 Some standalone analysis scripts also use NumPy or Matplotlib:
@@ -62,6 +62,9 @@ Play the production agent and save an HTML replay plus JSON match data:
 ```bash
 # Passive opponent (default)
 python -m experiments.play_match
+
+# Four-day melon opening
+python -m experiments.play_match --opening melon_v2 --seed 1
 
 # Built-in random opponent
 python -m experiments.play_match --opponent random
@@ -101,3 +104,21 @@ Start with [`docs/README.md`](docs/README.md) for game mechanics, then see
 ## License
 
 See [`LICENSE`](LICENSE).
+
+## Opening versions
+
+Select the four-day melon opening with
+`make_agent(opening_version="melon_v2")` from `agents.expansion_agent`.
+The default `classic` opening remains available. Days below are one-indexed:
+
+- Day 1: plant 9 WHEAT and 12 MELON; place 2 COW and 2 SHEEP.
+- Day 2: collect fertilizer, return it to the shed for sale, buy feed, and feed animals.
+- Day 3: harvest two WHEAT tiles early, repeat fertilizer refinancing, and add one COW. Keep the second cleared tile empty.
+- Day 4: repeat fertilizer refinancing and add one SHEEP on the remaining tile.
+- Day 5: hand control to the planner before buying replacement seeds. The 7 mature WHEAT tiles are repriced against all producer types; only seeds for the resulting targets are bought. Existing live MELON and animals remain protected through their current cycles. Fertilizer sales fund same-day purchases; existing workers place the COW on Day 3 and the SHEEP on Day 4. No extra hands are hired to wait for these purchases.
+
+Select the mirrored-opponent planner with
+`make_agent(planner_version="mirror_v2")`. For every candidate it assumes the
+opponent starts one equivalent producer and sends both projected outputs
+through the market-price forecast. The original concentration planner remains
+available as `planner_version="concentration"` and is still the default.

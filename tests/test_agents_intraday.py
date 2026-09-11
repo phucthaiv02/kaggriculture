@@ -151,3 +151,59 @@ def test_hire_does_not_reuse_money_for_an_already_promised_seed():
     targets = {(4, 3): ("WHEAT", False), (5, 4): ("WHEAT", False)}
     _, hires = schedule_open_tiles(obs, targets, plans, SHED_ACCESS, [1, 2])
     assert hires == 0
+
+
+def test_idle_carrier_returns_and_drops_with_exact_remaining_budget():
+    from agents.intraday import schedule_idle_drops
+    obs = make_obs(day=8, inventories=[{'WHEAT': 4}])
+    obs['farms'][0]['farmer'] = [2, 4]
+    obs['hour'] = 21
+    plans = [WorkerPlan((2, 4), [])]
+    schedule_idle_drops(obs, plans, SHED_ACCESS)
+    assert plans[0].queue == [['EAST'], ['EAST'], ['DROP']]
+
+
+def test_idle_carrier_stays_when_drop_would_exceed_day():
+    from agents.intraday import schedule_idle_drops
+    obs = make_obs(day=8, inventories=[{'WHEAT': 4}])
+    obs['farms'][0]['farmer'] = [2, 4]
+    obs['hour'] = 22
+    plans = [WorkerPlan((2, 4), [])]
+    schedule_idle_drops(obs, plans, SHED_ACCESS)
+    assert plans[0].queue == []
+
+
+def test_carried_harvest_does_not_interrupt_remaining_work():
+    from agents.intraday import schedule_idle_drops
+    obs = make_obs(day=8, inventories=[{'MELON': 4}])
+    plans = [WorkerPlan((4, 4), [['WEST'], ['WATER']])]
+    schedule_idle_drops(obs, plans, SHED_ACCESS)
+    assert plans[0].queue == [['WEST'], ['WATER']]
+
+
+def test_idle_hand_at_shed_can_drop_on_last_step_without_empty_farmer_trip():
+    from agents.intraday import schedule_idle_drops
+    obs = make_obs(day=8, hands=[[5, 4]], inventories=[{}, {'CARROT': 3}])
+    obs['hour'] = 23
+    plans = [WorkerPlan((4, 4), []), WorkerPlan((5, 4), [])]
+    schedule_idle_drops(obs, plans, SHED_ACCESS)
+    assert plans[0].queue == []
+    assert plans[1].queue == [['DROP']]
+
+
+def test_commitments_exclude_water_that_has_slipped_past_dusk():
+    plans = [WorkerPlan((1, 0), [['WEST'], ['WATER']])]
+    assert (0, 0) in queue_commitments([(1, 0)], plans)[1]
+    assert (0, 0) not in queue_commitments([(1, 0)], plans, max_steps=1)[1]
+    assert (0, 0) in queue_commitments([(1, 0)], plans, max_steps=2)[1]
+
+
+def test_intraday_hires_fund_uncovered_water_after_refinance():
+    from agents.expansion_agent import _maintenance_hires
+    from test_agents_farm_tasks import plant
+    obs = make_obs(day=4, tiles={(0, 0): plant('MELON', 0, 4, 0)}, money=100)
+    plans = [WorkerPlan((4, 4), [['PASS']] * 22)]
+    targets = {(0, 0): ('MELON', False)}
+    assert _maintenance_hires(obs, targets, plans, SHED_ACCESS) == 1
+    obs['farms'][0]['money'] = 0
+    assert _maintenance_hires(obs, targets, plans, SHED_ACCESS) == 0

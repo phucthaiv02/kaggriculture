@@ -106,7 +106,7 @@ For a fuller example (and per-crop yield/cost details for Carrot, Tomato, Strawb
 Install the environment from PyPI (any recent release that includes Kaggriculture):
 
 ```bash
-pip install -U kaggle-environments
+pip install kaggle-environments==1.32.7
 ```
 
 Run a game from Python or a notebook — you can pass agent functions directly, or paths to `.py` files:
