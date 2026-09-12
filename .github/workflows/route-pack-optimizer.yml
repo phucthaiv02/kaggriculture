@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install kaggle-environments==1.32.7 pytest
-      - name: Apply route-sized expansion labor
+      - name: Apply minimum bridge labor
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -40,17 +40,31 @@ jobs:
           text = text.replace(state_old, state_new)
 
           detect_old = '''        if hour > 0 and any(position not in targets for position in _active_positions(farm)):\n            positions = _active_positions(farm)\n            state[\"opening_active\"] = opening_governs(obs, targets, positions)\n            plan_targets(\n                obs, targets,\n                positions if not state[\"opening_active\"] else [p for p in positions if p not in targets],\n                effective_end, planner_version,\n            )\n'''
-          detect_new = '''        if hour > 0 and any(position not in targets for position in _active_positions(farm)):\n            positions = _active_positions(farm)\n            # A successful mid-day land purchase creates a burst of profitable\n            # vacancies. Do not respond by buying a second wave of labor just\n            # to fill the new quadrant before dusk. schedule_open_tiles will\n            # admit the subset that today's already-real workforce can route;\n            # remaining targets wait for tomorrow's normal morning sizing.\n            state[\"intraday_expansion_day\"] = day\n            state[\"opening_active\"] = opening_governs(obs, targets, positions)\n            plan_targets(\n                obs, targets,\n                positions if not state[\"opening_active\"] else [p for p in positions if p not in targets],\n                effective_end, planner_version,\n            )\n'''
+          detect_new = '''        if hour > 0 and any(position not in targets for position in _active_positions(farm)):\n            positions = _active_positions(farm)\n            # New land bought after morning planning gets only the minimum\n            # bridge labor needed to start some production before dusk.\n            # Tomorrow's normal morning pass can size labor for the rest.\n            state[\"intraday_expansion_day\"] = day\n            state[\"opening_active\"] = opening_governs(obs, targets, positions)\n            plan_targets(\n                obs, targets,\n                positions if not state[\"opening_active\"] else [p for p in positions if p not in targets],\n                effective_end, planner_version,\n            )\n'''
           if detect_old not in text:
               raise SystemExit('land detection block not found')
           text = text.replace(detect_old, detect_new)
 
-          hires_old = '''        hire_costs = (\n            [_hire_costs(farm, count) for count in range(1, MAX_HANDS - len(farm[\"hands\"]) + 1)]\n            if hour >= 2 and not state[\"unverified_hand_indices\"]\n            and not (state[\"opening_active\"] and opening_version == \"melon_v2\" and day < 4) else []\n        )'''
-          hires_new = '''        hire_costs = (\n            [_hire_costs(farm, count) for count in range(1, MAX_HANDS - len(farm[\"hands\"]) + 1)]\n            if hour >= 2 and not state[\"unverified_hand_indices\"]\n            and state[\"intraday_expansion_day\"] != day\n            and not (state[\"opening_active\"] and opening_version == \"melon_v2\" and day < 4) else []\n        )'''
-          if hires_old not in text:
-              raise SystemExit('intraday hire-cost block not found')
-          text = text.replace(hires_old, hires_new)
+          call_old = '''        purchase_targets, expansion_hires = schedule_open_tiles(\n            obs, targets, state[\"plans\"], _open_shed_access(farm), hire_costs,\n        )'''
+          call_new = '''        purchase_targets, expansion_hires = schedule_open_tiles(\n            obs, targets, state[\"plans\"], _open_shed_access(farm), hire_costs,\n            minimum_new_production=state[\"intraday_expansion_day\"] == day,\n        )'''
+          if call_old not in text:
+              raise SystemExit('schedule_open_tiles call not found')
+          text = text.replace(call_old, call_new)
           agent.write_text(text)
+
+          intraday = Path('agents/intraday.py')
+          text = intraday.read_text()
+          sig_old = '''def schedule_open_tiles(obs, targets, plans, shed_access, hire_costs=()):'''
+          sig_new = '''def schedule_open_tiles(\n    obs, targets, plans, shed_access, hire_costs=(), minimum_new_production=False,\n):'''
+          if sig_old not in text:
+              raise SystemExit('schedule_open_tiles signature not found')
+          text = text.replace(sig_old, sig_new)
+
+          score_old = '''        score = len(funded) - len(unfitted)\n        if score > best_funded:\n            selected, hire_count, best_funded = candidate, count, score\n            rejected_funded = {id(task) for task in unfitted}\n            funded_positions = {task.position for task in funded if id(task) not in rejected_funded}\n        if not rejected:\n            break'''
+          score_new = '''        score = len(funded) - len(unfitted)\n        if score > best_funded:\n            selected, hire_count, best_funded = candidate, count, score\n            rejected_funded = {id(task) for task in unfitted}\n            funded_positions = {task.position for task in funded if id(task) not in rejected_funded}\n        if minimum_new_production and score > 0:\n            # Expansion bought mid-day needs a bridge, not a full new-shift\n            # buildout. Counts are tested from zero upward, so this is the\n            # cheapest workforce that can actually start new production now.\n            selected = {position: candidate[position] for position in funded_positions}\n            hire_count = count\n            break\n        if not rejected:\n            break'''
+          if score_old not in text:
+              raise SystemExit('funded-score block not found')
+          intraday.write_text(text.replace(score_old, score_new))
 
           tests = Path('tests/test_agents_opening_book.py')
           text = tests.read_text()
@@ -71,7 +85,7 @@ jobs:
             tests/test_agents_intraday.py \
             tests/test_agents_affordable_production.py \
             tests/test_agents_melon_opening.py
-      - name: Verify existing workforce fills new land
+      - name: Verify minimum bridge labor
         run: |
           PYTHONPATH=. python - <<'PY'
           from kaggle_environments import make
@@ -102,10 +116,10 @@ jobs:
           assert results['classic'][0] < 10, results['classic']
           print('classic_hands_saved_vs_old_floor=', 10 - results['classic'][0])
           PY
-      - name: Commit validated expansion sizing
+      - name: Commit validated bridge labor
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add agents/expansion_agent.py tests/test_agents_opening_book.py
-          git commit -m 'optimize: bound intraday expansion labor'
+          git add agents/expansion_agent.py agents/intraday.py tests/test_agents_opening_book.py
+          git commit -m 'optimize: hire minimum bridge labor for expansion'
           git push
