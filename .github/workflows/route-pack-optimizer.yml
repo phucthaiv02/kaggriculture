@@ -1,0 +1,62 @@
+name: Route pack optimizer
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/route-pack-optimizer.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install kaggle-environments==1.32.7 pytest
+      - name: Apply compact-route repair
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('agents/scheduler.py')
+          text = path.read_text()
+          text = text.replace(
+              'def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):',
+              'def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False, compact=False):',
+          )
+          old = '''                    time_sensitive = (\n                        task.urgent or task.animal_harvest\n                        or task.deadline is not None or task.immediate_drop\n                        or task.must_liquidate\n                    )\n                    cost = projected if time_sensitive else projected - lengths[worker]\n                    candidates.append((cost, projected, worker, insertion))'''
+          new = '''                    time_sensitive = (\n                        task.urgent or task.animal_harvest\n                        or task.deadline is not None or task.immediate_drop\n                        or task.must_liquidate\n                    )\n                    # Normal scheduling balances deadline-sensitive work across\n                    # workers.  When that layout cannot fit the day, a compact\n                    # repair pass instead minimizes the *extra* route length of\n                    # each insertion, clustering nearby work before paying for\n                    # another Fibonacci-priced hand.\n                    cost = (\n                        projected - lengths[worker]\n                        if compact\n                        else projected if time_sensitive\n                        else projected - lengths[worker]\n                    )\n                    candidates.append((cost, projected, worker, insertion))'''
+          if old not in text:
+              raise SystemExit('cost block not found')
+          text = text.replace(old, new)
+
+          old_pack = '''def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n    \"\"\"Pack mandatory work, retrying a harder-first layout before adding labor.\"\"\"\n    buckets, unassigned = _pack_once(\n        tasks, worker_starts, budgets, shed_access, hard_first=False\n    )\n    if not unassigned or len(worker_starts) <= 1:\n        return buckets, unassigned\n\n    compact_buckets, compact_unassigned = _pack_once(\n        tasks, worker_starts, budgets, shed_access, hard_first=True\n    )\n    if len(compact_unassigned) < len(unassigned):\n        return compact_buckets, compact_unassigned\n    return buckets, unassigned\n'''
+          new_pack = '''def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n    \"\"\"Pack mandatory work, then repair a failed layout before adding labor.\n\n    The historical balanced pass remains authoritative whenever it already\n    fits.  Only a failed worker count triggers alternatives: harder-first\n    ordering, then marginal-route clustering.  This preserves deadline spread\n    on normal days while recovering cases where greedy balancing scatters a\n    geographic cluster and falsely asks ``hands_needed`` for another hand.\n    \"\"\"\n    best_buckets, best_unassigned = _pack_once(\n        tasks, worker_starts, budgets, shed_access, hard_first=False\n    )\n    if not best_unassigned or len(worker_starts) <= 1:\n        return best_buckets, best_unassigned\n\n    for hard_first, compact in ((True, False), (False, True), (True, True)):\n        buckets, unassigned = _pack_once(\n            tasks, worker_starts, budgets, shed_access,\n            hard_first=hard_first, compact=compact,\n        )\n        if len(unassigned) < len(best_unassigned):\n            best_buckets, best_unassigned = buckets, unassigned\n        if not best_unassigned:\n            break\n    return best_buckets, best_unassigned\n'''
+          if old_pack not in text:
+              raise SystemExit('pack block not found')
+          path.write_text(text.replace(old_pack, new_pack))
+
+          test_path = Path('tests/test_agents_scheduler.py')
+          tests = test_path.read_text()
+          marker = 'test_compact_route_repair_avoids_an_extra_hand'
+          if marker not in tests:
+              tests += '''\n\ndef test_compact_route_repair_avoids_an_extra_hand():\n    \"\"\"Balanced urgent routing can scatter a cluster across workers.\n\n    This workload fits the farmer plus one hand when insertions are charged by\n    marginal route growth.  The old balanced-only repair required two hands.\n    \"\"\"\n    tasks = [\n        Task((4, 0), [[\"WATER\"]] * 4),\n        Task((2, 3), [[\"WATER\"]] * 2, urgent=True),\n        Task((4, 4), [[\"WATER\"]] * 4),\n        Task((4, 3), [[\"WATER\"]] * 2),\n        Task((3, 1), [[\"WATER\"]] * 2),\n        Task((0, 0), [[\"WATER\"]], urgent=True),\n        Task((2, 0), [[\"WATER\"]] * 2, urgent=True),\n        Task((1, 0), [[\"WATER\"]] * 2, urgent=True),\n    ]\n    count, dropped = hands_needed(tasks, farmer_start=SHED)\n    assert dropped == []\n    assert count == 1\n\n    plans, unassigned = build_queues(tasks, farmer_start=SHED, hand_count=count)\n    assert unassigned == []\n    assert all(len(plan.queue) <= HAND_BUDGET for plan in plans)\n'''
+              test_path.write_text(tests)
+          PY
+      - name: Focused scheduler regressions
+        run: |
+          pytest -q \
+            tests/test_agents_scheduler.py \
+            tests/test_agents_capacity_guard.py \
+            tests/test_agents_opening_cash_priority.py \
+            tests/test_agents_opening_book.py \
+            tests/test_survival_debt_regression.py \
+            tests/test_agents_intraday.py
+      - name: Commit validated optimizer
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add agents/scheduler.py tests/test_agents_scheduler.py
+          git commit -m 'optimize: compact failed route packs'
+          git push
