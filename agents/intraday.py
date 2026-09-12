@@ -118,7 +118,9 @@ def schedule_idle_drops(obs, plans, shed_access):
             plans[index].queue.extend(home)
 
 
-def schedule_open_tiles(obs, targets, plans, shed_access, hire_costs=()):
+def schedule_open_tiles(
+    obs, targets, plans, shed_access, hire_costs=(), minimum_new_production=False,
+):
     """Append feasible work, replant in place first, and limit input shopping.
 
     Return (targets eligible for purchases, additional hire count). Occupied tiles keep
@@ -229,8 +231,17 @@ def schedule_open_tiles(obs, targets, plans, shed_access, hire_costs=()):
             selected, hire_count, best_funded = candidate, count, score
             rejected_funded = {id(task) for task in unfitted}
             funded_positions = {task.position for task in funded if id(task) not in rejected_funded}
+        if minimum_new_production and score > 0:
+            # Counts are considered from zero upward. Stop at the first
+            # workforce that can fund and route at least one new producer,
+            # and purchase only inputs for production that actually fits.
+            selected = {position: candidate[position] for position in funded_positions}
+            hire_count = count
+            break
         if not rejected:
             break
+    if minimum_new_production and best_funded <= 0:
+        selected, hire_count = {}, 0
     eligible.update(selected)
 
     # `selected`/`funded_positions` above is purchase intent only. A seed

@@ -179,18 +179,19 @@ def test_day_seven_does_not_buy_twice():
     )
 
 
-def test_land_waits_for_liquidation_and_cash():
+def test_land_buys_once_funded_without_waiting_for_all_liquidation():
     from agents.expansion_agent import _land_orders
     obs = make_obs(6)
     farm = obs["farms"][0]
-    farm["money"] = 100000
-    obs["private"] = {"shed": {"WHEAT": 100, "MILK": 1}, "inventories": [{}]}
-    assert _land_orders(obs, farm) == []
-    obs["private"]["shed"].pop("MILK")
-    obs["private"]["inventories"] = [{"FERTILIZER": 1}]
-    assert _land_orders(obs, farm) == []
-    obs["private"]["inventories"] = [{}]
+    obs["private"] = {
+        "shed": {"WHEAT": 100, "MILK": 1},
+        "inventories": [{"FERTILIZER": 1}],
+    }
+    farm["money"] = 1000
     assert _land_orders(obs, farm) == [["BUY_LAND"]]
+    obs["market"] = {"inventory": {"FERTILIZER": 10000}, "params": None}
+    farm["money"] = 900
+    assert _land_orders(obs, farm, [["SELL", "FERTILIZER", 2]]) == [["BUY_LAND"]]
     farm["money"] = 0
     assert _land_orders(obs, farm) == []
 

@@ -79,19 +79,18 @@ def _investment_sales(obs, reservations, selling_state, targets, hires):
 
 
 def _land_orders(obs, farm, pending_sales=()):
+    """Buy scheduled land as soon as real cash can fund it.
+
+    Goods still carried by workers remain future revenue, but they are not a
+    prerequisite for an already-funded expansion. SELL orders earlier in this
+    same market pass may finish funding the purchase; unsold inventory does not
+    count as imaginary cash.
+    """
     if not should_buy_land_on_schedule(obs, farm):
-        return []
-    shed = Counter(obs["private"]["shed"])
-    sales = [order for order in pending_sales if order[0] == "SELL"]
-    for _op, item, quantity in sales:
-        shed[item] = max(0, shed.get(item, 0) - int(quantity))
-    carried = obs["private"].get("inventories", [])
-    if any(inv.get(item, 0) > 0 for inv in carried for item in SELLABLE if item != "WHEAT"):
-        return []
-    if any(shed.get(item, 0) > 0 for item in SELLABLE if item != "WHEAT"):
         return []
     price = LAND_PRICES[len(farm["unlocked_quadrants"]) - 1]
     cash = farm["money"]
+    sales = [order for order in pending_sales if order[0] == "SELL"]
     if cash < price and sales:
         cash += _sale_revenue(obs, sales)
     return [["BUY_LAND"]] if cash >= price else []
@@ -343,6 +342,9 @@ def make_agent(
         "unverified_hand_indices": set(),
         "deferred_expansion_positions": set(),
         "protective_debt_positions": set(),
+        "intraday_expansion_day": -1,
+        "intraday_expansion_positions": set(),
+        "intraday_bridge_complete_day": -1,
     }
     opening_governs = make_opening_controller(opening_version)
     selling_state = {}
@@ -659,6 +661,13 @@ def make_agent(
         # mid-day or after the opening has already handed off.
         if hour > 0 and any(position not in targets for position in _active_positions(farm)):
             positions = _active_positions(farm)
+            new_positions = {position for position in positions if position not in targets}
+            if state["intraday_expansion_day"] != day:
+                state["intraday_expansion_day"] = day
+                state["intraday_expansion_positions"] = set(new_positions)
+                state["intraday_bridge_complete_day"] = -1
+            else:
+                state["intraday_expansion_positions"].update(new_positions)
             state["opening_active"] = opening_governs(obs, targets, positions)
             plan_targets(
                 obs, targets,
@@ -774,8 +783,6 @@ def make_agent(
                 shed_access,
                 pending_hand_budget=22,
             )
-            if should_buy_land_on_schedule(obs, farm):
-                hand_count = max(hand_count, 10)
             missing_hands = max(0, hand_count - len(existing_hands))
             affordable_hands = _affordable_hires(
                 farm, missing_hands, farm["money"]
@@ -849,9 +856,24 @@ def make_agent(
             if hour >= 2 and not state["unverified_hand_indices"]
             and not (state["opening_active"] and opening_version == "melon_v2" and day < 4) else []
         )
-        purchase_targets, expansion_hires = schedule_open_tiles(
-            obs, targets, state["plans"], _open_shed_access(farm), hire_costs,
+        bridge_pending = (
+            state["intraday_expansion_day"] == day
+            and state["intraday_bridge_complete_day"] != day
         )
+        expansion_hire_costs = (
+            hire_costs
+            if state["intraday_expansion_day"] != day or bridge_pending
+            else []
+        )
+        purchase_targets, expansion_hires = schedule_open_tiles(
+            obs, targets, state["plans"], _open_shed_access(farm),
+            expansion_hire_costs, minimum_new_production=bridge_pending,
+        )
+        if bridge_pending and any(
+            position in purchase_targets
+            for position in state["intraday_expansion_positions"]
+        ):
+            state["intraday_bridge_complete_day"] = day
         if state["opening_active"] and opening_version == "melon_v2":
             # Scheduled animals remain purchase commitments while workers
             # finish real maintenance; do not drop demand just because their
