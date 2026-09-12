@@ -4,7 +4,7 @@ on:
     branches: [feat/planner-capacity-v4]
     paths: [.github/workflows/route-pack-optimizer.yml]
 permissions:
-  contents: write
+  contents: read
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -14,57 +14,55 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install kaggle-environments==1.32.7 pytest
-      - name: Remove forced expansion workforce
+      - name: Measure day-seven workforce threshold
         run: |
           python - <<'PY'
           from pathlib import Path
+          import subprocess, sys
+
           path = Path('agents/expansion_agent.py')
-          text = path.read_text()
-          old = '''            if should_buy_land_on_schedule(obs, farm):\n                hand_count = max(hand_count, 10)\n'''
-          if old not in text:
+          original = path.read_text()
+          needle = '            if should_buy_land_on_schedule(obs, farm):\n                hand_count = max(hand_count, 10)\n'
+          if needle not in original:
               raise SystemExit('forced hand floor not found')
-          path.write_text(text.replace(old, ''))
-          PY
-      - name: Verify day-seven expansion still completes
-        run: |
-          PYTHONPATH=. pytest -q \
-            tests/test_agents_opening_book.py::test_day_seven_expands_and_starts_new_production \
-            tests/test_agents_scheduler.py \
-            tests/test_agents_capacity_guard.py \
-            tests/test_survival_debt_regression.py
-      - name: Trace day-seven labor
-        run: |
-          PYTHONPATH=. python - <<'PY'
+
+          script = r'''
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
+          import sys
+          version = sys.argv[1]
+          env = make('kaggriculture', configuration={
+              'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 169,
+          }, debug=False)
+          agent = make_agent(opening_version=version)
+          env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
+          day6 = [frame[0] for frame in env.steps if frame[0].observation.day == 6]
+          max_hands = max(len(frame.observation.farms[0].hands) for frame in day6)
+          buy_hours = [
+              frame.observation.hour for frame in day6
+              if any(order and order[0] == 'BUY_LAND' for order in (frame.action or {}).get('market', []))
+          ]
+          final = env.steps[-1][0].observation.farms[0]
+          ne_prod = sum(
+              isinstance(final.tiles[y][x], dict)
+              and bool(final.tiles[y][x].get('crop') or final.tiles[y][x].get('animal'))
+              for y in range(5) for x in range(5, 10)
+          )
+          print(version, 'max_hands', max_hands, 'buy_hours', buy_hours, 'ne_prod', ne_prod)
+          '''
 
-          for version in ('classic', 'melon_v2'):
-              env = make('kaggriculture', configuration={
-                  'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 169,
-              }, debug=False)
-              agent = make_agent(opening_version=version)
-              env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
-              day6 = [frame[0] for frame in env.steps if frame[0].observation.day == 6]
-              max_hands = max(len(frame.observation.farms[0].hands) for frame in day6)
-              buy_hours = [
-                  frame.observation.hour for frame in day6
-                  if any(order and order[0] == 'BUY_LAND' for order in (frame.action or {}).get('market', []))
-              ]
-              final = env.steps[-1][0].observation.farms[0]
-              ne_prod = sum(
-                  isinstance(final.tiles[y][x], dict)
-                  and bool(final.tiles[y][x].get('crop') or final.tiles[y][x].get('animal'))
-                  for y in range(5) for x in range(5, 10)
+          for floor in (0, 6, 7, 8, 9, 10):
+              replacement = '' if floor == 0 else (
+                  '            if should_buy_land_on_schedule(obs, farm):\n'
+                  f'                hand_count = max(hand_count, {floor})\n'
               )
-              print(version, 'max_day7_hands=', max_hands, 'buy_hours=', buy_hours, 'ne_prod=', ne_prod)
-              assert max_hands < 10
-              assert buy_hours
-              assert ne_prod > 0
+              path.write_text(original.replace(needle, replacement))
+              print('=== FLOOR', floor, '===', flush=True)
+              for version in ('classic', 'melon_v2'):
+                  subprocess.run(
+                      [sys.executable, '-c', script, version],
+                      check=True,
+                      env={**__import__('os').environ, 'PYTHONPATH': '.'},
+                  )
+          path.write_text(original)
           PY
-      - name: Commit if validated
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add agents/expansion_agent.py
-          git commit -m 'optimize: let route capacity size expansion labor'
-          git push
