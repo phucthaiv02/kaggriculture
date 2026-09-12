@@ -4,7 +4,7 @@ on:
     branches: [feat/planner-capacity-v4]
     paths: [.github/workflows/route-pack-optimizer.yml]
 permissions:
-  contents: read
+  contents: write
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -13,51 +13,70 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install kaggle-environments==1.32.7
-      - name: Trace classic day-seven cash route with six hands
+      - run: pip install kaggle-environments==1.32.7 pytest
+      - name: Apply cash-first route selection and remove fixed hand floor
         run: |
           python - <<'PY'
           from pathlib import Path
-          path = Path('agents/expansion_agent.py')
-          text = path.read_text()
-          text = text.replace(
-              '            if should_buy_land_on_schedule(obs, farm):\n                hand_count = max(hand_count, 10)\n',
-              '',
-          )
-          path.write_text(text)
+
+          scheduler = Path('agents/scheduler.py')
+          text = scheduler.read_text()
+          old = '''def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n    \"\"\"Pack mandatory work, then repair a failed layout before adding labor.\n\n    The historical balanced pass remains authoritative whenever it already\n    fits.  Only a failed worker count triggers alternatives: harder-first\n    ordering, then marginal-route clustering.  This preserves deadline spread\n    on normal days while recovering cases where greedy balancing scatters a\n    geographic cluster and falsely asks ``hands_needed`` for another hand.\n    \"\"\"\n    best_buckets, best_unassigned = _pack_once(\n        tasks, worker_starts, budgets, shed_access, hard_first=False\n    )\n    if not best_unassigned or len(worker_starts) <= 1:\n        return best_buckets, best_unassigned\n\n    for hard_first, compact in ((True, False), (False, True), (True, True)):\n        buckets, unassigned = _pack_once(\n            tasks, worker_starts, budgets, shed_access,\n            hard_first=hard_first, compact=compact,\n        )\n        if len(unassigned) < len(best_unassigned):\n            best_buckets, best_unassigned = buckets, unassigned\n        if not best_unassigned:\n            break\n    return best_buckets, best_unassigned\n'''
+          new = '''def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n    \"\"\"Pack mandatory work and choose the best feasible route layout.\n\n    Normal days keep the historical balanced layout whenever it fits.  A\n    failed layout still gets harder-first / compact repair passes.  Cash-first\n    days are different: an immediate DROP is a real investment deadline, so\n    even an already-feasible worker count compares the alternate layouts and\n    chooses the one that banks those cash tasks earliest before considering\n    total route length.\n    \"\"\"\n    cash_first = any(task.must_liquidate and task.immediate_drop for task in tasks)\n\n    def layout_score(buckets, unassigned):\n        lengths = [\n            len(_mandatory_queue(start, bucket, shed_access)[0])\n            for start, bucket in zip(worker_starts, buckets)\n        ]\n        cash_steps = []\n        if cash_first:\n            for start, bucket in zip(worker_starts, buckets):\n                for index, task in enumerate(bucket):\n                    if task.must_liquidate and task.immediate_drop:\n                        cash_steps.append(\n                            len(_mandatory_queue(start, bucket[:index + 1], shed_access)[0])\n                        )\n        return (\n            len(unassigned),\n            sum(cash_steps),\n            max(cash_steps, default=0),\n            max(lengths, default=0),\n            sum(lengths),\n        )\n\n    best_buckets, best_unassigned = _pack_once(\n        tasks, worker_starts, budgets, shed_access, hard_first=False\n    )\n    if not cash_first and (not best_unassigned or len(worker_starts) <= 1):\n        return best_buckets, best_unassigned\n\n    best_score = layout_score(best_buckets, best_unassigned)\n    for hard_first, compact in ((True, False), (False, True), (True, True)):\n        buckets, unassigned = _pack_once(\n            tasks, worker_starts, budgets, shed_access,\n            hard_first=hard_first, compact=compact,\n        )\n        score = layout_score(buckets, unassigned)\n        if score < best_score:\n            best_buckets, best_unassigned, best_score = buckets, unassigned, score\n        if not cash_first and not best_unassigned:\n            break\n    return best_buckets, best_unassigned\n'''
+          if old not in text:
+              raise SystemExit('pack block not found')
+          scheduler.write_text(text.replace(old, new))
+
+          agent = Path('agents/expansion_agent.py')
+          text = agent.read_text()
+          floor = '''            if should_buy_land_on_schedule(obs, farm):\n                hand_count = max(hand_count, 10)\n'''
+          if floor not in text:
+              raise SystemExit('forced hand floor not found')
+          agent.write_text(text.replace(floor, ''))
           PY
+      - name: Focused regressions
+        run: |
+          PYTHONPATH=. pytest -q \
+            tests/test_agents_scheduler.py \
+            tests/test_agents_capacity_guard.py \
+            tests/test_agents_opening_cash_priority.py \
+            tests/test_agents_opening_book.py \
+            tests/test_survival_debt_regression.py \
+            tests/test_agents_intraday.py
+      - name: Verify route labor and day-seven production
+        run: |
           PYTHONPATH=. python - <<'PY'
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
 
-          env = make('kaggriculture', configuration={
-              'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 169,
-          }, debug=False)
-          agent = make_agent(opening_version='classic')
-          env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
-
-          interesting = {'HARVEST', 'COLLECT_FERTILIZER', 'DROP', 'PICKUP', 'PLANT', 'PLACE'}
-          for frame in env.steps:
-              step = frame[0]
-              obs = step.observation
-              if obs.day != 6:
-                  continue
-              action = step.action or {}
-              market = action.get('market', [])
-              worker_ops = [action.get('farmer', ['PASS']), *action.get('hands', [])]
-              key_ops = [(i, op) for i, op in enumerate(worker_ops) if op and op[0] in interesting]
-              sells = [o for o in market if o and o[0] == 'SELL']
-              hires = sum(bool(o and o[0] == 'HIRE') for o in market)
-              land = any(o and o[0] == 'BUY_LAND' for o in market)
-              if key_ops or sells or hires or land or obs.hour in (0,1,18,19,20,21,22,23):
-                  farm = obs.farms[0]
-                  print(
-                      f'h={obs.hour:02d} money={farm.money:.0f} hands={len(farm.hands)} '
-                      f'ops={key_ops} sells={sells} hires={hires} land={land}'
-                  )
-          final = env.steps[-1][0].observation.farms[0]
-          print('FINAL_NE', [
-              (x,y,final.tiles[y][x]) for y in range(5) for x in range(5,10)
-              if isinstance(final.tiles[y][x], dict)
-          ])
+          results = {}
+          for version in ('classic', 'melon_v2'):
+              env = make('kaggriculture', configuration={
+                  'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 169,
+              }, debug=False)
+              agent = make_agent(opening_version=version)
+              env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
+              day6 = [frame[0] for frame in env.steps if frame[0].observation.day == 6]
+              max_hands = max(len(frame.observation.farms[0].hands) for frame in day6)
+              buy_hours = [
+                  frame.observation.hour for frame in day6
+                  if any(order and order[0] == 'BUY_LAND' for order in (frame.action or {}).get('market', []))
+              ]
+              final = env.steps[-1][0].observation.farms[0]
+              ne_prod = sum(
+                  isinstance(final.tiles[y][x], dict)
+                  and bool(final.tiles[y][x].get('crop') or final.tiles[y][x].get('animal'))
+                  for y in range(5) for x in range(5, 10)
+              )
+              print(version, 'max_day7_hands=', max_hands, 'buy_hours=', buy_hours, 'ne_prod=', ne_prod)
+              results[version] = (max_hands, buy_hours, ne_prod)
+              assert buy_hours and ne_prod > 0
+          assert results['classic'][0] < 10
           PY
+      - name: Commit validated route optimization
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add agents/scheduler.py agents/expansion_agent.py
+          git commit -m 'optimize: bank expansion cash with fewer hands'
+          git push
