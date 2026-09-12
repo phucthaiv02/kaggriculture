@@ -46,7 +46,7 @@ jobs:
           PY
       - name: Focused scheduler regressions
         run: |
-          pytest -q \
+          PYTHONPATH=. pytest -q \
             tests/test_agents_scheduler.py \
             tests/test_agents_capacity_guard.py \
             tests/test_agents_opening_cash_priority.py \
