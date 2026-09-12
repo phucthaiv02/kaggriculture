@@ -204,7 +204,7 @@ def _task_priority(task):
     )
 
 
-def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False, compact=False):
+def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):
     """Greedy exact-route pack for one task ordering.
 
     The normal ordering preserves the historical near-first behavior.  The
@@ -270,17 +270,7 @@ def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False, com
                         or task.deadline is not None or task.immediate_drop
                         or task.must_liquidate
                     )
-                    # Normal scheduling balances deadline-sensitive work across
-                    # workers.  When that layout cannot fit the day, a compact
-                    # repair pass instead minimizes the *extra* route length of
-                    # each insertion, clustering nearby work before paying for
-                    # another Fibonacci-priced hand.
-                    cost = (
-                        projected - lengths[worker]
-                        if compact
-                        else projected if time_sensitive
-                        else projected - lengths[worker]
-                    )
+                    cost = projected if time_sensitive else projected - lengths[worker]
                     candidates.append((cost, projected, worker, insertion))
         candidates.sort()
         for _, projected, worker, insertion in candidates:
@@ -292,28 +282,126 @@ def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False, com
     return buckets, unassigned
 
 
-def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
-    """Pack mandatory work, then repair a failed layout before adding labor.
+def _insert_task(bucket, task, start, budget, shed_access):
+    """Best feasible insertion without changing task-priority semantics."""
+    base = len(_mandatory_queue(start, bucket, shed_access)[0])
+    time_sensitive = (
+        task.urgent or task.animal_harvest
+        or task.deadline is not None or task.immediate_drop
+        or task.must_liquidate
+    )
+    choices = []
+    for insertion in range(len(bucket) + 1):
+        candidate = bucket[:insertion] + [task] + bucket[insertion:]
+        if any(
+            _task_priority(candidate[index]) > _task_priority(candidate[index + 1])
+            for index in range(len(candidate) - 1)
+        ):
+            continue
+        projected = len(_mandatory_queue(start, candidate, shed_access)[0])
+        if projected <= budget:
+            cost = projected if time_sensitive else projected - base
+            choices.append((cost, projected, insertion, candidate))
+    if not choices:
+        return None
+    return min(choices, key=lambda item: item[:3])
 
-    The historical balanced pass remains authoritative whenever it already
-    fits.  Only a failed worker count triggers alternatives: harder-first
-    ordering, then marginal-route clustering.  This preserves deadline spread
-    on normal days while recovering cases where greedy balancing scatters a
-    geographic cluster and falsely asks ``hands_needed`` for another hand.
+
+def _repair_single_swaps(buckets, unassigned, worker_starts, budgets, shed_access):
+    """Backtrack one greedy assignment before requesting another hand.
+
+    A failed greedy pack can be a fragmentation artifact: the pending task may
+    fit if one already-assigned task moves to another worker. Try exactly that
+    one-task exchange while preserving every priority/deadline rule. This does
+    not compact urgent work or alter an already-feasible layout.
     """
-    best_buckets, best_unassigned = _pack_once(
-        tasks, worker_starts, budgets, shed_access, hard_first=False
+    buckets = [list(bucket) for bucket in buckets]
+    remaining = list(unassigned)
+    changed = True
+    while changed and remaining:
+        changed = False
+        retry = []
+        for task in remaining:
+            direct = []
+            for worker, bucket in enumerate(buckets):
+                if task.pinned_worker is not None and worker != task.pinned_worker:
+                    continue
+                choice = _insert_task(
+                    bucket, task, worker_starts[worker], budgets[worker], shed_access
+                )
+                if choice is not None:
+                    direct.append((*choice[:3], worker, choice[3]))
+            if direct:
+                _, _, _, worker, candidate = min(direct, key=lambda item: item[:4])
+                buckets[worker] = candidate
+                changed = True
+                continue
+
+            exchanges = []
+            for source, bucket in enumerate(buckets):
+                if task.pinned_worker is not None and source != task.pinned_worker:
+                    continue
+                for victim_index, victim in enumerate(bucket):
+                    if victim.pinned_worker is not None:
+                        continue
+                    reduced = bucket[:victim_index] + bucket[victim_index + 1:]
+                    incoming = _insert_task(
+                        reduced, task, worker_starts[source], budgets[source], shed_access
+                    )
+                    if incoming is None:
+                        continue
+                    for destination, other in enumerate(buckets):
+                        if destination == source:
+                            continue
+                        moved = _insert_task(
+                            other, victim, worker_starts[destination], budgets[destination], shed_access
+                        )
+                        if moved is None:
+                            continue
+                        score = (
+                            max(incoming[1], moved[1]),
+                            incoming[1] + moved[1],
+                            source, destination, victim_index,
+                        )
+                        exchanges.append((
+                            score, source, destination, incoming[3], moved[3]
+                        ))
+            if exchanges:
+                _, source, destination, source_bucket, destination_bucket = min(
+                    exchanges, key=lambda item: item[0]
+                )
+                buckets[source] = source_bucket
+                buckets[destination] = destination_bucket
+                changed = True
+            else:
+                retry.append(task)
+        remaining = retry
+    return buckets, remaining
+
+
+def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
+    """Pack mandatory work, then repair one greedy assignment if needed."""
+    candidates = []
+    for hard_first in (False, True):
+        buckets, unassigned = _pack_once(
+            tasks, worker_starts, budgets, shed_access, hard_first=hard_first
+        )
+        candidates.append((buckets, unassigned))
+        if not unassigned and not hard_first:
+            return buckets, unassigned
+
+    best_buckets, best_unassigned = min(
+        candidates, key=lambda item: len(item[1])
     )
     if not best_unassigned or len(worker_starts) <= 1:
         return best_buckets, best_unassigned
 
-    for hard_first, compact in ((True, False), (False, True), (True, True)):
-        buckets, unassigned = _pack_once(
-            tasks, worker_starts, budgets, shed_access,
-            hard_first=hard_first, compact=compact,
+    for buckets, unassigned in candidates:
+        repaired, remaining = _repair_single_swaps(
+            buckets, unassigned, worker_starts, budgets, shed_access
         )
-        if len(unassigned) < len(best_unassigned):
-            best_buckets, best_unassigned = buckets, unassigned
+        if len(remaining) < len(best_unassigned):
+            best_buckets, best_unassigned = repaired, remaining
         if not best_unassigned:
             break
     return best_buckets, best_unassigned

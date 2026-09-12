@@ -375,25 +375,32 @@ if __name__ == "__main__":
     sys.exit(1 if failures else 0)
 
 
-def test_compact_route_repair_avoids_an_extra_hand():
-    """Balanced urgent routing can scatter a cluster across workers.
-
-    This workload fits the farmer plus one hand when insertions are charged by
-    marginal route growth.  The old balanced-only repair required two hands.
-    """
+def test_single_swap_route_repair_reduces_required_hands():
+    """One-task backtracking avoids two hires on a fragmented route set."""
     tasks = [
-        Task((4, 0), [["WATER"]] * 4),
-        Task((2, 3), [["WATER"]] * 2, urgent=True),
-        Task((4, 4), [["WATER"]] * 4),
-        Task((4, 3), [["WATER"]] * 2),
-        Task((3, 1), [["WATER"]] * 2),
-        Task((0, 0), [["WATER"]], urgent=True),
-        Task((2, 0), [["WATER"]] * 2, urgent=True),
-        Task((1, 0), [["WATER"]] * 2, urgent=True),
+        Task((5, 2), [["WATER"]]),
+        Task((3, 8), [["WATER"]] * 4, urgent=True),
+        Task((5, 0), [["WATER"]], urgent=True),
+        Task((3, 6), [["WATER"]] * 4, urgent=True),
+        Task((2, 2), [["WATER"]] * 5, urgent=True),
+        Task((6, 6), [["WATER"]], urgent=True),
+        Task((3, 3), [["WATER"]] * 3, urgent=True),
+        Task((3, 6), [["WATER"]] * 5, urgent=True),
+        Task((1, 9), [["WATER"]] * 5),
+        Task((9, 8), [["WATER"]] * 3, urgent=True),
+        Task((1, 5), [["WATER"]] * 3, urgent=True),
+        Task((8, 8), [["WATER"]] * 2),
+        Task((7, 0), [["WATER"]] * 3),
+        Task((9, 6), [["WATER"]] * 2, urgent=True),
+        Task((6, 3), [["WATER"]]),
+        Task((7, 1), [["WATER"]] * 5),
+        Task((6, 2), [["WATER"]] * 5),
+        Task((5, 4), [["WATER"]] * 4),
+        Task((4, 1), [["WATER"]] * 2, urgent=True),
     ]
     count, dropped = hands_needed(tasks, farmer_start=SHED)
     assert dropped == []
-    assert count == 1
+    assert count == 4
 
     plans, unassigned = build_queues(tasks, farmer_start=SHED, hand_count=count)
     assert unassigned == []
