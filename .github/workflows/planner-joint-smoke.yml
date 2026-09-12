@@ -1,0 +1,100 @@
+name: Planner joint allocation smoke
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/planner-joint-smoke.yml]
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install kaggle-environments==1.32.7 pytest
+      - name: Baseline melon v2
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          import json
+          from collections import Counter
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+
+          env = make('kaggriculture', configuration={
+              'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 192,
+          }, debug=False)
+          agent = make_agent(opening_version='melon_v2')
+          env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
+          day_hands = {}
+          for frame in env.steps:
+              obs = frame[0].observation
+              day_hands[obs.day] = max(day_hands.get(obs.day, 0), len(obs.farms[0].hands))
+          final = env.steps[-1][0].observation.farms[0]
+          kinds = Counter()
+          for row in final.tiles:
+              for tile in row:
+                  if isinstance(tile, dict):
+                      name = tile.get('animal') or tile.get('crop')
+                      if name:
+                          kinds[name] += 1
+          result = {
+              'money': final.money,
+              'hand_days': sum(day_hands.get(day, 0) for day in range(6, max(day_hands)+1)),
+              'kinds': dict(kinds),
+          }
+          print('SMOKE_BASELINE', result)
+          with open('/tmp/smoke_base.json', 'w') as f:
+              json.dump(result, f)
+          PY
+      - name: Apply exact joint-planner candidate
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          source = Path('.github/workflows/planner-joint-allocation.yml').read_text()
+          section = source.split('      - name: Apply joint planner allocation\n', 1)[1]
+          body = section.split('      - name: Planner regressions\n', 1)[0]
+          script = body.split("          python - <<'PY'\n", 1)[1].rsplit('          PY\n', 1)[0]
+          exec(textwrap.dedent(script), {})
+          PY
+      - name: Focused planner tests
+        run: PYTHONPATH=. pytest -q tests/test_agents_planner.py tests/test_agents_labor.py tests/test_agents_melon_opening.py
+      - name: Candidate melon v2
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          import json
+          from collections import Counter
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+
+          with open('/tmp/smoke_base.json') as f:
+              base = json.load(f)
+          env = make('kaggriculture', configuration={
+              'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 192,
+          }, debug=False)
+          agent = make_agent(opening_version='melon_v2')
+          env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
+          day_hands = {}
+          for frame in env.steps:
+              obs = frame[0].observation
+              day_hands[obs.day] = max(day_hands.get(obs.day, 0), len(obs.farms[0].hands))
+          final = env.steps[-1][0].observation.farms[0]
+          kinds = Counter()
+          for row in final.tiles:
+              for tile in row:
+                  if isinstance(tile, dict):
+                      name = tile.get('animal') or tile.get('crop')
+                      if name:
+                          kinds[name] += 1
+          cand = {
+              'money': final.money,
+              'hand_days': sum(day_hands.get(day, 0) for day in range(6, max(day_hands)+1)),
+              'kinds': dict(kinds),
+          }
+          print('SMOKE_BASELINE', base)
+          print('SMOKE_CANDIDATE', cand)
+          print('money_delta=', cand['money'] - base['money'], 'hand_day_delta=', cand['hand_days'] - base['hand_days'])
+          PY
