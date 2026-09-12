@@ -1,0 +1,132 @@
+name: Planner joint allocation
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/planner-joint-allocation.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install kaggle-environments==1.32.7 pytest
+      - name: Baseline melon planner
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          import json
+          from collections import Counter
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+
+          rows = []
+          for seed in (1, 2, 3):
+              env = make('kaggriculture', configuration={
+                  'seed': seed, 'weedSpawnChance': 0.0, 'episodeSteps': 360,
+              }, debug=False)
+              agent = make_agent(opening_version='melon_v2')
+              env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
+              hand_days = 0
+              day_hands = {}
+              for frame in env.steps:
+                  obs = frame[0].observation
+                  day_hands[obs.day] = max(day_hands.get(obs.day, 0), len(obs.farms[0].hands))
+              hand_days = sum(day_hands.get(day, 0) for day in range(6, max(day_hands) + 1))
+              final = env.steps[-1][0].observation.farms[0]
+              kinds = Counter()
+              for row in final.tiles:
+                  for tile in row:
+                      if isinstance(tile, dict):
+                          name = tile.get('animal') or tile.get('crop')
+                          if name:
+                              kinds[name] += 1
+              rows.append({'seed': seed, 'money': final.money, 'hand_days': hand_days, 'kinds': dict(kinds)})
+          print('BASELINE', rows)
+          with open('/tmp/planner_baseline.json', 'w') as f:
+              json.dump(rows, f)
+          PY
+      - name: Apply joint planner allocation
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          planner = Path('agents/planner.py')
+          text = planner.read_text()
+          old = '''    for position in sorted(\n        replanning, key=lambda p: (distance(p), p[1], p[0])\n    ):\n        x, y = position\n        tile = farm[\"tiles\"][y][x]\n        allowed = candidates\n        if isinstance(tile, dict) and tile.get(\"kind\") in (\"COOP\", \"PASTURE\"):\n            allowed = [\n                c\n                for c in candidates\n                if c[0][0] in ANIMALS\n                and official_game.ANIMALS[c[0][0]][\"structure\"] == tile[\"kind\"]\n            ]\n\n        allowed = [candidate for candidate in allowed if start_cost(candidate[0]) <= max(0, cash)]\n        selector = (\n            _choose_daily_mirrored\n            if planner_version == \"mirror_v2\"\n            else _choose_daily\n        )\n        choice, output = selector(\n            market, baseline, allowed, counts, labor, position\n        )\n        targets[position] = choice\n        if not choice:\n            continue\n\n        reserve_start(choice)\n        baseline.add(output, position)\n        if planner_version == \"mirror_v2\":\n            # Keep the rival's mirrored commitment in later tile decisions;\n            # each accepted target represents one producer for each player.\n            external.add(output, position)\n        counts[choice[0]] += 1\n'''
+          new = '''    # Jointly choose position + producer. The previous loop committed the\n    # nearest tile first, so an early mediocre assignment could consume cash,\n    # labor capacity and favorable market depth before a better pair was even\n    # considered. Re-evaluate every remaining position after each commitment\n    # and accept the globally best marginal pair under the live shared state.\n    pending = set(replanning)\n    while pending:\n        best = None\n        best_key = None\n        for position in sorted(pending):\n            x, y = position\n            tile = farm[\"tiles\"][y][x]\n            allowed = candidates\n            if isinstance(tile, dict) and tile.get(\"kind\") in (\"COOP\", \"PASTURE\"):\n                allowed = [\n                    c\n                    for c in candidates\n                    if c[0][0] in ANIMALS\n                    and official_game.ANIMALS[c[0][0]][\"structure\"] == tile[\"kind\"]\n                ]\n            allowed = [\n                candidate for candidate in allowed\n                if start_cost(candidate[0]) <= max(0, cash)\n            ]\n            if not allowed:\n                continue\n            results = [\n                result for result in evaluate_daily_targets(\n                    market, baseline, allowed, labor, position,\n                    mirror_opponent=planner_version == \"mirror_v2\",\n                )\n                if result.profit > 0\n            ]\n            for result in results:\n                if planner_version == \"mirror_v2\":\n                    rank = (\n                        result.profit_per_day,\n                        result.profit,\n                        -counts[result.choice[0]],\n                        result.choice,\n                    )\n                else:\n                    rank = (\n                        result.profit_per_day\n                        / (1.0 + TARGET_CONCENTRATION_PENALTY * counts[result.choice[0]]),\n                        result.profit_per_day,\n                        result.profit,\n                        -counts[result.choice[0]],\n                        result.choice,\n                    )\n                key = (*rank, -distance(position), -position[1], -position[0])\n                if best_key is None or key > best_key:\n                    best_key = key\n                    best = (position, result)\n\n        if best is None:\n            for position in pending:\n                targets[position] = None\n            break\n\n        position, result = best\n        choice, output = result.choice, result.output\n        targets[position] = choice\n        reserve_start(choice)\n        baseline.add(output, position)\n        if planner_version == \"mirror_v2\":\n            # Keep the rival's mirrored commitment in later tile decisions;\n            # each accepted target represents one producer for each player.\n            external.add(output, position)\n        counts[choice[0]] += 1\n        pending.remove(position)\n'''
+          if old not in text:
+              raise SystemExit('planner allocation loop not found')
+          planner.write_text(text.replace(old, new))
+
+          tests = Path('tests/test_agents_planner.py')
+          text = tests.read_text()
+          old_test = '''def test_mirror_v2_keeps_each_accepted_rival_commitment(monkeypatch):\n    from agents import planner\n    from agents.forecast import Production\n\n    seen_external = []\n\n    def choose(market, _baseline, _candidates, _counts, _labor, _position):\n        seen_external.append(sum(\n            sum(units.values()) for units in market.external.sales.values()\n        ))\n        output = Production()\n        output.sales[4][\"WHEAT\"] = 4\n        return (\"WHEAT\", False), output\n\n    monkeypatch.setattr(planner, \"_choose_daily_mirrored\", choose)\n    positions = [(0, 0), (1, 0)]\n    plan_targets(\n        make_obs(day=0), {}, positions, end_day=29,\n        planner_version=\"mirror_v2\",\n    )\n    assert seen_external == [0, 4]\n'''
+          new_test = '''def test_mirror_v2_keeps_each_accepted_rival_commitment(monkeypatch):\n    from agents import planner\n    from agents.forecast import Production\n    from agents.planner import TargetProfit\n\n    seen_external = []\n\n    def evaluate(market, _baseline, _candidates, _labor, _position, mirror_opponent=False):\n        assert mirror_opponent\n        seen_external.append(sum(\n            sum(units.values()) for units in market.external.sales.values()\n        ))\n        output = Production()\n        output.sales[4][\"WHEAT\"] = 4\n        return [TargetProfit((\"WHEAT\", False), output, 100, 0, 0, 4)]\n\n    monkeypatch.setattr(planner, \"evaluate_daily_targets\", evaluate)\n    positions = [(0, 0), (1, 0)]\n    plan_targets(\n        make_obs(day=0), {}, positions, end_day=29,\n        planner_version=\"mirror_v2\",\n    )\n    assert seen_external[:2] == [0, 0]\n    assert seen_external[-1] == 4\n\n\ndef test_plan_targets_jointly_ranks_position_and_producer(monkeypatch):\n    from agents import planner\n    from agents.forecast import Production\n    from agents.planner import TargetProfit\n\n    near, far = (4, 4), (0, 0)\n\n    def evaluate(_market, baseline, _candidates, _labor, position, mirror_opponent=False):\n        committed = sum(sum(v.values()) for v in baseline.sales.values())\n        output = Production()\n        if committed == 0 and position == far:\n            output.sales[4][\"MELON\"] = 4\n            return [TargetProfit((\"MELON\", False), output, 200, 0, 0, 4)]\n        output.sales[4][\"WHEAT\"] = 4\n        return [TargetProfit((\"WHEAT\", False), output, 100, 0, 0, 4)]\n\n    monkeypatch.setattr(planner, \"evaluate_daily_targets\", evaluate)\n    targets = {}\n    plan_targets(make_obs(day=0, money=10000), targets, [near, far], end_day=29)\n    assert targets[far] == (\"MELON\", False)\n    assert targets[near] == (\"WHEAT\", False)\n'''
+          if old_test not in text:
+              raise SystemExit('mirror regression block not found')
+          tests.write_text(text.replace(old_test, new_test))
+          PY
+      - name: Planner regressions
+        run: |
+          PYTHONPATH=. pytest -q \
+            tests/test_agents_planner.py \
+            tests/test_agents_labor.py \
+            tests/test_agents_forecast.py \
+            tests/test_agents_affordable_production.py \
+            tests/test_agents_capacity_guard.py \
+            tests/test_agents_intraday.py \
+            tests/test_agents_melon_opening.py \
+            tests/test_survival_debt_regression.py
+      - name: Candidate melon planner
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          import json
+          from collections import Counter
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+
+          with open('/tmp/planner_baseline.json') as f:
+              baseline = json.load(f)
+          rows = []
+          for seed in (1, 2, 3):
+              env = make('kaggriculture', configuration={
+                  'seed': seed, 'weedSpawnChance': 0.0, 'episodeSteps': 360,
+              }, debug=False)
+              agent = make_agent(opening_version='melon_v2')
+              env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
+              day_hands = {}
+              for frame in env.steps:
+                  obs = frame[0].observation
+                  day_hands[obs.day] = max(day_hands.get(obs.day, 0), len(obs.farms[0].hands))
+              hand_days = sum(day_hands.get(day, 0) for day in range(6, max(day_hands) + 1))
+              final = env.steps[-1][0].observation.farms[0]
+              kinds = Counter()
+              for row in final.tiles:
+                  for tile in row:
+                      if isinstance(tile, dict):
+                          name = tile.get('animal') or tile.get('crop')
+                          if name:
+                              kinds[name] += 1
+              rows.append({'seed': seed, 'money': final.money, 'hand_days': hand_days, 'kinds': dict(kinds)})
+          print('BASELINE', baseline)
+          print('CANDIDATE', rows)
+          base_money = sum(r['money'] for r in baseline)
+          cand_money = sum(r['money'] for r in rows)
+          base_hands = sum(r['hand_days'] for r in baseline)
+          cand_hands = sum(r['hand_days'] for r in rows)
+          print('money_delta=', cand_money - base_money, 'hand_day_delta=', cand_hands - base_hands)
+          # This candidate is specifically a planner optimization. Keep it only
+          # if it improves aggregate money without increasing aggregate labor.
+          assert cand_money > base_money, (base_money, cand_money)
+          assert cand_hands <= base_hands, (base_hands, cand_hands)
+          PY
+      - name: Commit planner optimization
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add agents/planner.py tests/test_agents_planner.py
+          git commit -m 'optimize: jointly allocate planner targets'
+          git push
