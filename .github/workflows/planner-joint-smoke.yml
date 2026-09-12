@@ -1,10 +1,10 @@
-name: Planner labor repair smoke
+name: Planner two-ply smoke
 on:
   push:
     branches: [feat/planner-capacity-v4]
     paths: [.github/workflows/planner-joint-smoke.yml]
 permissions:
-  contents: write
+  contents: read
 jobs:
   smoke:
     runs-on: ubuntu-latest
@@ -14,17 +14,32 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install kaggle-environments==1.32.7 pytest
-      - name: Baseline melon planner
+      - name: Prepare candidate patcher
         run: |
+          cp agents/planner.py /tmp/planner.original.py
+          cat > /tmp/apply_two_ply.py <<'PY'
+          from pathlib import Path
+          import sys
+
+          mode = sys.argv[1]
+          path = Path('agents/planner.py')
+          text = path.read_text()
+          old = '''    for position in sorted(\n        replanning, key=lambda p: (distance(p), p[1], p[0])\n    ):\n        x, y = position\n        tile = farm[\"tiles\"][y][x]\n        allowed = candidates\n        if isinstance(tile, dict) and tile.get(\"kind\") in (\"COOP\", \"PASTURE\"):\n            allowed = [\n                c\n                for c in candidates\n                if c[0][0] in ANIMALS\n                and official_game.ANIMALS[c[0][0]][\"structure\"] == tile[\"kind\"]\n            ]\n\n        allowed = [candidate for candidate in allowed if start_cost(candidate[0]) <= max(0, cash)]\n        selector = (\n            _choose_daily_mirrored\n            if planner_version == \"mirror_v2\"\n            else _choose_daily\n        )\n        choice, output = selector(\n            market, baseline, allowed, counts, labor, position\n        )\n        targets[position] = choice\n        if not choice:\n            continue\n\n        reserve_start(choice)\n        baseline.add(output, position)\n        if planner_version == \"mirror_v2\":\n            # Keep the rival's mirrored commitment in later tile decisions;\n            # each accepted target represents one producer for each player.\n            external.add(output, position)\n        counts[choice[0]] += 1\n'''
+          new = f'''    # Reprice all pending positions before committing one.  A shallow two-ply\n    # lookahead avoids giving the nearest tile irreversible first claim on\n    # shared cash, labor and market depth.  Producer selection itself remains\n    # delegated to the existing selector, so affordability and planner-version\n    # behavior stay unchanged.\n    selector = (\n        _choose_daily_mirrored\n        if planner_version == \"mirror_v2\"\n        else _choose_daily\n    )\n    score_mode = {mode!r}\n    lookahead_width = 4\n\n    def copy_flow(flow):\n        result = Production()\n        result.add(flow)\n        return result\n\n    def branch_feed_cost(input_state, bought_state, units):\n        missing = max(0, units - input_state[\"WHEAT\"])\n        return sum(\n            market_price(\n                \"WHEAT\", wheat_stock - bought_state - i - 1,\n                obs[\"market\"].get(\"params\"),\n            )\n            for i in range(missing)\n        ), missing\n\n    def branch_start_cost(choice, input_state, seed_state, bought_state):\n        name = choice[0]\n        if name in CROPS:\n            return 0 if seed_state[name] > 0 else SEED_COST[name]\n        feed, _ = branch_feed_cost(\n            input_state, bought_state, int(should_feed_animal(name, 0))\n        )\n        return (0 if input_state[name] > 0 else ANIMAL_COST[name]) + feed\n\n    def branch_reserve(choice, cash_state, input_state, seed_state, bought_state):\n        input_state = input_state.copy()\n        seed_state = seed_state.copy()\n        name = choice[0]\n        if name in CROPS:\n            if seed_state[name] > 0:\n                seed_state[name] -= 1\n            else:\n                cash_state -= SEED_COST[name]\n        else:\n            if input_state[name] > 0:\n                input_state[name] -= 1\n            else:\n                cash_state -= ANIMAL_COST[name]\n            units = int(should_feed_animal(name, 0))\n            feed, missing = branch_feed_cost(input_state, bought_state, units)\n            cash_state -= feed\n            bought_state += missing\n            input_state[\"WHEAT\"] = max(0, input_state[\"WHEAT\"] - units)\n        return cash_state, input_state, seed_state, bought_state\n\n    def allowed_at(position, cash_state, input_state, seed_state, bought_state):\n        x, y = position\n        tile = farm[\"tiles\"][y][x]\n        allowed = candidates\n        if isinstance(tile, dict) and tile.get(\"kind\") in (\"COOP\", \"PASTURE\"):\n            allowed = [\n                candidate for candidate in candidates\n                if candidate[0][0] in ANIMALS\n                and official_game.ANIMALS[candidate[0][0]][\"structure\"] == tile[\"kind\"]\n            ]\n        return [\n            candidate for candidate in allowed\n            if branch_start_cost(\n                candidate[0], input_state, seed_state, bought_state\n            ) <= max(0, cash_state)\n        ]\n\n    def proposal_score(market_state, baseline_state, allowed, count_state, position, choice):\n        chosen = [candidate for candidate in allowed if candidate[0] == choice]\n        if not chosen:\n            return None\n        scored = evaluate_daily_targets(\n            market_state, baseline_state, chosen, labor, position,\n            mirror_opponent=planner_version == \"mirror_v2\",\n        )\n        if not scored or scored[0].profit <= 0:\n            return None\n        result = scored[0]\n        if score_mode == \"profit\":\n            return result.profit\n        if planner_version == \"mirror_v2\":\n            return result.profit_per_day\n        return result.profit_per_day / (\n            1.0 + TARGET_CONCENTRATION_PENALTY * count_state[choice[0]]\n        )\n\n    pending = set(replanning)\n    while pending:\n        proposals = []\n        for position in sorted(pending):\n            allowed = allowed_at(position, cash, inputs, seeds, wheat_bought)\n            choice, output = selector(\n                market, baseline, allowed, counts, labor, position\n            )\n            if not choice:\n                continue\n            score = proposal_score(\n                market, baseline, allowed, counts, position, choice\n            )\n            if score is None:\n                continue\n            proposals.append((score, -distance(position), position, choice, output))\n\n        if not proposals:\n            for position in pending:\n                targets[position] = None\n            break\n\n        ranked = sorted(proposals, reverse=True)\n        frontier = ranked[:lookahead_width]\n        branches = []\n        for first_score, first_distance, first_position, first_choice, first_output in frontier:\n            branch_baseline = copy_flow(baseline)\n            branch_baseline.add(first_output, first_position)\n            branch_counts = counts.copy()\n            branch_counts[first_choice[0]] += 1\n            branch_external = copy_flow(external)\n            if planner_version == \"mirror_v2\":\n                branch_external.add(first_output, first_position)\n            branch_market = copy(market)\n            branch_market.external = branch_external\n            branch_cash, branch_inputs, branch_seeds, branch_bought = branch_reserve(\n                first_choice, cash, inputs, seeds, wheat_bought\n            )\n\n            second_best = 0.0\n            for _, _, second_position, _, _ in frontier:\n                if second_position == first_position:\n                    continue\n                allowed = allowed_at(\n                    second_position, branch_cash, branch_inputs, branch_seeds, branch_bought\n                )\n                second_choice, _ = selector(\n                    branch_market, branch_baseline, allowed, branch_counts, labor, second_position\n                )\n                if not second_choice:\n                    continue\n                second_score = proposal_score(\n                    branch_market, branch_baseline, allowed, branch_counts,\n                    second_position, second_choice,\n                )\n                if second_score is not None:\n                    second_best = max(second_best, second_score)\n            branches.append((\n                first_score + second_best, first_score, first_distance,\n                first_position, first_choice, first_output,\n            ))\n\n        _, _, _, position, choice, output = max(branches)\n        targets[position] = choice\n        reserve_start(choice)\n        baseline.add(output, position)\n        if planner_version == \"mirror_v2\":\n            external.add(output, position)\n        counts[choice[0]] += 1\n        pending.remove(position)\n'''
+          if old not in text:
+              raise SystemExit('allocation loop not found')
+          path.write_text(text.replace(old, new))
+          PY
+      - name: Rate lookahead benchmark
+        run: |
+          cp /tmp/planner.original.py agents/planner.py
+          python /tmp/apply_two_ply.py rate
           PYTHONPATH=. python - <<'PY'
           import json
           from collections import Counter
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
-
-          env = make('kaggriculture', configuration={
-              'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 288,
-          }, debug=False)
+          env = make('kaggriculture', configuration={'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 288}, debug=False)
           agent = make_agent(opening_version='melon_v2')
           env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
           day_hands = {}
@@ -37,89 +52,49 @@ jobs:
               for tile in row:
                   if isinstance(tile, dict):
                       name = tile.get('animal') or tile.get('crop')
-                      if name:
-                          kinds[name] += 1
-          result = {
-              'money': final.money,
-              'hand_days': sum(day_hands.get(day, 0) for day in range(6, max(day_hands)+1)),
-              'kinds': dict(kinds),
-          }
-          print('BASELINE', result)
-          with open('/tmp/planner_base.json', 'w') as f:
-              json.dump(result, f)
+                      if name: kinds[name] += 1
+          result = {'money': final.money, 'hand_days': sum(day_hands.get(d, 0) for d in range(6, max(day_hands)+1)), 'kinds': dict(kinds)}
+          print('RATE', result)
+          with open('/tmp/rate.json', 'w') as f: json.dump(result, f)
           PY
-      - name: Apply planner labor route repair
+      - name: Profit lookahead benchmark
+        run: |
+          cp /tmp/planner.original.py agents/planner.py
+          python /tmp/apply_two_ply.py profit
+          PYTHONPATH=. python - <<'PY'
+          import json
+          from collections import Counter
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+          env = make('kaggriculture', configuration={'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 288}, debug=False)
+          agent = make_agent(opening_version='melon_v2')
+          env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
+          day_hands = {}
+          for frame in env.steps:
+              obs = frame[0].observation
+              day_hands[obs.day] = max(day_hands.get(obs.day, 0), len(obs.farms[0].hands))
+          final = env.steps[-1][0].observation.farms[0]
+          kinds = Counter()
+          for row in final.tiles:
+              for tile in row:
+                  if isinstance(tile, dict):
+                      name = tile.get('animal') or tile.get('crop')
+                      if name: kinds[name] += 1
+          result = {'money': final.money, 'hand_days': sum(day_hands.get(d, 0) for d in range(6, max(day_hands)+1)), 'kinds': dict(kinds)}
+          print('PROFIT', result)
+          with open('/tmp/profit.json', 'w') as f: json.dump(result, f)
+          PY
+      - name: Compare candidates
         run: |
           python - <<'PY'
-          from pathlib import Path
-
-          path = Path('agents/labor.py')
-          text = path.read_text()
-          old = '''    def _daily_cost(self, tasks):\n        remaining = list(tasks)\n        workers = 0\n        while remaining:\n            if workers > MAX_HANDS:\n                return float('inf')\n            # Start at the shed access nearest the next service cluster.\n            first = min(remaining, key=lambda t: min(abs(t[0]-s[0])+abs(t[1]-s[1]) for s in self.shed_access))\n            start = min(self.shed_access, key=lambda s: abs(first[0]-s[0])+abs(first[1]-s[1]))\n            current, used, supplies, goods = start, 0, set(), False\n            assigned = 0\n            while remaining:\n                possible = []\n                for index, (x, y, count, inputs, output) in enumerate(remaining):\n                    travel = abs(current[0]-x) + abs(current[1]-y)\n                    pickups = len(set(inputs) - supplies)\n                    # Pickups are batched at the route's initial shed visit.\n                    back = min(abs(x-s[0])+abs(y-s[1]) for s in self.shed_access) if goods or output else 0\n                    projected = used + travel + count + pickups\n                    if projected + back + int(goods or output) <= HAND_BUDGET:\n                        possible.append((travel, projected, index))\n                if not possible:\n                    break\n                _, used, index = min(possible)\n                x, y, _, inputs, output = remaining.pop(index)\n                supplies.update(inputs)\n                goods = goods or output\n                current = (x, y)\n                assigned += 1\n            if not assigned:\n                return float('inf')\n            workers += 1\n        return sum(game._hire_cost(n) for n in range(max(0, workers - 1)))\n'''
-          new = '''    def _route_length(self, bucket):\n        \"\"\"Exact length of the forecast route for one worker bucket.\n\n        Forecast tasks do not carry scheduler priority/deadline metadata, but\n        their travel, batched PICKUPs, service actions and final DROP are all\n        known. Try every open shed-access tile as the worker start and keep the\n        cheapest valid route estimate.\n        \"\"\"\n        if not bucket:\n            return 0\n        best = float('inf')\n        for start in self.shed_access:\n            current, used, supplies, goods = start, 0, set(), False\n            for x, y, count, inputs, output in bucket:\n                used += abs(current[0] - x) + abs(current[1] - y)\n                needed = set(inputs) - supplies\n                used += len(needed)\n                supplies.update(inputs)\n                used += count\n                goods = goods or output\n                current = (x, y)\n            if goods:\n                used += min(\n                    abs(current[0] - s[0]) + abs(current[1] - s[1])\n                    for s in self.shed_access\n                ) + 1\n            best = min(best, used)\n        return best\n\n    def _pack_once(self, tasks, worker_count, hard_first=False):\n        \"\"\"Insertion-pack forecast tasks into a fixed number of workers.\"\"\"\n        buckets = [[] for _ in range(worker_count)]\n        lengths = [0] * worker_count\n\n        def nearest_shed(task):\n            return min(\n                abs(task[0] - s[0]) + abs(task[1] - s[1])\n                for s in self.shed_access\n            )\n\n        if hard_first:\n            ordered = sorted(\n                tasks,\n                key=lambda task: (\n                    -self._route_length((task,)), -task[2], task[1], task[0]\n                ),\n            )\n        else:\n            ordered = sorted(\n                tasks,\n                key=lambda task: (nearest_shed(task), -task[2], task[1], task[0]),\n            )\n\n        unassigned = []\n        for task in ordered:\n            choices = []\n            for worker, bucket in enumerate(buckets):\n                for insertion in range(len(bucket) + 1):\n                    candidate = bucket[:insertion] + [task] + bucket[insertion:]\n                    projected = self._route_length(tuple(candidate))\n                    if projected <= HAND_BUDGET:\n                        choices.append((\n                            max(0, projected - lengths[worker]),\n                            projected, worker, insertion,\n                        ))\n            if not choices:\n                unassigned.append(task)\n                continue\n            _, projected, worker, insertion = min(choices)\n            buckets[worker].insert(insertion, task)\n            lengths[worker] = projected\n        return buckets, unassigned\n\n    def _insert_task(self, bucket, task):\n        base = self._route_length(tuple(bucket))\n        choices = []\n        for insertion in range(len(bucket) + 1):\n            candidate = bucket[:insertion] + [task] + bucket[insertion:]\n            projected = self._route_length(tuple(candidate))\n            if projected <= HAND_BUDGET:\n                choices.append((\n                    max(0, projected - base), projected, insertion, candidate\n                ))\n        if not choices:\n            return None\n        return min(choices, key=lambda item: item[:3])\n\n    def _repair_single_swaps(self, buckets, unassigned):\n        \"\"\"Move one prior assignment before charging another Fibonacci hand.\"\"\"\n        buckets = [list(bucket) for bucket in buckets]\n        remaining = list(unassigned)\n        changed = True\n        while changed and remaining:\n            changed = False\n            retry = []\n            for task in remaining:\n                direct = []\n                for worker, bucket in enumerate(buckets):\n                    choice = self._insert_task(bucket, task)\n                    if choice is not None:\n                        direct.append((*choice[:3], worker, choice[3]))\n                if direct:\n                    _, _, _, worker, candidate = min(\n                        direct, key=lambda item: item[:4]\n                    )\n                    buckets[worker] = candidate\n                    changed = True\n                    continue\n\n                exchanges = []\n                for source, bucket in enumerate(buckets):\n                    for victim_index, victim in enumerate(bucket):\n                        reduced = bucket[:victim_index] + bucket[victim_index + 1:]\n                        incoming = self._insert_task(reduced, task)\n                        if incoming is None:\n                            continue\n                        for destination, other in enumerate(buckets):\n                            if destination == source:\n                                continue\n                            moved = self._insert_task(other, victim)\n                            if moved is None:\n                                continue\n                            score = (\n                                max(incoming[1], moved[1]),\n                                incoming[1] + moved[1],\n                                source, destination, victim_index,\n                            )\n                            exchanges.append((\n                                score, source, destination, incoming[3], moved[3]\n                            ))\n                if exchanges:\n                    _, source, destination, source_bucket, destination_bucket = min(\n                        exchanges, key=lambda item: item[0]\n                    )\n                    buckets[source] = source_bucket\n                    buckets[destination] = destination_bucket\n                    changed = True\n                else:\n                    retry.append(task)\n            remaining = retry\n        return buckets, remaining\n\n    def _can_pack(self, tasks, worker_count):\n        candidates = []\n        for hard_first in (False, True):\n            buckets, unassigned = self._pack_once(\n                tasks, worker_count, hard_first=hard_first\n            )\n            if not unassigned:\n                return True\n            candidates.append((buckets, unassigned))\n        if worker_count <= 1:\n            return False\n        for buckets, unassigned in candidates:\n            _, remaining = self._repair_single_swaps(buckets, unassigned)\n            if not remaining:\n                return True\n        return False\n\n    def _greedy_worker_count(self, tasks):\n        \"\"\"Historical nearest-route estimate, retained as a safe upper bound.\"\"\"\n        remaining = list(tasks)\n        workers = 0\n        while remaining:\n            if workers > MAX_HANDS:\n                return None\n            first = min(\n                remaining,\n                key=lambda t: min(\n                    abs(t[0] - s[0]) + abs(t[1] - s[1])\n                    for s in self.shed_access\n                ),\n            )\n            start = min(\n                self.shed_access,\n                key=lambda s: abs(first[0] - s[0]) + abs(first[1] - s[1]),\n            )\n            current, used, supplies, goods = start, 0, set(), False\n            assigned = 0\n            while remaining:\n                possible = []\n                for index, (x, y, count, inputs, output) in enumerate(remaining):\n                    travel = abs(current[0] - x) + abs(current[1] - y)\n                    pickups = len(set(inputs) - supplies)\n                    back = (\n                        min(\n                            abs(x - s[0]) + abs(y - s[1])\n                            for s in self.shed_access\n                        )\n                        if goods or output else 0\n                    )\n                    projected = used + travel + count + pickups\n                    if projected + back + int(goods or output) <= HAND_BUDGET:\n                        possible.append((travel, projected, index))\n                if not possible:\n                    break\n                _, used, index = min(possible)\n                x, y, _, inputs, output = remaining.pop(index)\n                supplies.update(inputs)\n                goods = goods or output\n                current = (x, y)\n                assigned += 1\n            if not assigned:\n                return None\n            workers += 1\n        return workers\n\n    def _daily_cost(self, tasks):\n        workers = self._greedy_worker_count(tasks)\n        if workers is None:\n            return float('inf')\n\n        # Keep the historical estimate as an upper bound. Only lower it when\n        # insertion packing plus the same one-swap idea as the real scheduler\n        # proves the whole workload fits with fewer workers.\n        while workers > 1 and self._can_pack(tasks, workers - 1):\n            workers -= 1\n        return sum(game._hire_cost(n) for n in range(max(0, workers - 1)))\n'''
-          if old not in text:
-              raise SystemExit('old daily labor estimator not found')
-          path.write_text(text.replace(old, new))
-
-          tests = Path('tests/test_agents_labor.py')
-          t = tests.read_text()
-          t += '''\n\ndef test_forecast_repairs_fragmented_routes_before_charging_another_hand():\n    from kaggle_environments.envs.kaggriculture import kaggriculture as game\n\n    labor = LaborForecast()\n    visits = [\n        ((5, 2), 1, (), False),\n        ((3, 8), 4, (), False),\n        ((5, 0), 1, (), False),\n        ((3, 6), 4, (), False),\n        ((2, 2), 5, (), False),\n        ((6, 6), 1, (), False),\n        ((3, 3), 3, (), False),\n        ((3, 6), 5, (), False),\n        ((1, 9), 5, (), False),\n        ((9, 8), 3, (), False),\n        ((1, 5), 3, (), False),\n        ((8, 8), 2, (), False),\n        ((7, 0), 3, (), False),\n        ((9, 6), 2, (), False),\n        ((6, 3), 1, (), False),\n        ((7, 1), 5, (), False),\n        ((6, 2), 5, (), False),\n        ((5, 4), 4, (), False),\n        ((4, 1), 2, (), False),\n    ]\n    repaired = labor.cost({0: visits})\n    four_hands = sum(game._hire_cost(n) for n in range(4))\n    assert repaired == four_hands\n'''
-          tests.write_text(t)
-          PY
-      - name: Planner regressions
-        run: |
-          PYTHONPATH=. pytest -q \
-            tests/test_agents_planner.py \
-            tests/test_agents_affordable_production.py \
-            tests/test_agents_labor.py \
-            tests/test_agents_forecast.py \
-            tests/test_agents_scheduler.py \
-            tests/test_agents_capacity_guard.py \
-            tests/test_agents_intraday.py \
-            tests/test_agents_melon_opening.py \
-            tests/test_survival_debt_regression.py
-      - name: Candidate melon planner
-        run: |
-          PYTHONPATH=. python - <<'PY'
           import json
-          from collections import Counter
-          from kaggle_environments import make
-          from agents.expansion_agent import make_agent
-
-          with open('/tmp/planner_base.json') as f:
-              base = json.load(f)
-          env = make('kaggriculture', configuration={
-              'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 288,
-          }, debug=False)
-          agent = make_agent(opening_version='melon_v2')
-          env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
-          day_hands = {}
-          for frame in env.steps:
-              obs = frame[0].observation
-              day_hands[obs.day] = max(day_hands.get(obs.day, 0), len(obs.farms[0].hands))
-          final = env.steps[-1][0].observation.farms[0]
-          kinds = Counter()
-          for row in final.tiles:
-              for tile in row:
-                  if isinstance(tile, dict):
-                      name = tile.get('animal') or tile.get('crop')
-                      if name:
-                          kinds[name] += 1
-          cand = {
-              'money': final.money,
-              'hand_days': sum(day_hands.get(day, 0) for day in range(6, max(day_hands)+1)),
-              'kinds': dict(kinds),
-          }
+          base = {'money': 13536.0, 'hand_days': 80}
+          rate = json.load(open('/tmp/rate.json'))
+          profit = json.load(open('/tmp/profit.json'))
           print('BASELINE', base)
-          print('CANDIDATE', cand)
-          print('money_delta=', cand['money'] - base['money'], 'hand_day_delta=', cand['hand_days'] - base['hand_days'])
-          assert cand['money'] > base['money'], (base, cand)
-          assert cand['hand_days'] <= base['hand_days'], (base, cand)
+          print('RATE', rate, 'delta', rate['money'] - base['money'], rate['hand_days'] - base['hand_days'])
+          print('PROFIT', profit, 'delta', profit['money'] - base['money'], profit['hand_days'] - base['hand_days'])
+          winner = max((rate['money'], 'rate'), (profit['money'], 'profit'))
+          print('WINNER', winner)
+          assert winner[0] > base['money'], (base, rate, profit)
           PY
-      - name: Commit planner labor repair
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add agents/labor.py tests/test_agents_labor.py
-          git commit -m 'optimize: repair planner labor routes'
-          git push
