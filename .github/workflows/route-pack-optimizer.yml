@@ -4,7 +4,7 @@ on:
     branches: [feat/planner-capacity-v4]
     paths: [.github/workflows/route-pack-optimizer.yml]
 permissions:
-  contents: write
+  contents: read
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -14,32 +14,60 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install kaggle-environments==1.32.7 pytest
-      - name: Apply affordability-first land gate and remove fixed hand floor
+      - name: Restore safe scheduler and add one-swap repair
         run: |
+          git fetch --depth=1 origin dd208ce54c3bc1afeb74d1b200a74d33093e9084
+          git show dd208ce54c3bc1afeb74d1b200a74d33093e9084:agents/scheduler.py > agents/scheduler.py
+          git show dd208ce54c3bc1afeb74d1b200a74d33093e9084:tests/test_agents_scheduler.py > tests/test_agents_scheduler.py
           python - <<'PY'
           from pathlib import Path
-
-          agent = Path('agents/expansion_agent.py')
-          text = agent.read_text()
-          old_land = '''def _land_orders(obs, farm, pending_sales=()):\n    if not should_buy_land_on_schedule(obs, farm):\n        return []\n    shed = Counter(obs[\"private\"][\"shed\"])\n    sales = [order for order in pending_sales if order[0] == \"SELL\"]\n    for _op, item, quantity in sales:\n        shed[item] = max(0, shed.get(item, 0) - int(quantity))\n    carried = obs[\"private\"].get(\"inventories\", [])\n    if any(inv.get(item, 0) > 0 for inv in carried for item in SELLABLE if item != \"WHEAT\"):\n        return []\n    if any(shed.get(item, 0) > 0 for item in SELLABLE if item != \"WHEAT\"):\n        return []\n    price = LAND_PRICES[len(farm[\"unlocked_quadrants\"]) - 1]\n    cash = farm[\"money\"]\n    if cash < price and sales:\n        cash += _sale_revenue(obs, sales)\n    return [[\"BUY_LAND\"]] if cash >= price else []\n'''
-          new_land = '''def _land_orders(obs, farm, pending_sales=()):\n    \"\"\"Buy scheduled land as soon as this market pass can afford it.\n\n    Output still in a worker inventory is future revenue, not a prerequisite\n    for expansion.  Waiting for every carried sellable to reach the shed can\n    delay a funded land purchase by most of the day.  Only cash already on\n    hand plus SELL orders that execute earlier in this same market pass count\n    toward affordability.\n    \"\"\"\n    if not should_buy_land_on_schedule(obs, farm):\n        return []\n    price = LAND_PRICES[len(farm[\"unlocked_quadrants\"]) - 1]\n    sales = [order for order in pending_sales if order[0] == \"SELL\"]\n    cash = farm[\"money\"] + _sale_revenue(obs, sales)\n    return [[\"BUY_LAND\"]] if cash >= price else []\n'''
-          if old_land not in text:
-              raise SystemExit('land-order block not found')
-          text = text.replace(old_land, new_land)
-          floor = '''            if should_buy_land_on_schedule(obs, farm):\n                hand_count = max(hand_count, 10)\n'''
-          if floor not in text:
-              raise SystemExit('forced hand floor not found')
-          agent.write_text(text.replace(floor, ''))
-
-          tests = Path('tests/test_agents_opening_book.py')
-          text = tests.read_text()
-          old_test = '''def test_land_waits_for_liquidation_and_cash():\n    from agents.expansion_agent import _land_orders\n    obs = make_obs(6)\n    farm = obs[\"farms\"][0]\n    farm[\"money\"] = 100000\n    obs[\"private\"] = {\"shed\": {\"WHEAT\": 100, \"MILK\": 1}, \"inventories\": [{}]}\n    assert _land_orders(obs, farm) == []\n    obs[\"private\"][\"shed\"].pop(\"MILK\")\n    obs[\"private\"][\"inventories\"] = [{\"FERTILIZER\": 1}]\n    assert _land_orders(obs, farm) == []\n    obs[\"private\"][\"inventories\"] = [{}]\n    assert _land_orders(obs, farm) == [[\"BUY_LAND\"]]\n    farm[\"money\"] = 0\n    assert _land_orders(obs, farm) == []\n'''
-          new_test = '''def test_land_buys_once_affordable_without_waiting_for_all_liquidation():\n    from agents.expansion_agent import _land_orders\n    obs = make_obs(6)\n    farm = obs[\"farms\"][0]\n    obs[\"private\"] = {\n        \"shed\": {\"WHEAT\": 100, \"MILK\": 1},\n        \"inventories\": [{\"FERTILIZER\": 1}],\n    }\n\n    # Carried/shed output must not block land that is already funded.\n    farm[\"money\"] = 1000\n    assert _land_orders(obs, farm) == [[\"BUY_LAND\"]]\n\n    # A SELL earlier in the same market pass may finish funding the purchase.\n    farm[\"money\"] = 900\n    assert _land_orders(obs, farm, [[\"SELL\", \"FERTILIZER\", 2]]) == [[\"BUY_LAND\"]]\n\n    # Unsold or still-carried goods are not imaginary cash.\n    farm[\"money\"] = 0\n    assert _land_orders(obs, farm) == []\n'''
-          if old_test not in text:
-              raise SystemExit('old land test not found')
-          tests.write_text(text.replace(old_test, new_test))
+          path = Path('agents/scheduler.py')
+          text = path.read_text()
+          old = '''def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n    \"\"\"Pack mandatory work, retrying a harder-first layout before adding labor.\"\"\"\n    buckets, unassigned = _pack_once(\n        tasks, worker_starts, budgets, shed_access, hard_first=False\n    )\n    if not unassigned or len(worker_starts) <= 1:\n        return buckets, unassigned\n\n    compact_buckets, compact_unassigned = _pack_once(\n        tasks, worker_starts, budgets, shed_access, hard_first=True\n    )\n    if len(compact_unassigned) < len(unassigned):\n        return compact_buckets, compact_unassigned\n    return buckets, unassigned\n'''
+          new = '''def _insert_task(bucket, task, start, budget, shed_access):\n    \"\"\"Best feasible insertion without changing task-priority semantics.\"\"\"\n    base = len(_mandatory_queue(start, bucket, shed_access)[0])\n    time_sensitive = (\n        task.urgent or task.animal_harvest\n        or task.deadline is not None or task.immediate_drop\n        or task.must_liquidate\n    )\n    choices = []\n    for insertion in range(len(bucket) + 1):\n        candidate = bucket[:insertion] + [task] + bucket[insertion:]\n        if any(\n            _task_priority(candidate[index]) > _task_priority(candidate[index + 1])\n            for index in range(len(candidate) - 1)\n        ):\n            continue\n        projected = len(_mandatory_queue(start, candidate, shed_access)[0])\n        if projected <= budget:\n            cost = projected if time_sensitive else projected - base\n            choices.append((cost, projected, insertion, candidate))\n    if not choices:\n        return None\n    return min(choices, key=lambda item: item[:3])\n\n\ndef _repair_single_swaps(buckets, unassigned, worker_starts, budgets, shed_access):\n    \"\"\"Backtrack one greedy assignment before requesting another hand.\n\n    A failed greedy pack can be a fragmentation artifact: the pending task may\n    fit if one already-assigned task moves to another worker.  Try exactly that\n    one-task exchange while preserving every existing priority/deadline rule.\n    This does not compact urgent work or alter an already-feasible layout.\n    \"\"\"\n    buckets = [list(bucket) for bucket in buckets]\n    remaining = list(unassigned)\n    changed = True\n    while changed and remaining:\n        changed = False\n        retry = []\n        for task in remaining:\n            direct = []\n            for worker, bucket in enumerate(buckets):\n                if task.pinned_worker is not None and worker != task.pinned_worker:\n                    continue\n                choice = _insert_task(\n                    bucket, task, worker_starts[worker], budgets[worker], shed_access\n                )\n                if choice is not None:\n                    direct.append((*choice[:3], worker, choice[3]))\n            if direct:\n                _, _, _, worker, candidate = min(direct, key=lambda item: item[:4])\n                buckets[worker] = candidate\n                changed = True\n                continue\n\n            exchanges = []\n            for source, bucket in enumerate(buckets):\n                if task.pinned_worker is not None and source != task.pinned_worker:\n                    continue\n                for victim_index, victim in enumerate(bucket):\n                    if victim.pinned_worker is not None:\n                        continue\n                    reduced = bucket[:victim_index] + bucket[victim_index + 1:]\n                    incoming = _insert_task(\n                        reduced, task, worker_starts[source], budgets[source], shed_access\n                    )\n                    if incoming is None:\n                        continue\n                    for destination, other in enumerate(buckets):\n                        if destination == source:\n                            continue\n                        moved = _insert_task(\n                            other, victim, worker_starts[destination], budgets[destination], shed_access\n                        )\n                        if moved is None:\n                            continue\n                        score = (\n                            max(incoming[1], moved[1]),\n                            incoming[1] + moved[1],\n                            source, destination, victim_index,\n                        )\n                        exchanges.append((\n                            score, source, destination, incoming[3], moved[3]\n                        ))\n            if exchanges:\n                _, source, destination, source_bucket, destination_bucket = min(\n                    exchanges, key=lambda item: item[0]\n                )\n                buckets[source] = source_bucket\n                buckets[destination] = destination_bucket\n                changed = True\n            else:\n                retry.append(task)\n        remaining = retry\n    return buckets, remaining\n\n\ndef _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n    \"\"\"Pack mandatory work, then repair one greedy assignment if needed.\"\"\"\n    candidates = []\n    for hard_first in (False, True):\n        buckets, unassigned = _pack_once(\n            tasks, worker_starts, budgets, shed_access, hard_first=hard_first\n        )\n        candidates.append((buckets, unassigned))\n        if not unassigned and not hard_first:\n            return buckets, unassigned\n\n    best_buckets, best_unassigned = min(\n        candidates, key=lambda item: len(item[1])\n    )\n    if not best_unassigned or len(worker_starts) <= 1:\n        return best_buckets, best_unassigned\n\n    for buckets, unassigned in candidates:\n        repaired, remaining = _repair_single_swaps(\n            buckets, unassigned, worker_starts, budgets, shed_access\n        )\n        if len(remaining) < len(best_unassigned):\n            best_buckets, best_unassigned = repaired, remaining\n        if not best_unassigned:\n            break\n    return best_buckets, best_unassigned\n'''
+          if old not in text:
+              raise SystemExit('old pack block not found')
+          path.write_text(text.replace(old, new))
           PY
-      - name: Focused regressions
+      - name: Find deterministic improvement
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          import random
+          from agents.farm_tasks import Task
+          from agents.scheduler import _pack, _pack_once
+
+          def legacy(tasks, starts, budgets):
+              buckets, unassigned = _pack_once(tasks, starts, budgets, ((4,4),(5,4),(4,5),(5,5)), False)
+              if not unassigned or len(starts) <= 1:
+                  return buckets, unassigned
+              other_buckets, other_unassigned = _pack_once(tasks, starts, budgets, ((4,4),(5,4),(4,5),(5,5)), True)
+              if len(other_unassigned) < len(unassigned):
+                  return other_buckets, other_unassigned
+              return buckets, unassigned
+
+          rng = random.Random(20260912)
+          found = None
+          for case in range(1200):
+              worker_count = rng.choice((2, 3))
+              starts = [(4,4), (5,4), (4,5)][:worker_count]
+              budgets = [rng.choice((10,11,12,13,14)) for _ in starts]
+              tasks = []
+              for _ in range(rng.randint(6, 11)):
+                  p = (rng.randrange(5), rng.randrange(5))
+                  n = rng.randint(1, 4)
+                  tasks.append(Task(p, [['WATER']] * n, urgent=rng.random() < 0.35))
+              _, old_missing = legacy(tasks, starts, budgets)
+              _, new_missing = _pack(tasks, starts, budgets)
+              if len(new_missing) < len(old_missing):
+                  found = (case, starts, budgets, tasks, len(old_missing), len(new_missing))
+                  break
+          assert found is not None, 'one-swap repair found no improvement'
+          case, starts, budgets, tasks, old_n, new_n = found
+          print('CASE', case, 'starts=', starts, 'budgets=', budgets, 'old_missing=', old_n, 'new_missing=', new_n)
+          for task in tasks:
+              print('TASK', task.position, len(task.actions), 'urgent=', task.urgent)
+          PY
+      - name: Full route-sensitive regressions
         run: |
           PYTHONPATH=. pytest -q \
             tests/test_agents_scheduler.py \
@@ -50,41 +78,3 @@ jobs:
             tests/test_agents_intraday.py \
             tests/test_agents_affordable_production.py \
             tests/test_agents_melon_opening.py
-      - name: Verify day-seven labor and production
-        run: |
-          PYTHONPATH=. python - <<'PY'
-          from kaggle_environments import make
-          from agents.expansion_agent import make_agent
-
-          results = {}
-          for version in ('classic', 'melon_v2'):
-              env = make('kaggriculture', configuration={
-                  'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 169,
-              }, debug=False)
-              agent = make_agent(opening_version=version)
-              env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
-              day6 = [frame[0] for frame in env.steps if frame[0].observation.day == 6]
-              max_hands = max(len(frame.observation.farms[0].hands) for frame in day6)
-              buy_hours = [
-                  frame.observation.hour for frame in day6
-                  if any(order and order[0] == 'BUY_LAND' for order in (frame.action or {}).get('market', []))
-              ]
-              final = env.steps[-1][0].observation.farms[0]
-              ne_prod = sum(
-                  isinstance(final.tiles[y][x], dict)
-                  and bool(final.tiles[y][x].get('crop') or final.tiles[y][x].get('animal'))
-                  for y in range(5) for x in range(5, 10)
-              )
-              print(version, 'max_day7_hands=', max_hands, 'buy_hours=', buy_hours, 'ne_prod=', ne_prod)
-              results[version] = (max_hands, buy_hours, ne_prod)
-              assert buy_hours and ne_prod > 0
-          print('classic_hand_reduction_vs_old_floor=', 10 - results['classic'][0])
-          assert results['classic'][0] < 10
-          PY
-      - name: Commit validated change
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add agents/expansion_agent.py tests/test_agents_opening_book.py
-          git commit -m 'optimize: expand once cash is available'
-          git push
