@@ -204,7 +204,7 @@ def _task_priority(task):
     )
 
 
-def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):
+def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False, compact=False):
     """Greedy exact-route pack for one task ordering.
 
     The normal ordering preserves the historical near-first behavior.  The
@@ -270,7 +270,17 @@ def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):
                         or task.deadline is not None or task.immediate_drop
                         or task.must_liquidate
                     )
-                    cost = projected if time_sensitive else projected - lengths[worker]
+                    # Normal scheduling balances deadline-sensitive work across
+                    # workers.  When that layout cannot fit the day, a compact
+                    # repair pass instead minimizes the *extra* route length of
+                    # each insertion, clustering nearby work before paying for
+                    # another Fibonacci-priced hand.
+                    cost = (
+                        projected - lengths[worker]
+                        if compact
+                        else projected if time_sensitive
+                        else projected - lengths[worker]
+                    )
                     candidates.append((cost, projected, worker, insertion))
         candidates.sort()
         for _, projected, worker, insertion in candidates:
@@ -283,19 +293,30 @@ def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):
 
 
 def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
-    """Pack mandatory work, retrying a harder-first layout before adding labor."""
-    buckets, unassigned = _pack_once(
+    """Pack mandatory work, then repair a failed layout before adding labor.
+
+    The historical balanced pass remains authoritative whenever it already
+    fits.  Only a failed worker count triggers alternatives: harder-first
+    ordering, then marginal-route clustering.  This preserves deadline spread
+    on normal days while recovering cases where greedy balancing scatters a
+    geographic cluster and falsely asks ``hands_needed`` for another hand.
+    """
+    best_buckets, best_unassigned = _pack_once(
         tasks, worker_starts, budgets, shed_access, hard_first=False
     )
-    if not unassigned or len(worker_starts) <= 1:
-        return buckets, unassigned
+    if not best_unassigned or len(worker_starts) <= 1:
+        return best_buckets, best_unassigned
 
-    compact_buckets, compact_unassigned = _pack_once(
-        tasks, worker_starts, budgets, shed_access, hard_first=True
-    )
-    if len(compact_unassigned) < len(unassigned):
-        return compact_buckets, compact_unassigned
-    return buckets, unassigned
+    for hard_first, compact in ((True, False), (False, True), (True, True)):
+        buckets, unassigned = _pack_once(
+            tasks, worker_starts, budgets, shed_access,
+            hard_first=hard_first, compact=compact,
+        )
+        if len(unassigned) < len(best_unassigned):
+            best_buckets, best_unassigned = buckets, unassigned
+        if not best_unassigned:
+            break
+    return best_buckets, best_unassigned
 
 
 def hands_needed(
