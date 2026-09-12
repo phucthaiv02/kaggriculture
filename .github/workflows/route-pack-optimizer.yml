@@ -14,27 +14,48 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install kaggle-environments==1.32.7 pytest
-      - name: Remove fixed hand floor and buy land once funded
+      - name: Apply route-sized expansion labor
         run: |
           python - <<'PY'
           from pathlib import Path
 
           agent = Path('agents/expansion_agent.py')
           text = agent.read_text()
-          old = '''def _land_orders(obs, farm, pending_sales=()):\n    if not should_buy_land_on_schedule(obs, farm):\n        return []\n    shed = Counter(obs[\"private\"][\"shed\"])\n    sales = [order for order in pending_sales if order[0] == \"SELL\"]\n    for _op, item, quantity in sales:\n        shed[item] = max(0, shed.get(item, 0) - int(quantity))\n    carried = obs[\"private\"].get(\"inventories\", [])\n    if any(inv.get(item, 0) > 0 for inv in carried for item in SELLABLE if item != \"WHEAT\"):\n        return []\n    if any(shed.get(item, 0) > 0 for item in SELLABLE if item != \"WHEAT\"):\n        return []\n    price = LAND_PRICES[len(farm[\"unlocked_quadrants\"]) - 1]\n    cash = farm[\"money\"]\n    if cash < price and sales:\n        cash += _sale_revenue(obs, sales)\n    return [[\"BUY_LAND\"]] if cash >= price else []\n'''
-          new = '''def _land_orders(obs, farm, pending_sales=()):\n    \"\"\"Buy scheduled land as soon as real cash can fund it.\n\n    Goods still carried by workers remain future revenue, but they are not a\n    prerequisite for an already-funded expansion. SELL orders earlier in this\n    same market pass may finish funding the purchase; unsold inventory does not\n    count as imaginary cash.\n    \"\"\"\n    if not should_buy_land_on_schedule(obs, farm):\n        return []\n    price = LAND_PRICES[len(farm[\"unlocked_quadrants\"]) - 1]\n    cash = farm[\"money\"]\n    sales = [order for order in pending_sales if order[0] == \"SELL\"]\n    if cash < price and sales:\n        cash += _sale_revenue(obs, sales)\n    return [[\"BUY_LAND\"]] if cash >= price else []\n'''
-          if old not in text:
+
+          old_land = '''def _land_orders(obs, farm, pending_sales=()):\n    if not should_buy_land_on_schedule(obs, farm):\n        return []\n    shed = Counter(obs[\"private\"][\"shed\"])\n    sales = [order for order in pending_sales if order[0] == \"SELL\"]\n    for _op, item, quantity in sales:\n        shed[item] = max(0, shed.get(item, 0) - int(quantity))\n    carried = obs[\"private\"].get(\"inventories\", [])\n    if any(inv.get(item, 0) > 0 for inv in carried for item in SELLABLE if item != \"WHEAT\"):\n        return []\n    if any(shed.get(item, 0) > 0 for item in SELLABLE if item != \"WHEAT\"):\n        return []\n    price = LAND_PRICES[len(farm[\"unlocked_quadrants\"]) - 1]\n    cash = farm[\"money\"]\n    if cash < price and sales:\n        cash += _sale_revenue(obs, sales)\n    return [[\"BUY_LAND\"]] if cash >= price else []\n'''
+          new_land = '''def _land_orders(obs, farm, pending_sales=()):\n    \"\"\"Buy scheduled land as soon as real cash can fund it.\n\n    Goods still carried by workers remain future revenue, but they are not a\n    prerequisite for an already-funded expansion. SELL orders earlier in this\n    same market pass may finish funding the purchase; unsold inventory does not\n    count as imaginary cash.\n    \"\"\"\n    if not should_buy_land_on_schedule(obs, farm):\n        return []\n    price = LAND_PRICES[len(farm[\"unlocked_quadrants\"]) - 1]\n    cash = farm[\"money\"]\n    sales = [order for order in pending_sales if order[0] == \"SELL\"]\n    if cash < price and sales:\n        cash += _sale_revenue(obs, sales)\n    return [[\"BUY_LAND\"]] if cash >= price else []\n'''
+          if old_land not in text:
               raise SystemExit('land-order block not found')
-          text = text.replace(old, new)
+          text = text.replace(old_land, new_land)
+
           floor = '''            if should_buy_land_on_schedule(obs, farm):\n                hand_count = max(hand_count, 10)\n'''
           if floor not in text:
               raise SystemExit('forced hand floor not found')
-          agent.write_text(text.replace(floor, ''))
+          text = text.replace(floor, '')
+
+          state_old = '''        \"deferred_expansion_positions\": set(),\n        \"protective_debt_positions\": set(),\n    }'''
+          state_new = '''        \"deferred_expansion_positions\": set(),\n        \"protective_debt_positions\": set(),\n        \"intraday_expansion_day\": -1,\n    }'''
+          if state_old not in text:
+              raise SystemExit('state block not found')
+          text = text.replace(state_old, state_new)
+
+          detect_old = '''        if hour > 0 and any(position not in targets for position in _active_positions(farm)):\n            positions = _active_positions(farm)\n            state[\"opening_active\"] = opening_governs(obs, targets, positions)\n            plan_targets(\n                obs, targets,\n                positions if not state[\"opening_active\"] else [p for p in positions if p not in targets],\n                effective_end, planner_version,\n            )\n'''
+          detect_new = '''        if hour > 0 and any(position not in targets for position in _active_positions(farm)):\n            positions = _active_positions(farm)\n            # A successful mid-day land purchase creates a burst of profitable\n            # vacancies. Do not respond by buying a second wave of labor just\n            # to fill the new quadrant before dusk. schedule_open_tiles will\n            # admit the subset that today's already-real workforce can route;\n            # remaining targets wait for tomorrow's normal morning sizing.\n            state[\"intraday_expansion_day\"] = day\n            state[\"opening_active\"] = opening_governs(obs, targets, positions)\n            plan_targets(\n                obs, targets,\n                positions if not state[\"opening_active\"] else [p for p in positions if p not in targets],\n                effective_end, planner_version,\n            )\n'''
+          if detect_old not in text:
+              raise SystemExit('land detection block not found')
+          text = text.replace(detect_old, detect_new)
+
+          hires_old = '''        hire_costs = (\n            [_hire_costs(farm, count) for count in range(1, MAX_HANDS - len(farm[\"hands\"]) + 1)]\n            if hour >= 2 and not state[\"unverified_hand_indices\"]\n            and not (state[\"opening_active\"] and opening_version == \"melon_v2\" and day < 4) else []\n        )'''
+          hires_new = '''        hire_costs = (\n            [_hire_costs(farm, count) for count in range(1, MAX_HANDS - len(farm[\"hands\"]) + 1)]\n            if hour >= 2 and not state[\"unverified_hand_indices\"]\n            and state[\"intraday_expansion_day\"] != day\n            and not (state[\"opening_active\"] and opening_version == \"melon_v2\" and day < 4) else []\n        )'''
+          if hires_old not in text:
+              raise SystemExit('intraday hire-cost block not found')
+          text = text.replace(hires_old, hires_new)
+          agent.write_text(text)
 
           tests = Path('tests/test_agents_opening_book.py')
           text = tests.read_text()
           old_test = '''def test_land_waits_for_liquidation_and_cash():\n    from agents.expansion_agent import _land_orders\n    obs = make_obs(6)\n    farm = obs[\"farms\"][0]\n    farm[\"money\"] = 100000\n    obs[\"private\"] = {\"shed\": {\"WHEAT\": 100, \"MILK\": 1}, \"inventories\": [{}]}\n    assert _land_orders(obs, farm) == []\n    obs[\"private\"][\"shed\"].pop(\"MILK\")\n    obs[\"private\"][\"inventories\"] = [{\"FERTILIZER\": 1}]\n    assert _land_orders(obs, farm) == []\n    obs[\"private\"][\"inventories\"] = [{}]\n    assert _land_orders(obs, farm) == [[\"BUY_LAND\"]]\n    farm[\"money\"] = 0\n    assert _land_orders(obs, farm) == []\n'''
-          new_test = '''def test_land_buys_once_funded_without_waiting_for_all_liquidation():\n    from agents.expansion_agent import _land_orders\n    obs = make_obs(6)\n    farm = obs[\"farms\"][0]\n    obs[\"private\"] = {\n        \"shed\": {\"WHEAT\": 100, \"MILK\": 1},\n        \"inventories\": [{\"FERTILIZER\": 1}],\n    }\n\n    # Carried/shed output must not block land that current cash already funds.\n    farm[\"money\"] = 1000\n    assert _land_orders(obs, farm) == [[\"BUY_LAND\"]]\n\n    # Same-pass sales can finish funding the purchase.\n    obs[\"market\"] = {\n        \"inventory\": {\"FERTILIZER\": 10000},\n        \"params\": None,\n    }\n    farm[\"money\"] = 900\n    assert _land_orders(\n        obs, farm, [[\"SELL\", \"FERTILIZER\", 2]]\n    ) == [[\"BUY_LAND\"]]\n\n    # Unsold/carried goods do not count as cash.\n    farm[\"money\"] = 0\n    assert _land_orders(obs, farm) == []\n'''
+          new_test = '''def test_land_buys_once_funded_without_waiting_for_all_liquidation():\n    from agents.expansion_agent import _land_orders\n    obs = make_obs(6)\n    farm = obs[\"farms\"][0]\n    obs[\"private\"] = {\n        \"shed\": {\"WHEAT\": 100, \"MILK\": 1},\n        \"inventories\": [{\"FERTILIZER\": 1}],\n    }\n\n    farm[\"money\"] = 1000\n    assert _land_orders(obs, farm) == [[\"BUY_LAND\"]]\n\n    obs[\"market\"] = {\n        \"inventory\": {\"FERTILIZER\": 10000},\n        \"params\": None,\n    }\n    farm[\"money\"] = 900\n    assert _land_orders(\n        obs, farm, [[\"SELL\", \"FERTILIZER\", 2]]\n    ) == [[\"BUY_LAND\"]]\n\n    farm[\"money\"] = 0\n    assert _land_orders(obs, farm) == []\n'''
           if old_test not in text:
               raise SystemExit('old land regression not found')
           tests.write_text(text.replace(old_test, new_test))
@@ -50,7 +71,7 @@ jobs:
             tests/test_agents_intraday.py \
             tests/test_agents_affordable_production.py \
             tests/test_agents_melon_opening.py
-      - name: Verify fewer hands still expand and produce
+      - name: Verify existing workforce fills new land
         run: |
           PYTHONPATH=. python - <<'PY'
           from kaggle_environments import make
@@ -78,7 +99,7 @@ jobs:
               results[version] = (max_hands, buy_hours, ne_prod)
               print(version, 'max_day7_hands=', max_hands, 'buy_hours=', buy_hours, 'ne_prod=', ne_prod)
               assert buy_hours and ne_prod > 0
-          assert results['classic'][0] < 10
+          assert results['classic'][0] < 10, results['classic']
           print('classic_hands_saved_vs_old_floor=', 10 - results['classic'][0])
           PY
       - name: Commit validated expansion sizing
@@ -86,5 +107,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add agents/expansion_agent.py tests/test_agents_opening_book.py
-          git commit -m 'optimize: let routes size expansion labor'
+          git commit -m 'optimize: bound intraday expansion labor'
           git push
