@@ -14,25 +14,30 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install kaggle-environments==1.32.7 pytest
-      - name: Apply cash-first route selection and remove fixed hand floor
+      - name: Apply affordability-first land gate and remove fixed hand floor
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          scheduler = Path('agents/scheduler.py')
-          text = scheduler.read_text()
-          old = '''def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n    \"\"\"Pack mandatory work, then repair a failed layout before adding labor.\n\n    The historical balanced pass remains authoritative whenever it already\n    fits.  Only a failed worker count triggers alternatives: harder-first\n    ordering, then marginal-route clustering.  This preserves deadline spread\n    on normal days while recovering cases where greedy balancing scatters a\n    geographic cluster and falsely asks ``hands_needed`` for another hand.\n    \"\"\"\n    best_buckets, best_unassigned = _pack_once(\n        tasks, worker_starts, budgets, shed_access, hard_first=False\n    )\n    if not best_unassigned or len(worker_starts) <= 1:\n        return best_buckets, best_unassigned\n\n    for hard_first, compact in ((True, False), (False, True), (True, True)):\n        buckets, unassigned = _pack_once(\n            tasks, worker_starts, budgets, shed_access,\n            hard_first=hard_first, compact=compact,\n        )\n        if len(unassigned) < len(best_unassigned):\n            best_buckets, best_unassigned = buckets, unassigned\n        if not best_unassigned:\n            break\n    return best_buckets, best_unassigned\n'''
-          new = '''def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n    \"\"\"Pack mandatory work and choose the best feasible route layout.\n\n    Normal days keep the historical balanced layout whenever it fits.  A\n    failed layout still gets harder-first / compact repair passes.  Cash-first\n    days are different: an immediate DROP is a real investment deadline, so\n    even an already-feasible worker count compares the alternate layouts and\n    chooses the one that banks those cash tasks earliest before considering\n    total route length.\n    \"\"\"\n    cash_first = any(task.must_liquidate and task.immediate_drop for task in tasks)\n\n    def layout_score(buckets, unassigned):\n        lengths = [\n            len(_mandatory_queue(start, bucket, shed_access)[0])\n            for start, bucket in zip(worker_starts, buckets)\n        ]\n        cash_steps = []\n        if cash_first:\n            for start, bucket in zip(worker_starts, buckets):\n                for index, task in enumerate(bucket):\n                    if task.must_liquidate and task.immediate_drop:\n                        cash_steps.append(\n                            len(_mandatory_queue(start, bucket[:index + 1], shed_access)[0])\n                        )\n        return (\n            len(unassigned),\n            sum(cash_steps),\n            max(cash_steps, default=0),\n            max(lengths, default=0),\n            sum(lengths),\n        )\n\n    best_buckets, best_unassigned = _pack_once(\n        tasks, worker_starts, budgets, shed_access, hard_first=False\n    )\n    if not cash_first and (not best_unassigned or len(worker_starts) <= 1):\n        return best_buckets, best_unassigned\n\n    best_score = layout_score(best_buckets, best_unassigned)\n    for hard_first, compact in ((True, False), (False, True), (True, True)):\n        buckets, unassigned = _pack_once(\n            tasks, worker_starts, budgets, shed_access,\n            hard_first=hard_first, compact=compact,\n        )\n        score = layout_score(buckets, unassigned)\n        if score < best_score:\n            best_buckets, best_unassigned, best_score = buckets, unassigned, score\n        if not cash_first and not best_unassigned:\n            break\n    return best_buckets, best_unassigned\n'''
-          if old not in text:
-              raise SystemExit('pack block not found')
-          scheduler.write_text(text.replace(old, new))
-
           agent = Path('agents/expansion_agent.py')
           text = agent.read_text()
+          old_land = '''def _land_orders(obs, farm, pending_sales=()):\n    if not should_buy_land_on_schedule(obs, farm):\n        return []\n    shed = Counter(obs[\"private\"][\"shed\"])\n    sales = [order for order in pending_sales if order[0] == \"SELL\"]\n    for _op, item, quantity in sales:\n        shed[item] = max(0, shed.get(item, 0) - int(quantity))\n    carried = obs[\"private\"].get(\"inventories\", [])\n    if any(inv.get(item, 0) > 0 for inv in carried for item in SELLABLE if item != \"WHEAT\"):\n        return []\n    if any(shed.get(item, 0) > 0 for item in SELLABLE if item != \"WHEAT\"):\n        return []\n    price = LAND_PRICES[len(farm[\"unlocked_quadrants\"]) - 1]\n    cash = farm[\"money\"]\n    if cash < price and sales:\n        cash += _sale_revenue(obs, sales)\n    return [[\"BUY_LAND\"]] if cash >= price else []\n'''
+          new_land = '''def _land_orders(obs, farm, pending_sales=()):\n    \"\"\"Buy scheduled land as soon as this market pass can afford it.\n\n    Output still in a worker inventory is future revenue, not a prerequisite\n    for expansion.  Waiting for every carried sellable to reach the shed can\n    delay a funded land purchase by most of the day.  Only cash already on\n    hand plus SELL orders that execute earlier in this same market pass count\n    toward affordability.\n    \"\"\"\n    if not should_buy_land_on_schedule(obs, farm):\n        return []\n    price = LAND_PRICES[len(farm[\"unlocked_quadrants\"]) - 1]\n    sales = [order for order in pending_sales if order[0] == \"SELL\"]\n    cash = farm[\"money\"] + _sale_revenue(obs, sales)\n    return [[\"BUY_LAND\"]] if cash >= price else []\n'''
+          if old_land not in text:
+              raise SystemExit('land-order block not found')
+          text = text.replace(old_land, new_land)
           floor = '''            if should_buy_land_on_schedule(obs, farm):\n                hand_count = max(hand_count, 10)\n'''
           if floor not in text:
               raise SystemExit('forced hand floor not found')
           agent.write_text(text.replace(floor, ''))
+
+          tests = Path('tests/test_agents_opening_book.py')
+          text = tests.read_text()
+          old_test = '''def test_land_waits_for_liquidation_and_cash():\n    from agents.expansion_agent import _land_orders\n    obs = make_obs(6)\n    farm = obs[\"farms\"][0]\n    farm[\"money\"] = 100000\n    obs[\"private\"] = {\"shed\": {\"WHEAT\": 100, \"MILK\": 1}, \"inventories\": [{}]}\n    assert _land_orders(obs, farm) == []\n    obs[\"private\"][\"shed\"].pop(\"MILK\")\n    obs[\"private\"][\"inventories\"] = [{\"FERTILIZER\": 1}]\n    assert _land_orders(obs, farm) == []\n    obs[\"private\"][\"inventories\"] = [{}]\n    assert _land_orders(obs, farm) == [[\"BUY_LAND\"]]\n    farm[\"money\"] = 0\n    assert _land_orders(obs, farm) == []\n'''
+          new_test = '''def test_land_buys_once_affordable_without_waiting_for_all_liquidation():\n    from agents.expansion_agent import _land_orders\n    obs = make_obs(6)\n    farm = obs[\"farms\"][0]\n    obs[\"private\"] = {\n        \"shed\": {\"WHEAT\": 100, \"MILK\": 1},\n        \"inventories\": [{\"FERTILIZER\": 1}],\n    }\n\n    # Carried/shed output must not block land that is already funded.\n    farm[\"money\"] = 1000\n    assert _land_orders(obs, farm) == [[\"BUY_LAND\"]]\n\n    # A SELL earlier in the same market pass may finish funding the purchase.\n    farm[\"money\"] = 900\n    assert _land_orders(obs, farm, [[\"SELL\", \"FERTILIZER\", 2]]) == [[\"BUY_LAND\"]]\n\n    # Unsold or still-carried goods are not imaginary cash.\n    farm[\"money\"] = 0\n    assert _land_orders(obs, farm) == []\n'''
+          if old_test not in text:
+              raise SystemExit('old land test not found')
+          tests.write_text(text.replace(old_test, new_test))
           PY
       - name: Focused regressions
         run: |
@@ -42,8 +47,10 @@ jobs:
             tests/test_agents_opening_cash_priority.py \
             tests/test_agents_opening_book.py \
             tests/test_survival_debt_regression.py \
-            tests/test_agents_intraday.py
-      - name: Verify route labor and day-seven production
+            tests/test_agents_intraday.py \
+            tests/test_agents_affordable_production.py \
+            tests/test_agents_melon_opening.py
+      - name: Verify day-seven labor and production
         run: |
           PYTHONPATH=. python - <<'PY'
           from kaggle_environments import make
@@ -71,12 +78,13 @@ jobs:
               print(version, 'max_day7_hands=', max_hands, 'buy_hours=', buy_hours, 'ne_prod=', ne_prod)
               results[version] = (max_hands, buy_hours, ne_prod)
               assert buy_hours and ne_prod > 0
+          print('classic_hand_reduction_vs_old_floor=', 10 - results['classic'][0])
           assert results['classic'][0] < 10
           PY
-      - name: Commit validated route optimization
+      - name: Commit validated change
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add agents/scheduler.py agents/expansion_agent.py
-          git commit -m 'optimize: bank expansion cash with fewer hands'
+          git add agents/expansion_agent.py tests/test_agents_opening_book.py
+          git commit -m 'optimize: expand once cash is available'
           git push
