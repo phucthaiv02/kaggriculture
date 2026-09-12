@@ -1,4 +1,4 @@
-name: Planner joint allocation smoke
+name: Planner value smoke
 on:
   push:
     branches: [feat/planner-capacity-v4]
@@ -48,28 +48,49 @@ jobs:
           with open('/tmp/planner_base.json', 'w') as f:
               json.dump(result, f)
           PY
-      - name: Apply selector-preserving joint allocation
+      - name: Apply shared-horizon planner
         run: |
           python - <<'PY'
           from pathlib import Path
 
           planner = Path('agents/planner.py')
           text = planner.read_text()
-          old = '''    for position in sorted(\n        replanning, key=lambda p: (distance(p), p[1], p[0])\n    ):\n        x, y = position\n        tile = farm[\"tiles\"][y][x]\n        allowed = candidates\n        if isinstance(tile, dict) and tile.get(\"kind\") in (\"COOP\", \"PASTURE\"):\n            allowed = [\n                c\n                for c in candidates\n                if c[0][0] in ANIMALS\n                and official_game.ANIMALS[c[0][0]][\"structure\"] == tile[\"kind\"]\n            ]\n\n        allowed = [candidate for candidate in allowed if start_cost(candidate[0]) <= max(0, cash)]\n        selector = (\n            _choose_daily_mirrored\n            if planner_version == \"mirror_v2\"\n            else _choose_daily\n        )\n        choice, output = selector(\n            market, baseline, allowed, counts, labor, position\n        )\n        targets[position] = choice\n        if not choice:\n            continue\n\n        reserve_start(choice)\n        baseline.add(output, position)\n        if planner_version == \"mirror_v2\":\n            # Keep the rival's mirrored commitment in later tile decisions;\n            # each accepted target represents one producer for each player.\n            external.add(output, position)\n        counts[choice[0]] += 1\n'''
-          new = '''    # Choose the best position/producer pair under the same selector and\n    # affordability rules used historically.  The old nearest-first loop gave\n    # nearby tiles first claim on cash, labor and favorable market depth before\n    # farther positions were even evaluated.  Here every remaining position\n    # proposes its locally best affordable target; only then do we commit the\n    # strongest marginal proposal and reprice the rest against the new shared\n    # baseline.  Keeping the selector call intact preserves planner-version\n    # behavior and the affordability contract tested by production regressions.\n    selector = (\n        _choose_daily_mirrored\n        if planner_version == \"mirror_v2\"\n        else _choose_daily\n    )\n    pending = set(replanning)\n    while pending:\n        proposals = []\n        for position in sorted(pending):\n            x, y = position\n            tile = farm[\"tiles\"][y][x]\n            allowed = candidates\n            if isinstance(tile, dict) and tile.get(\"kind\") in (\"COOP\", \"PASTURE\"):\n                allowed = [\n                    c\n                    for c in candidates\n                    if c[0][0] in ANIMALS\n                    and official_game.ANIMALS[c[0][0]][\"structure\"] == tile[\"kind\"]\n                ]\n            allowed = [\n                candidate for candidate in allowed\n                if start_cost(candidate[0]) <= max(0, cash)\n            ]\n            choice, output = selector(\n                market, baseline, allowed, counts, labor, position\n            )\n            if not choice:\n                continue\n\n            # Score exactly the selector's chosen target at this position.\n            # In normal operation this reproduces the selector's own economic\n            # ranking; in tests it also honors a monkeypatched selector rather\n            # than silently bypassing it.\n            chosen_candidates = [c for c in allowed if c[0] == choice]\n            scored = evaluate_daily_targets(\n                market, baseline, chosen_candidates, labor, position,\n                mirror_opponent=planner_version == \"mirror_v2\",\n            )\n            if not scored:\n                continue\n            result = scored[0]\n            if planner_version == \"mirror_v2\":\n                rank = (\n                    result.profit_per_day, result.profit,\n                    -counts[choice[0]], choice,\n                )\n            else:\n                rank = (\n                    result.profit_per_day\n                    / (1.0 + TARGET_CONCENTRATION_PENALTY * counts[choice[0]]),\n                    result.profit_per_day, result.profit,\n                    -counts[choice[0]], choice,\n                )\n            proposals.append((\n                rank, -distance(position), -position[1], -position[0],\n                position, choice, output,\n            ))\n\n        if not proposals:\n            for position in pending:\n                targets[position] = None\n            break\n\n        *_, position, choice, output = max(\n            proposals, key=lambda item: item[:-3]\n        )\n        targets[position] = choice\n        reserve_start(choice)\n        baseline.add(output, position)\n        if planner_version == \"mirror_v2\":\n            # Keep the rival's mirrored commitment in later tile decisions;\n            # each accepted target represents one producer for each player.\n            external.add(output, position)\n        counts[choice[0]] += 1\n        pending.remove(position)\n'''
+          old = '''def _daily_candidates(day, end_day):\n    \"\"\"Fresh targets projected only through their own comparison horizon.\"\"\"\n    for name in sorted((*CROPS, *ANIMALS)):\n        target_end = _planner_cycle_end(name, day, end_day)\n        first = _first_yield_age(name)\n        if day + first > target_end:\n            continue\n        for fertilize in ((False, True) if name in CROPS else (False,)):\n            output, cost = _rotation(name, fertilize, day, target_end)\n            yield (name, fertilize), output, cost\n'''
+          new = '''def _daily_candidates(day, end_day):\n    \"\"\"Project every fresh target through one shared rolling horizon.\n\n    Producer-specific first-yield windows made profit/day easy to compare, but\n    they hid repeat harvests and replants from slower/high-value producers. A\n    common horizon makes marginal net value directly comparable while keeping\n    the existing 16-day runtime bound.\n    \"\"\"\n    target_end = _cycle_end(day, end_day)\n    for name in sorted((*CROPS, *ANIMALS)):\n        first = _first_yield_age(name)\n        if day + first > target_end:\n            continue\n        for fertilize in ((False, True) if name in CROPS else (False,)):\n            output, cost = _rotation(name, fertilize, day, target_end)\n            yield (name, fertilize), output, cost\n'''
           if old not in text:
-              raise SystemExit('planner allocation loop not found')
-          planner.write_text(text.replace(old, new))
+              raise SystemExit('daily candidates block not found')
+          text = text.replace(old, new)
+
+          old_eval = '''    \"\"\"Evaluate fresh targets on per-type horizons and normalize by elapsed day.\n\n    Crops are scoped to their max-yield age. Animals use their configured fresh\n    target windows. Near season end the window is truncated to the last playable\n    day, but a target still must reach at least its first yield.\n    \"\"\"'''
+          new_eval = '''    \"\"\"Evaluate fresh targets on one shared rolling comparison horizon.\n\n    All producers see the same endpoint, so net profit and profit/day induce\n    the same value ordering before the concentration tie-break. Near season end\n    the window is truncated to the last playable day.\n    \"\"\"'''
+          if old_eval not in text:
+              raise SystemExit('daily evaluation doc not found')
+          text = text.replace(old_eval, new_eval)
+          old_end = '''        end = _planner_cycle_end(name, market.day, market.end_day)'''
+          new_end = '''        end = _cycle_end(market.day, market.end_day)'''
+          if old_end not in text:
+              raise SystemExit('per-type evaluation horizon not found')
+          text = text.replace(old_end, new_end)
+
+          old_choose = '''    \"\"\"Choose positive marginal profit/day with a light concentration haircut.\n\n    MarketForecast already prices the next unit against projected shared supply.\n    This extra haircut is deliberately small: it only makes a near-tie prefer a\n    less-concentrated producer instead of repeatedly leaning on one forecast.\n    \"\"\"'''
+          new_choose = '''    \"\"\"Choose positive marginal net value on the shared planning horizon.\n\n    All candidates now span the same number of days, so profit/day preserves\n    absolute net-value ordering. The light concentration haircut only breaks\n    near-ties after forecast market slippage and labor cost.\n    \"\"\"'''
+          if old_choose not in text:
+              raise SystemExit('choose doc not found')
+          text = text.replace(old_choose, new_choose)
+          text = text.replace(
+              '''    \"\"\"Choose profit/day assuming the opponent adds the same producer.\"\"\"''',
+              '''    \"\"\"Choose shared-horizon net value with mirrored rival production.\"\"\"''',
+          )
+          text = text.replace(
+              '''    Existing crops are forecast from their real age, held yield and watering\n    state, including visible opponent crops. Unsown choices are reconsidered\n    each day. Fresh choices use target-specific horizons and are ranked by\n    marginal net profit/day with a light same-producer concentration haircut;\n    shared baseline saturation and route load are updated after every accepted\n    tile.''',
+              '''    Existing crops are forecast from their real age, held yield and watering\n    state, including visible opponent crops. Unsown choices are reconsidered\n    each day. Fresh choices share one rolling horizon and are ranked by marginal\n    net value with a light same-producer concentration haircut; shared baseline\n    saturation and route load are updated after every accepted tile.''',
+          )
+          planner.write_text(text)
 
           tests = Path('tests/test_agents_planner.py')
-          text = tests.read_text()
-          old_test = '''    assert seen_external == [0, 4]\n'''
-          new_test = '''    # Joint allocation evaluates every pending position before committing\n    # one, so both first-round proposals see the same zero external baseline.\n    # After the first commitment, the remaining proposal must see that rival\n    # production in the shared market forecast.\n    assert seen_external == [0, 0, 4]\n'''
-          if old_test not in text:
-              raise SystemExit('mirror expectation not found')
-          text = text.replace(old_test, new_test)
-          text += '''\n\ndef test_plan_targets_ranks_positions_before_committing_cash(monkeypatch):\n    from agents import planner\n    from agents.forecast import Production\n\n    near, far = (4, 4), (0, 0)\n\n    def choose(_market, baseline, candidates, _counts, _labor, position):\n        if not candidates:\n            return None, None\n        output = Production()\n        committed = sum(sum(values.values()) for values in baseline.sales.values())\n        if position == far and committed == 0:\n            output.sales[4][\"MELON\"] = 20\n            return (\"MELON\", False), output\n        output.sales[4][\"WHEAT\"] = 1\n        return (\"WHEAT\", False), output\n\n    monkeypatch.setattr(planner, \"_choose_daily\", choose)\n    targets = {}\n    plan_targets(make_obs(day=0, money=10000), targets, [near, far], end_day=29)\n    assert targets[far] == (\"MELON\", False)\n    assert targets[near] == (\"WHEAT\", False)\n'''
-          tests.write_text(text)
+          t = tests.read_text()
+          t += '''\n\ndef test_fresh_targets_share_one_comparison_horizon(monkeypatch):\n    from agents import planner\n    from agents.forecast import Production\n\n    seen = []\n\n    def rotation(name, fertilize, day, end_day, tile=None):\n        seen.append((name, end_day))\n        return Production(), 1\n\n    monkeypatch.setattr(planner, \"_rotation\", rotation)\n    list(planner._daily_candidates(7, 29))\n    assert seen\n    assert {end for _name, end in seen} == {23}\n'''
+          tests.write_text(t)
           PY
       - name: Planner regressions
         run: |
@@ -119,10 +140,10 @@ jobs:
           print('money_delta=', cand['money'] - base['money'], 'hand_day_delta=', cand['hand_days'] - base['hand_days'])
           assert cand['money'] > base['money'], (base, cand)
           PY
-      - name: Commit planner optimization
+      - name: Commit planner value optimization
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add agents/planner.py tests/test_agents_planner.py
-          git commit -m 'optimize: jointly rank planner positions'
+          git commit -m 'optimize: compare planner targets on shared horizon'
           git push
