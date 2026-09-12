@@ -13,56 +13,51 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install kaggle-environments==1.32.7 pytest
-      - name: Measure day-seven workforce threshold
+      - run: pip install kaggle-environments==1.32.7
+      - name: Trace classic day-seven cash route with six hands
         run: |
           python - <<'PY'
           from pathlib import Path
-          import subprocess, sys
-
           path = Path('agents/expansion_agent.py')
-          original = path.read_text()
-          needle = '            if should_buy_land_on_schedule(obs, farm):\n                hand_count = max(hand_count, 10)\n'
-          if needle not in original:
-              raise SystemExit('forced hand floor not found')
-
-          script = r'''
+          text = path.read_text()
+          text = text.replace(
+              '            if should_buy_land_on_schedule(obs, farm):\n                hand_count = max(hand_count, 10)\n',
+              '',
+          )
+          path.write_text(text)
+          PY
+          PYTHONPATH=. python - <<'PY'
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
-          import sys
-          version = sys.argv[1]
+
           env = make('kaggriculture', configuration={
               'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 169,
           }, debug=False)
-          agent = make_agent(opening_version=version)
+          agent = make_agent(opening_version='classic')
           env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
-          day6 = [frame[0] for frame in env.steps if frame[0].observation.day == 6]
-          max_hands = max(len(frame.observation.farms[0].hands) for frame in day6)
-          buy_hours = [
-              frame.observation.hour for frame in day6
-              if any(order and order[0] == 'BUY_LAND' for order in (frame.action or {}).get('market', []))
-          ]
-          final = env.steps[-1][0].observation.farms[0]
-          ne_prod = sum(
-              isinstance(final.tiles[y][x], dict)
-              and bool(final.tiles[y][x].get('crop') or final.tiles[y][x].get('animal'))
-              for y in range(5) for x in range(5, 10)
-          )
-          print(version, 'max_hands', max_hands, 'buy_hours', buy_hours, 'ne_prod', ne_prod)
-          '''
 
-          for floor in (0, 6, 7, 8, 9, 10):
-              replacement = '' if floor == 0 else (
-                  '            if should_buy_land_on_schedule(obs, farm):\n'
-                  f'                hand_count = max(hand_count, {floor})\n'
-              )
-              path.write_text(original.replace(needle, replacement))
-              print('=== FLOOR', floor, '===', flush=True)
-              for version in ('classic', 'melon_v2'):
-                  subprocess.run(
-                      [sys.executable, '-c', script, version],
-                      check=True,
-                      env={**__import__('os').environ, 'PYTHONPATH': '.'},
+          interesting = {'HARVEST', 'COLLECT_FERTILIZER', 'DROP', 'PICKUP', 'PLANT', 'PLACE'}
+          for frame in env.steps:
+              step = frame[0]
+              obs = step.observation
+              if obs.day != 6:
+                  continue
+              action = step.action or {}
+              market = action.get('market', [])
+              worker_ops = [action.get('farmer', ['PASS']), *action.get('hands', [])]
+              key_ops = [(i, op) for i, op in enumerate(worker_ops) if op and op[0] in interesting]
+              sells = [o for o in market if o and o[0] == 'SELL']
+              hires = sum(bool(o and o[0] == 'HIRE') for o in market)
+              land = any(o and o[0] == 'BUY_LAND' for o in market)
+              if key_ops or sells or hires or land or obs.hour in (0,1,18,19,20,21,22,23):
+                  farm = obs.farms[0]
+                  print(
+                      f'h={obs.hour:02d} money={farm.money:.0f} hands={len(farm.hands)} '
+                      f'ops={key_ops} sells={sells} hires={hires} land={land}'
                   )
-          path.write_text(original)
+          final = env.steps[-1][0].observation.farms[0]
+          print('FINAL_NE', [
+              (x,y,final.tiles[y][x]) for y in range(5) for x in range(5,10)
+              if isinstance(final.tiles[y][x], dict)
+          ])
           PY
