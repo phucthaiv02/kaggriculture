@@ -1,0 +1,75 @@
+name: Benchmark 13-hand economic ceiling
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/scheduler-cap13-benchmark.yml]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -q kaggle-environments==1.32.7
+      - name: Full-season melon with 13-hand ceiling
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          from collections import Counter
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+
+          CAP = 13
+          base = make_agent(opening_version='melon_v2')
+          dropped_hires = Counter()
+
+          def agent(obs):
+              action = base(obs)
+              market = []
+              hands = len(obs.farms[0].hands)
+              room = max(0, CAP - hands)
+              for order in action.get('market', []):
+                  if order and order[0] == 'HIRE':
+                      if room <= 0:
+                          dropped_hires[obs.day] += 1
+                          continue
+                      room -= 1
+                  market.append(order)
+              action['market'] = market
+              return action
+
+          env = make('kaggriculture', configuration={
+              'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 720,
+          }, debug=False)
+          env.run([agent, lambda obs: {'farmer':['PASS'],'market':[]}])
+          daily = {}
+          max_weeds = 0
+          for frame in env.steps:
+              o = frame[0].observation
+              farm = o.farms[0]
+              daily[o.day] = max(daily.get(o.day, 0), len(farm.hands))
+              weeds = sum(tile == 'WEED' for row in farm.tiles for tile in row)
+              max_weeds = max(max_weeds, weeds)
+          final = env.steps[-1][0].observation.farms[0]
+          active = Counter()
+          for row in final.tiles:
+              for tile in row:
+                  if isinstance(tile, dict):
+                      name = tile.get('animal') or tile.get('crop')
+                      if name:
+                          active[name] += 1
+          result = {
+              'money': final.money,
+              'max_hands': max(daily.values()),
+              'hand_days': sum(daily.values()),
+              'daily': daily,
+              'dropped_hires': dict(dropped_hires),
+              'max_weeds': max_weeds,
+              'active': dict(active),
+          }
+          print('BASELINE', {'money':12674.0,'max_hands':16,'hand_days':140})
+          print('CAP13', result)
+          print('DELTA', result['money']-12674.0, result['max_hands']-16, result['hand_days']-140)
+          PY
