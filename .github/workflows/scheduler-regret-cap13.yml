@@ -1,0 +1,137 @@
+name: Benchmark regret packing with 13-hand ceiling
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/scheduler-regret-cap13.yml]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -q kaggle-environments==1.32.7 pytest
+      - name: Apply regret packing and internal 13-hand ceiling
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          # Regret fallback: preserve execution priority, but reserve scarce
+          # worker slots before easy tasks consume them.
+          p = Path('agents/scheduler.py')
+          s = p.read_text()
+          marker = '\ndef _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n'
+          fn = dedent('''
+          
+          def _pack_regret(tasks, worker_starts, budgets, shed_access):
+              buckets = [[] for _ in worker_starts]
+              remaining = list(tasks)
+              while remaining:
+                  ranked = []
+                  for index, task in enumerate(remaining):
+                      choices = []
+                      for worker, bucket in enumerate(buckets):
+                          if task.pinned_worker is not None and worker != task.pinned_worker:
+                              continue
+                          choice = _insert_task(
+                              bucket, task, worker_starts[worker], budgets[worker], shed_access
+                          )
+                          if choice is not None:
+                              choices.append((choice[0], choice[1], worker, choice[3]))
+                      if not choices:
+                          continue
+                      choices.sort(key=lambda item: item[:3])
+                      best = choices[0]
+                      regret = choices[1][0] - best[0] if len(choices) > 1 else float('inf')
+                      ranked.append(((len(choices), -regret, _task_priority(task),
+                                      -len(_mandatory_actions(task)),
+                                      task.position[1], task.position[0], index), index, best))
+                  if not ranked:
+                      break
+                  _, index, (_, _, worker, candidate) = min(ranked, key=lambda item: item[0])
+                  buckets[worker] = candidate
+                  remaining.pop(index)
+              return buckets, remaining
+          ''')
+          if marker not in s:
+              raise SystemExit('pack marker missing')
+          s = s.replace(marker, fn + marker, 1)
+          old = '''    for buckets, unassigned in candidates:\n        repaired, remaining = _repair_single_swaps(\n            buckets, unassigned, worker_starts, budgets, shed_access\n        )\n        if len(remaining) < len(best_unassigned):\n            best_buckets, best_unassigned = repaired, remaining\n        if not best_unassigned:\n            break\n    return best_buckets, best_unassigned\n'''
+          new = '''    for buckets, unassigned in candidates:\n        repaired, remaining = _repair_single_swaps(\n            buckets, unassigned, worker_starts, budgets, shed_access\n        )\n        if len(remaining) < len(best_unassigned):\n            best_buckets, best_unassigned = repaired, remaining\n        if not best_unassigned:\n            break\n    if best_unassigned and len(worker_starts) >= 10:\n        regret_buckets, regret_unassigned = _pack_regret(\n            tasks, worker_starts, budgets, shed_access\n        )\n        if len(regret_unassigned) < len(best_unassigned):\n            best_buckets, best_unassigned = regret_buckets, regret_unassigned\n    return best_buckets, best_unassigned\n'''
+          if old not in s:
+              raise SystemExit('pack tail missing')
+          p.write_text(s.replace(old, new, 1))
+
+          # Economic ceiling: all route construction uses the same real worker
+          # ceiling, so no work is assigned to phantom hands that will not be hired.
+          p = Path('agents/expansion_agent.py')
+          s = p.read_text()
+          s = s.replace('BOARD_SIZE = 10\n', 'BOARD_SIZE = 10\nECONOMIC_HAND_CAP = 13\n', 1)
+          old = '''            state.update(\n                day=day, hand_target=hand_target, plans=[], reserved={},'''
+          new = '''            hand_target = min(hand_target, ECONOMIC_HAND_CAP)\n            state.update(\n                day=day, hand_target=hand_target, plans=[], reserved={},'''
+          if old not in s:
+              raise SystemExit('hour0 target block missing')
+          s = s.replace(old, new, 1)
+          old = '''            missing_hands = max(0, hand_count - len(existing_hands))'''
+          new = '''            hand_count = max(\n                len(existing_hands), min(hand_count, ECONOMIC_HAND_CAP)\n            )\n            missing_hands = max(0, hand_count - len(existing_hands))'''
+          if old not in s:
+              raise SystemExit('hour1 hand block missing')
+          s = s.replace(old, new, 1)
+          old = '''            [_hire_costs(farm, count) for count in range(1, MAX_HANDS - len(farm["hands"]) + 1)]'''
+          new = '''            [_hire_costs(farm, count) for count in range(\n                1, max(0, ECONOMIC_HAND_CAP - len(farm["hands"])) + 1\n            )]'''
+          if old not in s:
+              raise SystemExit('intraday hire range missing')
+          s = s.replace(old, new, 1)
+          old = '''            expansion_hires = max(expansion_hires, maintenance_hires)'''
+          new = '''            room = max(0, ECONOMIC_HAND_CAP - len(farm["hands"]))\n            maintenance_hires = min(maintenance_hires, room)\n            expansion_hires = min(max(expansion_hires, maintenance_hires), room)'''
+          if old not in s:
+              raise SystemExit('maintenance hire block missing')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+      - name: Full-season melon benchmark
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          from collections import Counter
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+          env = make('kaggriculture', configuration={'seed':1,'weedSpawnChance':0.0,'episodeSteps':720}, debug=False)
+          agent = make_agent(opening_version='melon_v2')
+          env.run([lambda obs: agent(obs), lambda obs: {'farmer':['PASS'],'market':[]}])
+          daily = {}
+          max_weeds = 0
+          for frame in env.steps:
+              o = frame[0].observation
+              farm = o.farms[0]
+              daily[o.day] = max(daily.get(o.day,0), len(farm.hands))
+              max_weeds = max(max_weeds, sum(tile == 'WEED' for row in farm.tiles for tile in row))
+          final = env.steps[-1][0].observation.farms[0]
+          active = Counter()
+          for row in final.tiles:
+              for tile in row:
+                  if isinstance(tile, dict):
+                      name = tile.get('animal') or tile.get('crop')
+                      if name: active[name] += 1
+          cand = {'money':final.money,'max_hands':max(daily.values()),'hand_days':sum(daily.values()),
+                  'daily':daily,'max_weeds':max_weeds,'active':dict(active)}
+          print('BASELINE', {'money':12674.0,'max_hands':16,'hand_days':140})
+          print('REGRET', {'money':14516.0,'max_hands':16,'hand_days':115})
+          print('REGRET_CAP13', cand)
+          print('DELTA_BASE', cand['money']-12674.0, cand['max_hands']-16, cand['hand_days']-140)
+          assert cand['max_hands'] <= 13, cand
+          PY
+      - name: Focused regressions
+        run: |
+          PYTHONPATH=. pytest -q \
+            tests/test_agents_scheduler.py \
+            tests/test_agents_capacity_guard.py \
+            tests/test_agents_opening_cash_priority.py \
+            tests/test_agents_opening_book.py \
+            tests/test_survival_debt_regression.py \
+            tests/test_agents_intraday.py \
+            tests/test_agents_affordable_production.py \
+            tests/test_agents_melon_opening.py
