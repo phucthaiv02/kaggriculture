@@ -14,10 +14,9 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install kaggle-environments==1.32.7
-      - name: Trace day-six cash and land timing
+      - name: Trace day-six worker cargo
         run: |
           PYTHONPATH=. python - <<'PY'
-          from collections import Counter
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
 
@@ -27,43 +26,22 @@ jobs:
               'episodeSteps': 192,
           }, debug=False)
           base = make_agent(opening_version='melon_v2')
-          trace = []
+          cash_items = ('FERTILIZER','CARROT','MELON','TOMATO','STRAWBERRY','EGG','MILK','WOOL')
 
           def agent(obs):
               action = base(obs)
-              if obs.day == 6:
+              if obs.day == 6 and 3 <= obs.hour <= 8:
                   farm = obs.farms[0]
-                  shed = dict(obs.private.shed)
-                  carried = Counter()
-                  for inv in obs.private.inventories:
-                      carried.update(inv)
-                  worker_ops = [action.get('farmer', ['PASS']), *action.get('hands', [])]
-                  drops = [i for i, op in enumerate(worker_ops) if op and op[0] == 'DROP']
-                  sales = [o for o in action.get('market', []) if o and o[0] == 'SELL']
-                  land = [o for o in action.get('market', []) if o and o[0] == 'BUY_LAND']
-                  trace.append({
-                      'hour': obs.hour,
-                      'money': farm.money,
-                      'hands': len(farm.hands),
-                      'shed_cash': {k: shed.get(k, 0) for k in ('FERTILIZER','CARROT','MELON','TOMATO','STRAWBERRY','EGG','MILK','WOOL') if shed.get(k, 0)},
-                      'carried_cash': {k: carried.get(k, 0) for k in ('FERTILIZER','CARROT','MELON','TOMATO','STRAWBERRY','EGG','MILK','WOOL') if carried.get(k, 0)},
-                      'drops': drops,
-                      'sales': sales,
-                      'land': land,
-                      'market': action.get('market', []),
-                  })
+                  positions = [tuple(farm.farmer), *map(tuple, farm.hands)]
+                  ops = [action.get('farmer', ['PASS']), *action.get('hands', [])]
+                  workers = []
+                  for index, (position, inv) in enumerate(zip(positions, obs.private.inventories)):
+                      cargo = {k: inv.get(k, 0) for k in cash_items if inv.get(k, 0)}
+                      if cargo or (index < len(ops) and ops[index] and ops[index][0] == 'DROP'):
+                          workers.append((index, position, cargo, ops[index] if index < len(ops) else None))
+                  print('D6', obs.hour, 'money', farm.money, 'hands', len(farm.hands), 'workers', workers,
+                        'market', action.get('market', []))
               return action
 
           env.run([agent, lambda obs: {'farmer': ['PASS'], 'market': []}])
-          for row in trace:
-              print('D6', row)
-
-          final = env.steps[-1][0].observation.farms[0]
-          active = []
-          for y, line in enumerate(final.tiles):
-              for x, tile in enumerate(line):
-                  if isinstance(tile, dict) and (tile.get('crop') or tile.get('animal')):
-                      active.append((x, y, tile.get('crop') or tile.get('animal')))
-          print('FINAL', final.money, 'quadrants', list(final.unlocked_quadrants), 'active_count', len(active))
-          print('NE_ACTIVE', [entry for entry in active if entry[0] >= 5 and entry[1] < 5])
           PY
