@@ -1,4 +1,4 @@
-name: Planner today-labor cash smoke
+name: Verify planner labor liquidity guard
 on:
   push:
     branches: [feat/planner-capacity-v4]
@@ -6,7 +6,7 @@ on:
 permissions:
   contents: read
 jobs:
-  smoke:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,67 +14,47 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install kaggle-environments==1.32.7 pytest
-      - name: Apply today-labor cash guard
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('agents/planner.py')
-          text = path.read_text()
-          old = '''    cash = farm["money"]\n    wheat_bought = 0\n    wheat_stock = obs["market"]["inventory"].get("WHEAT", 0)\n'''
-          new = '''    cash = farm["money"]\n    wheat_bought = 0\n    wheat_stock = obs["market"]["inventory"].get("WHEAT", 0)\n\n    def day_labor_cost(flow, position=None):\n        entries = list(baseline.visits.get(day, ()))\n        if flow is not None:\n            entries.extend(\n                (position if p is None else p, count, needs, goods)\n                for p, count, needs, goods in flow.visits.get(day, ())\n            )\n        return labor.cost({day: entries})\n\n    # Capital committed to fresh production must leave enough cash for the\n    # workers required to execute today's already-standing workload. Future\n    # labor remains part of profitability, not today's liquidity constraint.\n    standing_labor_cost = day_labor_cost(None)\n    if standing_labor_cost != float("inf"):\n        cash -= standing_labor_cost\n    else:\n        cash = -1\n'''
-          if old not in text:
-              raise SystemExit('cash block not found')
-          text = text.replace(old, new)
-
-          old = '''        allowed = [candidate for candidate in allowed if start_cost(candidate[0]) <= max(0, cash)]\n        selector = (\n'''
-          new = '''        baseline_day_cost = day_labor_cost(None)\n        affordable = []\n        for candidate in allowed:\n            labor_with_candidate = day_labor_cost(candidate[1], position)\n            marginal_today_labor = (\n                float("inf")\n                if labor_with_candidate == float("inf")\n                else max(0, labor_with_candidate - baseline_day_cost)\n            )\n            if start_cost(candidate[0]) + marginal_today_labor <= max(0, cash):\n                affordable.append(candidate)\n        allowed = affordable\n        selector = (\n'''
-          if old not in text:
-              raise SystemExit('affordability block not found')
-          text = text.replace(old, new)
-
-          old = '''        reserve_start(choice)\n        baseline.add(output, position)\n'''
-          new = '''        before_labor = day_labor_cost(None)\n        after_labor = day_labor_cost(output, position)\n        reserve_start(choice)\n        if after_labor != float("inf"):\n            cash -= max(0, after_labor - before_labor)\n        baseline.add(output, position)\n'''
-          # Only replace the live allocation occurrence near the end. There is
-          # exactly one reserve_start(choice) in the allocation loop.
-          if text.count(old) != 1:
-              raise SystemExit(f'unexpected reserve block count: {text.count(old)}')
-          text = text.replace(old, new)
-          path.write_text(text)
-          PY
-      - name: Candidate melon planner
+      - name: Benchmark committed planner
         run: |
           PYTHONPATH=. python - <<'PY'
-          import json
           from collections import Counter
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
+
           env = make('kaggriculture', configuration={'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 288}, debug=False)
           agent = make_agent(opening_version='melon_v2')
           env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
+
           day_hands = {}
           for frame in env.steps:
               obs = frame[0].observation
               day_hands[obs.day] = max(day_hands.get(obs.day, 0), len(obs.farms[0].hands))
+
           final = env.steps[-1][0].observation.farms[0]
           kinds = Counter()
           for row in final.tiles:
               for tile in row:
                   if isinstance(tile, dict):
                       name = tile.get('animal') or tile.get('crop')
-                      if name: kinds[name] += 1
-          cand = {'money': final.money, 'hand_days': sum(day_hands.get(d, 0) for d in range(6, max(day_hands)+1)), 'kinds': dict(kinds)}
-          base = {'money': 13536.0, 'hand_days': 80}
-          print('BASELINE', base)
-          print('CANDIDATE', cand)
-          print('DELTA', cand['money'] - base['money'], cand['hand_days'] - base['hand_days'])
-          with open('/tmp/candidate.json', 'w') as f: json.dump(cand, f)
-          assert cand['money'] > base['money'], (base, cand)
+                      if name:
+                          kinds[name] += 1
+
+          money = final.money
+          hand_days = sum(day_hands.get(d, 0) for d in range(6, max(day_hands) + 1))
+          result = {'money': money, 'hand_days': hand_days, 'kinds': dict(kinds)}
+          print('COMMITTED', result)
+          assert money > 13536.0, result
+          assert hand_days <= 80, result
           PY
-      - name: Focused planner regressions
+      - name: Planner and execution regressions
         run: |
           PYTHONPATH=. pytest -q \
+            tests/test_planner_liquidity.py \
             tests/test_agents_planner.py \
             tests/test_agents_affordable_production.py \
             tests/test_agents_labor.py \
             tests/test_agents_capacity_guard.py \
+            tests/test_agents_opening_book.py \
+            tests/test_agents_opening_cash_priority.py \
+            tests/test_agents_melon_opening.py \
             tests/test_survival_debt_regression.py
