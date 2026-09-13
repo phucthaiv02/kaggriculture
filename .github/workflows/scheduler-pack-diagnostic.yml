@@ -1,0 +1,72 @@
+name: Diagnose scheduler hand inflation
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/scheduler-pack-diagnostic.yml]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -q kaggle-environments==1.32.7
+      - name: Trace high-hand packing
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          from kaggle_environments import make
+          import agents.expansion_agent as ea
+          import agents.scheduler as sch
+
+          ctx = {'day': None, 'hour': None}
+          original = ea.hands_needed
+          seen = set()
+
+          def wrapped(tasks, farmer_start, existing_hand_starts=(), shed_access=sch.SHED_ACCESS,
+                      pending_hand_budget=sch.HAND_BUDGET, max_hands=sch.MAX_HANDS):
+              result = original(tasks, farmer_start, existing_hand_starts, shed_access,
+                                pending_hand_budget, max_hands)
+              count = result[0]
+              key = (ctx['day'], ctx['hour'], count, len(tasks))
+              if count >= 14 and key not in seen:
+                  seen.add(key)
+                  mandatory = sum(len(sch._mandatory_actions(t)) for t in tasks)
+                  print(f'PACK day={ctx["day"]} hour={ctx["hour"]} tasks={len(tasks)} '
+                        f'mandatory_actions={mandatory} requested_hands={count}')
+                  for hands in range(12, 17):
+                      starts = [tuple(farmer_start)] + sch.predicted_hand_starts(
+                          farmer_start, existing_hand_starts, hands
+                      )
+                      budgets = [sch.FARMER_BUDGET]
+                      budgets += [sch.HAND_BUDGET] * min(hands, len(existing_hand_starts))
+                      budgets += [pending_hand_budget] * max(0, hands - len(existing_hand_starts))
+                      buckets, missing = sch._pack(tasks, starts, budgets, shed_access)
+                      lengths = [len(sch._mandatory_queue(s, b, shed_access)[0])
+                                 for s, b in zip(starts, buckets)]
+                      print(' TRY', hands, 'missing', len(missing),
+                            'lengths', sorted(lengths, reverse=True),
+                            'assigned', sum(len(b) for b in buckets))
+                  by_priority = {}
+                  for t in tasks:
+                      p = sch._task_priority(t)
+                      by_priority[p] = by_priority.get(p, 0) + 1
+                  print(' PRIORITY_GROUPS', sorted(by_priority.items(), key=lambda x: x[0]))
+              return result
+
+          ea.hands_needed = wrapped
+          base = ea.make_agent(opening_version='melon_v2')
+          def agent(obs):
+              ctx['day'], ctx['hour'] = obs.day, obs.hour
+              return base(obs)
+
+          env = make('kaggriculture', configuration={
+              'seed': 1,
+              'weedSpawnChance': 0.0,
+              'episodeSteps': 720,
+          }, debug=False)
+          env.run([agent, lambda obs: {'farmer': ['PASS'], 'market': []}])
+          print('DONE high_hand_cases', len(seen))
+          PY
