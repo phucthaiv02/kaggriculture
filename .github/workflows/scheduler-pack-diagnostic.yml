@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -q kaggle-environments==1.32.7
-      - name: Trace high-hand packing
+      - name: Summarize high-hand packing
         run: |
           PYTHONPATH=. python - <<'PY'
           from kaggle_environments import make
@@ -23,6 +23,7 @@ jobs:
 
           ctx = {'day': None, 'hour': None}
           original = ea.hands_needed
+          rows = []
           seen = set()
 
           def wrapped(tasks, farmer_start, existing_hand_starts=(), shed_access=sch.SHED_ACCESS,
@@ -33,9 +34,7 @@ jobs:
               key = (ctx['day'], ctx['hour'], count, len(tasks))
               if count >= 14 and key not in seen:
                   seen.add(key)
-                  mandatory = sum(len(sch._mandatory_actions(t)) for t in tasks)
-                  print(f'PACK day={ctx["day"]} hour={ctx["hour"]} tasks={len(tasks)} '
-                        f'mandatory_actions={mandatory} requested_hands={count}')
+                  tries = []
                   for hands in range(12, 17):
                       starts = [tuple(farmer_start)] + sch.predicted_hand_starts(
                           farmer_start, existing_hand_starts, hands
@@ -46,27 +45,26 @@ jobs:
                       buckets, missing = sch._pack(tasks, starts, budgets, shed_access)
                       lengths = [len(sch._mandatory_queue(s, b, shed_access)[0])
                                  for s, b in zip(starts, buckets)]
-                      print(' TRY', hands, 'missing', len(missing),
-                            'lengths', sorted(lengths, reverse=True),
-                            'assigned', sum(len(b) for b in buckets))
-                  by_priority = {}
-                  for t in tasks:
-                      p = sch._task_priority(t)
-                      by_priority[p] = by_priority.get(p, 0) + 1
-                  print(' PRIORITY_GROUPS', sorted(by_priority.items(), key=lambda x: x[0]))
+                      tries.append((hands, len(missing), max(lengths or [0]), sum(lengths)))
+                  rows.append((ctx['day'], ctx['hour'], len(tasks),
+                               sum(len(sch._mandatory_actions(t)) for t in tasks), count, tries))
               return result
 
           ea.hands_needed = wrapped
           base = ea.make_agent(opening_version='melon_v2')
+          daily = {}
           def agent(obs):
               ctx['day'], ctx['hour'] = obs.day, obs.hour
+              daily[obs.day] = max(daily.get(obs.day, 0), len(obs.farms[0].hands))
               return base(obs)
 
           env = make('kaggriculture', configuration={
-              'seed': 1,
-              'weedSpawnChance': 0.0,
-              'episodeSteps': 720,
+              'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 720,
           }, debug=False)
           env.run([agent, lambda obs: {'farmer': ['PASS'], 'market': []}])
-          print('DONE high_hand_cases', len(seen))
+          print('SUMMARY_BEGIN')
+          for row in rows:
+              print(row)
+          print('DAILY_HANDS', daily)
+          print('SUMMARY_END')
           PY
