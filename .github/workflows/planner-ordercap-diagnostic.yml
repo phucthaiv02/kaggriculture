@@ -1,0 +1,38 @@
+name: Diagnose planner market order cap
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/planner-ordercap-diagnostic.yml]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install kaggle-environments==1.32.7
+      - name: Instrument order-cap truncation
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('agents/expansion_agent.py')
+          text = path.read_text()
+          old = '        return {"farmer": farmer_op, "hands": hand_ops, "market": market[:10]}\n'
+          new = '''        if len(market) > 10:\n            print(\n                "ORDER_CAP", day, hour, len(market),\n                "kept=", [order[0] + (":" + order[1] if len(order) > 1 else "") for order in market[:10]],\n                "dropped=", [order[0] + (":" + order[1] if len(order) > 1 else "") for order in market[10:]],\n            )\n        return {"farmer": farmer_op, "hands": hand_ops, "market": market[:10]}\n'''
+          if old not in text:
+              raise SystemExit('final return not found')
+          path.write_text(text.replace(old, new))
+          PY
+      - name: Run diagnostic game
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+          env = make('kaggriculture', configuration={'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 288}, debug=False)
+          agent = make_agent(opening_version='melon_v2')
+          env.run([lambda obs: agent(obs), lambda obs: {'farmer': ['PASS'], 'market': []}])
+          print('FINAL_MONEY', env.steps[-1][0].observation.farms[0].money)
+          PY
