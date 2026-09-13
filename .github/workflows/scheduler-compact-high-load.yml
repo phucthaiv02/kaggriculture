@@ -1,4 +1,4 @@
-name: Benchmark regret route packing
+name: Benchmark clustered regret packing
 on:
   push:
     branches: [feat/planner-capacity-v4]
@@ -14,13 +14,22 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -q kaggle-environments==1.32.7 pytest
-      - name: Apply regret packing candidate
+      - name: Apply clustered regret candidate
         run: |
           python - <<'PY'
           from pathlib import Path
           from textwrap import dedent
           p = Path('agents/scheduler.py')
           s = p.read_text()
+          s = s.replace(
+              'def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):',
+              'def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False, compact=False):'
+          )
+          old_cost = '''                    cost = projected if time_sensitive else projected - lengths[worker]\n                    candidates.append((cost, projected, worker, insertion))'''
+          new_cost = '''                    protected_timing = (\n                        task.must_liquidate or task.immediate_drop\n                        or task.refinance_feed or task.cash_priority < 2\n                    )\n                    cost = (\n                        projected - lengths[worker]\n                        if compact and not protected_timing\n                        else projected if time_sensitive\n                        else projected - lengths[worker]\n                    )\n                    candidates.append((cost, projected, worker, insertion))'''
+          if old_cost not in s:
+              raise SystemExit('cost block not found')
+          s = s.replace(old_cost, new_cost, 1)
           marker = '\ndef _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n'
           fn = dedent('''
           
@@ -67,7 +76,7 @@ jobs:
               raise SystemExit('pack marker not found')
           s = s.replace(marker, fn + marker, 1)
           old = '''    for buckets, unassigned in candidates:\n        repaired, remaining = _repair_single_swaps(\n            buckets, unassigned, worker_starts, budgets, shed_access\n        )\n        if len(remaining) < len(best_unassigned):\n            best_buckets, best_unassigned = repaired, remaining\n        if not best_unassigned:\n            break\n    return best_buckets, best_unassigned\n'''
-          new = '''    for buckets, unassigned in candidates:\n        repaired, remaining = _repair_single_swaps(\n            buckets, unassigned, worker_starts, budgets, shed_access\n        )\n        if len(remaining) < len(best_unassigned):\n            best_buckets, best_unassigned = repaired, remaining\n        if not best_unassigned:\n            break\n\n    if best_unassigned and len(worker_starts) >= 10:\n        regret_buckets, regret_unassigned = _pack_regret(\n            tasks, worker_starts, budgets, shed_access\n        )\n        if len(regret_unassigned) < len(best_unassigned):\n            best_buckets, best_unassigned = regret_buckets, regret_unassigned\n    return best_buckets, best_unassigned\n'''
+          new = '''    for buckets, unassigned in candidates:\n        repaired, remaining = _repair_single_swaps(\n            buckets, unassigned, worker_starts, budgets, shed_access\n        )\n        if len(remaining) < len(best_unassigned):\n            best_buckets, best_unassigned = repaired, remaining\n        if not best_unassigned:\n            break\n\n    if best_unassigned and len(worker_starts) >= 10:\n        for hard_first in (False, True):\n            clustered, missing = _pack_once(\n                tasks, worker_starts, budgets, shed_access,\n                hard_first=hard_first, compact=True,\n            )\n            if len(missing) < len(best_unassigned):\n                best_buckets, best_unassigned = clustered, missing\n            if not best_unassigned:\n                return best_buckets, best_unassigned\n        regret_buckets, regret_unassigned = _pack_regret(\n            tasks, worker_starts, budgets, shed_access\n        )\n        if len(regret_unassigned) < len(best_unassigned):\n            best_buckets, best_unassigned = regret_buckets, regret_unassigned\n    return best_buckets, best_unassigned\n'''
           if old not in s:
               raise SystemExit('pack repair block not found')
           p.write_text(s.replace(old, new, 1))
@@ -87,10 +96,12 @@ jobs:
           final = env.steps[-1][0].observation.farms[0]
           cand = {'money': final.money, 'max_hands': max(daily.values()), 'hand_days': sum(daily.values()), 'daily': daily}
           print('BASELINE', {'money':12674.0, 'max_hands':16, 'hand_days':140})
+          print('REGRET_ONLY', {'money':14516.0, 'max_hands':16, 'hand_days':115})
           print('CANDIDATE', cand)
-          print('DELTA', cand['money']-12674.0, cand['max_hands']-16, cand['hand_days']-140)
+          print('DELTA_BASE', cand['money']-12674.0, cand['max_hands']-16, cand['hand_days']-140)
+          print('DELTA_REGRET', cand['money']-14516.0, cand['max_hands']-16, cand['hand_days']-115)
           assert cand['money'] >= 12674.0 * 0.98, cand
-          assert cand['max_hands'] < 16 or cand['hand_days'] < 140, cand
+          assert cand['max_hands'] <= 15 or cand['hand_days'] < 115, cand
           PY
       - name: Scheduler and survival regressions
         run: |
