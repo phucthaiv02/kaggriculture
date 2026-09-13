@@ -1,0 +1,87 @@
+name: Benchmark high-load route compaction
+on:
+  push:
+    branches: [feat/planner-capacity-v4]
+    paths: [.github/workflows/scheduler-compact-high-load.yml]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -q kaggle-environments==1.32.7 pytest
+      - name: Baseline full-season melon
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          import json
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+          env = make('kaggriculture', configuration={'seed':1,'weedSpawnChance':0.0,'episodeSteps':720}, debug=False)
+          agent = make_agent(opening_version='melon_v2')
+          env.run([lambda obs: agent(obs), lambda obs: {'farmer':['PASS'],'market':[]}])
+          daily = {}
+          for frame in env.steps:
+              o = frame[0].observation
+              daily[o.day] = max(daily.get(o.day,0), len(o.farms[0].hands))
+          final = env.steps[-1][0].observation.farms[0]
+          result = {'money': final.money, 'max_hands': max(daily.values()), 'hand_days': sum(daily.values()), 'daily': daily}
+          print('BASELINE', result)
+          open('/tmp/base.json','w').write(json.dumps(result))
+          PY
+      - name: Apply scheduler candidate
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('agents/scheduler.py')
+          s=p.read_text()
+          s=s.replace(
+              'def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):',
+              'def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False, compact=False):'
+          )
+          old='''                    cost = projected if time_sensitive else projected - lengths[worker]\n                    candidates.append((cost, projected, worker, insertion))'''
+          new='''                    cost = (\n                        projected - lengths[worker]\n                        if compact\n                        else projected if time_sensitive\n                        else projected - lengths[worker]\n                    )\n                    candidates.append((cost, projected, worker, insertion))'''
+          if old not in s: raise SystemExit('cost block not found')
+          s=s.replace(old,new)
+          old='''    best_buckets, best_unassigned = min(\n        candidates, key=lambda item: len(item[1])\n    )\n    if not best_unassigned or len(worker_starts) <= 1:\n        return best_buckets, best_unassigned\n\n    for buckets, unassigned in candidates:\n        repaired, remaining = _repair_single_swaps('''
+          new='''    best_buckets, best_unassigned = min(\n        candidates, key=lambda item: len(item[1])\n    )\n    if not best_unassigned or len(worker_starts) <= 1:\n        return best_buckets, best_unassigned\n\n    # At high worker counts, greedy balancing can scatter same-priority\n    # maintenance across the board and pay the central travel cost repeatedly.\n    # A compact fallback clusters by marginal route growth, but never for\n    # opening/land cash workflows whose DROP timing matters intraday.\n    compact_safe = (\n        len(worker_starts) >= 10\n        and not any(\n            task.must_liquidate or task.immediate_drop or task.refinance_feed\n            or task.cash_priority < 2\n            for task in tasks\n        )\n    )\n    if compact_safe:\n        for hard_first in (False, True):\n            buckets, unassigned = _pack_once(\n                tasks, worker_starts, budgets, shed_access,\n                hard_first=hard_first, compact=True,\n            )\n            candidates.append((buckets, unassigned))\n            if len(unassigned) < len(best_unassigned):\n                best_buckets, best_unassigned = buckets, unassigned\n            if not best_unassigned:\n                return best_buckets, best_unassigned\n\n    for buckets, unassigned in candidates:\n        repaired, remaining = _repair_single_swaps('''
+          if old not in s: raise SystemExit('pack block not found')
+          s=s.replace(old,new)
+          p.write_text(s)
+          PY
+      - name: Candidate full-season melon
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          import json
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+          env = make('kaggriculture', configuration={'seed':1,'weedSpawnChance':0.0,'episodeSteps':720}, debug=False)
+          agent = make_agent(opening_version='melon_v2')
+          env.run([lambda obs: agent(obs), lambda obs: {'farmer':['PASS'],'market':[]}])
+          daily = {}
+          for frame in env.steps:
+              o = frame[0].observation
+              daily[o.day] = max(daily.get(o.day,0), len(o.farms[0].hands))
+          final = env.steps[-1][0].observation.farms[0]
+          cand = {'money': final.money, 'max_hands': max(daily.values()), 'hand_days': sum(daily.values()), 'daily': daily}
+          base=json.load(open('/tmp/base.json'))
+          print('BASELINE', base)
+          print('CANDIDATE', cand)
+          print('DELTA money', cand['money']-base['money'], 'max_hands', cand['max_hands']-base['max_hands'], 'hand_days', cand['hand_days']-base['hand_days'])
+          assert cand['money'] >= base['money'] * 0.98, (base,cand)
+          assert cand['max_hands'] <= base['max_hands'], (base,cand)
+          PY
+      - name: Scheduler and survival regressions
+        run: |
+          PYTHONPATH=. pytest -q \
+            tests/test_agents_scheduler.py \
+            tests/test_agents_capacity_guard.py \
+            tests/test_agents_opening_cash_priority.py \
+            tests/test_agents_opening_book.py \
+            tests/test_survival_debt_regression.py \
+            tests/test_agents_intraday.py \
+            tests/test_agents_affordable_production.py \
+            tests/test_agents_melon_opening.py
