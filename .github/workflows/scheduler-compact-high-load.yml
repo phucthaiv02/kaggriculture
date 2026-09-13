@@ -18,61 +18,56 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          from textwrap import dedent
           p = Path('agents/scheduler.py')
           s = p.read_text()
-          marker = '''\ndef _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n'''
-          fn = r'''
-
-def _pack_regret(tasks, worker_starts, budgets, shed_access):
-    """Pack the most constrained task first while preserving route priority.
-
-    Assignment order is not execution order: _insert_task still enforces the
-    existing task-priority/deadline ordering inside every worker route.  This
-    fallback simply prevents easy work from consuming the only worker slot
-    that a later remote/pinned task can use.
-    """
-    buckets = [[] for _ in worker_starts]
-    remaining = list(tasks)
-    while remaining:
-        ranked = []
-        for index, task in enumerate(remaining):
-            worker_choices = []
-            for worker, bucket in enumerate(buckets):
-                if task.pinned_worker is not None and worker != task.pinned_worker:
-                    continue
-                choice = _insert_task(
-                    bucket, task, worker_starts[worker], budgets[worker], shed_access
-                )
-                if choice is not None:
-                    worker_choices.append((choice[0], choice[1], worker, choice[3]))
-            if not worker_choices:
-                continue
-            worker_choices.sort(key=lambda item: item[:3])
-            best = worker_choices[0]
-            regret = (
-                worker_choices[1][0] - best[0]
-                if len(worker_choices) > 1 else float("inf")
-            )
-            rank = (
-                len(worker_choices),
-                -regret,
-                _task_priority(task),
-                -len(_mandatory_actions(task)),
-                task.position[1], task.position[0], index,
-            )
-            ranked.append((rank, index, best))
-        if not ranked:
-            break
-        _, index, (_, _, worker, candidate) = min(ranked, key=lambda item: item[0])
-        buckets[worker] = candidate
-        remaining.pop(index)
-    return buckets, remaining
-'''
+          marker = '\ndef _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):\n'
+          fn = dedent('''
+          
+          def _pack_regret(tasks, worker_starts, budgets, shed_access):
+              """Pack the most constrained task first while preserving route priority."""
+              buckets = [[] for _ in worker_starts]
+              remaining = list(tasks)
+              while remaining:
+                  ranked = []
+                  for index, task in enumerate(remaining):
+                      worker_choices = []
+                      for worker, bucket in enumerate(buckets):
+                          if task.pinned_worker is not None and worker != task.pinned_worker:
+                              continue
+                          choice = _insert_task(
+                              bucket, task, worker_starts[worker], budgets[worker], shed_access
+                          )
+                          if choice is not None:
+                              worker_choices.append((choice[0], choice[1], worker, choice[3]))
+                      if not worker_choices:
+                          continue
+                      worker_choices.sort(key=lambda item: item[:3])
+                      best = worker_choices[0]
+                      regret = (
+                          worker_choices[1][0] - best[0]
+                          if len(worker_choices) > 1 else float("inf")
+                      )
+                      rank = (
+                          len(worker_choices), -regret, _task_priority(task),
+                          -len(_mandatory_actions(task)),
+                          task.position[1], task.position[0], index,
+                      )
+                      ranked.append((rank, index, best))
+                  if not ranked:
+                      break
+                  _, index, (_, _, worker, candidate) = min(
+                      ranked, key=lambda item: item[0]
+                  )
+                  buckets[worker] = candidate
+                  remaining.pop(index)
+              return buckets, remaining
+          ''')
           if marker not in s:
               raise SystemExit('pack marker not found')
           s = s.replace(marker, fn + marker, 1)
           old = '''    for buckets, unassigned in candidates:\n        repaired, remaining = _repair_single_swaps(\n            buckets, unassigned, worker_starts, budgets, shed_access\n        )\n        if len(remaining) < len(best_unassigned):\n            best_buckets, best_unassigned = repaired, remaining\n        if not best_unassigned:\n            break\n    return best_buckets, best_unassigned\n'''
-          new = '''    for buckets, unassigned in candidates:\n        repaired, remaining = _repair_single_swaps(\n            buckets, unassigned, worker_starts, budgets, shed_access\n        )\n        if len(remaining) < len(best_unassigned):\n            best_buckets, best_unassigned = repaired, remaining\n        if not best_unassigned:\n            break\n\n    # A failed high-load greedy layout can still have plenty of aggregate\n    # capacity.  Retry from scratch by reserving scarce worker slots first.\n    if best_unassigned and len(worker_starts) >= 10:\n        regret_buckets, regret_unassigned = _pack_regret(\n            tasks, worker_starts, budgets, shed_access\n        )\n        if len(regret_unassigned) < len(best_unassigned):\n            best_buckets, best_unassigned = regret_buckets, regret_unassigned\n    return best_buckets, best_unassigned\n'''
+          new = '''    for buckets, unassigned in candidates:\n        repaired, remaining = _repair_single_swaps(\n            buckets, unassigned, worker_starts, budgets, shed_access\n        )\n        if len(remaining) < len(best_unassigned):\n            best_buckets, best_unassigned = repaired, remaining\n        if not best_unassigned:\n            break\n\n    if best_unassigned and len(worker_starts) >= 10:\n        regret_buckets, regret_unassigned = _pack_regret(\n            tasks, worker_starts, budgets, shed_access\n        )\n        if len(regret_unassigned) < len(best_unassigned):\n            best_buckets, best_unassigned = regret_buckets, regret_unassigned\n    return best_buckets, best_unassigned\n'''
           if old not in s:
               raise SystemExit('pack repair block not found')
           p.write_text(s.replace(old, new, 1))
