@@ -13,20 +13,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install kaggle-environments==1.32.7
-      - name: Trace day-six worker cargo
+      - run: pip install -q kaggle-environments==1.32.7
+      - name: Compact day-six worker cargo trace
         run: |
           PYTHONPATH=. python - <<'PY'
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
 
           env = make('kaggriculture', configuration={
-              'seed': 1,
-              'weedSpawnChance': 0.0,
-              'episodeSteps': 192,
+              'seed': 1, 'weedSpawnChance': 0.0, 'episodeSteps': 192,
           }, debug=False)
           base = make_agent(opening_version='melon_v2')
           cash_items = ('FERTILIZER','CARROT','MELON','TOMATO','STRAWBERRY','EGG','MILK','WOOL')
+          rows = []
 
           def agent(obs):
               action = base(obs)
@@ -39,9 +38,12 @@ jobs:
                       cargo = {k: inv.get(k, 0) for k in cash_items if inv.get(k, 0)}
                       if cargo or (index < len(ops) and ops[index] and ops[index][0] == 'DROP'):
                           workers.append((index, position, cargo, ops[index] if index < len(ops) else None))
-                  print('D6', obs.hour, 'money', farm.money, 'hands', len(farm.hands), 'workers', workers,
-                        'market', action.get('market', []))
+                  rows.append((obs.hour, farm.money, workers, action.get('market', [])))
               return action
 
           env.run([agent, lambda obs: {'farmer': ['PASS'], 'market': []}])
+          print('TRACE_START')
+          for row in rows:
+              print(row)
+          print('TRACE_END')
           PY
