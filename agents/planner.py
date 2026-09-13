@@ -341,7 +341,8 @@ def plan_targets(
     Capacity comes from LaborForecast itself. Every accepted target enters the
     shared baseline, and later candidates are rejected naturally if the
     combined visits cannot fit the farmer plus maximum hands. Fresh targets
-    also share the actual cash/input budget after today's standing feed need.
+    share the actual input budget, today's live feed, and the cash required
+    for today's standing plus marginal labor before new capital is committed.
     """
     if planner_version not in PLANNER_VERSIONS:
         raise ValueError(f"unknown planner version: {planner_version}")
@@ -476,6 +477,24 @@ def plan_targets(
     wheat_bought = 0
     wheat_stock = obs["market"]["inventory"].get("WHEAT", 0)
 
+    def day_labor_cost(flow, position=None):
+        entries = list(baseline.visits.get(day, ()))
+        if flow is not None:
+            entries.extend(
+                (position if p is None else p, count, needs, goods)
+                for p, count, needs, goods in flow.visits.get(day, ())
+            )
+        return labor.cost({day: entries})
+
+    # Fresh production must leave enough real cash for the workers needed
+    # to execute today's standing workload. Future labor stays in the ROI
+    # calculation; it is not charged against today's liquidity.
+    standing_labor_cost = day_labor_cost(None)
+    if standing_labor_cost != float("inf"):
+        cash -= standing_labor_cost
+    else:
+        cash = -1
+
     def feed_cost(units):
         missing = max(0, units - inputs["WHEAT"])
         return sum(
@@ -546,7 +565,18 @@ def plan_targets(
                 and official_game.ANIMALS[c[0][0]]["structure"] == tile["kind"]
             ]
 
-        allowed = [candidate for candidate in allowed if start_cost(candidate[0]) <= max(0, cash)]
+        baseline_day_cost = day_labor_cost(None)
+        affordable = []
+        for candidate in allowed:
+            labor_with_candidate = day_labor_cost(candidate[1], position)
+            marginal_today_labor = (
+                float("inf")
+                if labor_with_candidate == float("inf")
+                else max(0, labor_with_candidate - baseline_day_cost)
+            )
+            if start_cost(candidate[0]) + marginal_today_labor <= max(0, cash):
+                affordable.append(candidate)
+        allowed = affordable
         selector = (
             _choose_daily_mirrored
             if planner_version == "mirror_v2"
@@ -559,7 +589,11 @@ def plan_targets(
         if not choice:
             continue
 
+        before_labor = day_labor_cost(None)
+        after_labor = day_labor_cost(output, position)
         reserve_start(choice)
+        if after_labor != float("inf"):
+            cash -= max(0, after_labor - before_labor)
         baseline.add(output, position)
         if planner_version == "mirror_v2":
             # Keep the rival's mirrored commitment in later tile decisions;
