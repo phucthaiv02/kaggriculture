@@ -21,6 +21,7 @@ truncated.
 from __future__ import annotations
 
 from collections import Counter
+from time import perf_counter
 
 from kaggle_environments.envs.kaggriculture.kaggriculture import LAND_PRICES, market_price
 
@@ -156,7 +157,7 @@ def _is_protective_task(task):
 
 def _capacity_safe_queues(
     tasks, farmer_start, hand_count, existing_hands, shed_access,
-    pending_hand_budget=22, existing_hand_budget=23,
+    pending_hand_budget=22, existing_hand_budget=23, deadline=None,
 ):
     """Pack against the workers we can actually afford.
 
@@ -168,7 +169,20 @@ def _capacity_safe_queues(
     kwargs = dict(
         pending_hand_budget=pending_hand_budget,
         existing_hand_budget=existing_hand_budget,
+        deadline=deadline,
     )
+    # Prove survival work fits first.  If it does not, never spend the
+    # remaining compute budget trying to arrange discretionary expansion.
+    protective = [task for task in tasks if _is_protective_task(task)]
+    protective_plans, protective_unassigned = build_queues(
+        protective, farmer_start, hand_count, existing_hands, shed_access, **kwargs
+    )
+    if protective_unassigned or (deadline is not None and perf_counter() >= deadline):
+        unassigned_ids = {id(task) for task in protective_unassigned}
+        admitted_ids = {id(task) for task in protective if id(task) not in unassigned_ids}
+        admitted = [task for task in protective if id(task) in admitted_ids]
+        return protective_plans, admitted, protective_unassigned, list(protective_unassigned)
+
     plans, unassigned = build_queues(
         tasks, farmer_start, hand_count, existing_hands, shed_access, **kwargs
     )
@@ -345,6 +359,7 @@ def make_agent(
         "intraday_expansion_day": -1,
         "intraday_expansion_positions": set(),
         "intraday_bridge_complete_day": -1,
+        "spawn_mismatches": set(),
     }
     opening_governs = make_opening_controller(opening_version)
     selling_state = {}
@@ -372,6 +387,7 @@ def make_agent(
         """
         hands = tuple(map(tuple, farm["hands"]))
         still_unverified = set()
+        mismatches = set()
         for index in state["unverified_hand_indices"]:
             hand_index = index - 1
             if hand_index >= len(hands):
@@ -381,11 +397,13 @@ def make_agent(
             plan = state["plans"][index] if index < len(state["plans"]) else None
             if plan is not None and plan.start != hands[hand_index]:
                 plan.queue = []
+                mismatches.add(index)
         state["unverified_hand_indices"] = still_unverified
         if hour >= 2:
             # Morning HIRE orders have resolved. Failed/truncated purchases
             # must release their tasks and inputs for intraday scheduling.
             del state["plans"][len(hands) + 1:]
+        return mismatches
 
     def _animal_still_needs_attention(tile, name, day, position):
         """True if a *placed* animal still has real, unfulfilled survival
@@ -470,6 +488,13 @@ def make_agent(
             )
             and not state.get("opening_replant_delivered")
         )
+        # Hour-1 queues were already built for predicted hire starts.  Repack
+        # the whole farm only when validation found an actual spawn mismatch;
+        # newly delivered inputs are picked up by the incremental idle-worker
+        # scheduler below.
+        if (hour == 2 and not state["spawn_mismatches"]
+                and not delivered and not replant_delivered):
+            return
         if hour != 2 and not delivered and not replant_delivered:
             return
         if replant_delivered:
@@ -493,6 +518,7 @@ def make_agent(
             tasks, tuple(farm["farmer"]), len(actual_hands), actual_hands,
             _open_shed_access(farm), pending_hand_budget=remaining,
             existing_hand_budget=remaining,
+            deadline=state.get("compute_deadline"),
         )
         state["plans"] = plans
         state["reserved"] = reserved_items(admitted)
@@ -641,6 +667,10 @@ def make_agent(
         return
 
     def agent(obs, configuration=None):
+        # Leave headroom for serialization and the environment's hard 1s
+        # action deadline.  Scheduler routines return their best partial plan
+        # when this internal budget expires.
+        state["compute_deadline"] = perf_counter() + 0.70
         effective_end = end_day
         if configuration is not None:
             # The final observation is terminal; no action can run from it.
@@ -782,6 +812,7 @@ def make_agent(
                 existing_hands,
                 shed_access,
                 pending_hand_budget=22,
+                deadline=state["compute_deadline"],
             )
             missing_hands = max(0, hand_count - len(existing_hands))
             affordable_hands = _affordable_hires(
@@ -797,6 +828,7 @@ def make_agent(
                 shed_access,
                 pending_hand_budget=22,
                 existing_hand_budget=23,
+                deadline=state["compute_deadline"],
             )
             state["plans"], state["reserved"] = plans, reserved_items(admitted_tasks)
             state["protective_debt_positions"] = {task.position for task in protective_debt}
@@ -847,7 +879,9 @@ def make_agent(
             )
 
         if state["unverified_hand_indices"]:
-            _validate_predicted_hands(farm, hour)
+            state["spawn_mismatches"] = _validate_predicted_hands(farm, hour)
+        else:
+            state["spawn_mismatches"] = set()
         _replan_all_from_actual(obs, farm, day, hour)
         # Morning hires already have pending orders/plans. Extra hires here
         # are only for newly available work after that pass has settled.

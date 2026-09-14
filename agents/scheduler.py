@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from time import perf_counter
 
 FARMER_BUDGET = 23
 HAND_BUDGET = 23
@@ -204,7 +205,8 @@ def _task_priority(task):
     )
 
 
-def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):
+def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False,
+               deadline=None):
     """Greedy exact-route pack for one task ordering.
 
     The normal ordering preserves the historical near-first behavior.  The
@@ -218,8 +220,35 @@ def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):
     """
     buckets = [[] for _ in worker_starts]
 
+    length_cache = {}
+
     def work_length(start, bucket):
-        return len(_mandatory_queue(start, bucket, shed_access)[0])
+        # Route construction is substantially more expensive than comparing
+        # insertion candidates.  The same bucket occurs repeatedly in the
+        # normal/hard-first passes, so memoize its exact length.
+        key = (start, tuple(id(task) for task in bucket))
+        if key not in length_cache:
+            length_cache[key] = len(_mandatory_queue(start, bucket, shed_access)[0])
+        return length_cache[key]
+
+    def insertion_points(bucket, task):
+        """Bound large-farm insertion search without changing small cases.
+
+        For a saturated 75-tile farm, checking every slot and rebuilding the
+        route for each one is the source of the one-second timeout.  Endpoints
+        plus the slots adjacent to the nearest existing tasks retain the useful
+        spatial choices while capping the work per worker.
+        """
+        if len(tasks) <= 32 or len(bucket) <= 4:
+            return range(len(bucket) + 1)
+        nearest = sorted(
+            range(len(bucket)),
+            key=lambda i: (
+                abs(bucket[i].position[0] - task.position[0])
+                + abs(bucket[i].position[1] - task.position[1]), i,
+            ),
+        )[:2]
+        return sorted({0, len(bucket), *(i for i in nearest), *(i + 1 for i in nearest)})
 
     def nearest_distance(task):
         return min(
@@ -251,12 +280,17 @@ def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):
     ordered = sorted(tasks, key=ordering)
     unassigned = []
     lengths = [0] * len(worker_starts)
-    for task in ordered:
+    for task_index, task in enumerate(ordered):
+        if deadline is not None and perf_counter() >= deadline:
+            unassigned.extend(ordered[task_index:])
+            break
         candidates = []
         for worker, bucket in enumerate(buckets):
             if task.pinned_worker is not None and worker != task.pinned_worker:
                 continue
-            for insertion in range(len(bucket) + 1):
+            for insertion in insertion_points(bucket, task):
+                if deadline is not None and perf_counter() >= deadline:
+                    break
                 candidate = bucket[:insertion] + [task] + bucket[insertion:]
                 if any(
                     _task_priority(candidate[index]) > _task_priority(candidate[index + 1])
@@ -282,7 +316,7 @@ def _pack_once(tasks, worker_starts, budgets, shed_access, hard_first=False):
     return buckets, unassigned
 
 
-def _insert_task(bucket, task, start, budget, shed_access):
+def _insert_task(bucket, task, start, budget, shed_access, deadline=None):
     """Best feasible insertion without changing task-priority semantics."""
     base = len(_mandatory_queue(start, bucket, shed_access)[0])
     time_sensitive = (
@@ -292,6 +326,8 @@ def _insert_task(bucket, task, start, budget, shed_access):
     )
     choices = []
     for insertion in range(len(bucket) + 1):
+        if deadline is not None and perf_counter() >= deadline:
+            break
         candidate = bucket[:insertion] + [task] + bucket[insertion:]
         if any(
             _task_priority(candidate[index]) > _task_priority(candidate[index + 1])
@@ -307,7 +343,9 @@ def _insert_task(bucket, task, start, budget, shed_access):
     return min(choices, key=lambda item: item[:3])
 
 
-def _repair_single_swaps(buckets, unassigned, worker_starts, budgets, shed_access):
+def _repair_single_swaps(
+    buckets, unassigned, worker_starts, budgets, shed_access, deadline=None
+):
     """Backtrack one greedy assignment before requesting another hand.
 
     A failed greedy pack can be a fragmentation artifact: the pending task may
@@ -319,15 +357,21 @@ def _repair_single_swaps(buckets, unassigned, worker_starts, budgets, shed_acces
     remaining = list(unassigned)
     changed = True
     while changed and remaining:
+        if deadline is not None and perf_counter() >= deadline:
+            break
         changed = False
         retry = []
         for task in remaining:
+            if deadline is not None and perf_counter() >= deadline:
+                retry.append(task)
+                continue
             direct = []
             for worker, bucket in enumerate(buckets):
                 if task.pinned_worker is not None and worker != task.pinned_worker:
                     continue
                 choice = _insert_task(
-                    bucket, task, worker_starts[worker], budgets[worker], shed_access
+                    bucket, task, worker_starts[worker], budgets[worker], shed_access,
+                    deadline=deadline,
                 )
                 if choice is not None:
                     direct.append((*choice[:3], worker, choice[3]))
@@ -346,7 +390,8 @@ def _repair_single_swaps(buckets, unassigned, worker_starts, budgets, shed_acces
                         continue
                     reduced = bucket[:victim_index] + bucket[victim_index + 1:]
                     incoming = _insert_task(
-                        reduced, task, worker_starts[source], budgets[source], shed_access
+                        reduced, task, worker_starts[source], budgets[source], shed_access,
+                        deadline=deadline,
                     )
                     if incoming is None:
                         continue
@@ -354,7 +399,8 @@ def _repair_single_swaps(buckets, unassigned, worker_starts, budgets, shed_acces
                         if destination == source:
                             continue
                         moved = _insert_task(
-                            other, victim, worker_starts[destination], budgets[destination], shed_access
+                            other, victim, worker_starts[destination], budgets[destination],
+                            shed_access, deadline=deadline,
                         )
                         if moved is None:
                             continue
@@ -379,26 +425,36 @@ def _repair_single_swaps(buckets, unassigned, worker_starts, budgets, shed_acces
     return buckets, remaining
 
 
-def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
+def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, deadline=None):
     """Pack mandatory work, then repair one greedy assignment if needed."""
     candidates = []
     for hard_first in (False, True):
+        if deadline is not None and perf_counter() >= deadline:
+            break
         buckets, unassigned = _pack_once(
-            tasks, worker_starts, budgets, shed_access, hard_first=hard_first
+            tasks, worker_starts, budgets, shed_access, hard_first=hard_first,
+            deadline=deadline,
         )
         candidates.append((buckets, unassigned))
         if not unassigned and not hard_first:
             return buckets, unassigned
 
+    if not candidates:
+        return [[] for _ in worker_starts], list(tasks)
+
     best_buckets, best_unassigned = min(
         candidates, key=lambda item: len(item[1])
     )
-    if not best_unassigned or len(worker_starts) <= 1:
+    if (not best_unassigned or len(worker_starts) <= 1
+            or (deadline is not None and perf_counter() >= deadline)):
         return best_buckets, best_unassigned
 
     for buckets, unassigned in candidates:
+        if deadline is not None and perf_counter() >= deadline:
+            break
         repaired, remaining = _repair_single_swaps(
-            buckets, unassigned, worker_starts, budgets, shed_access
+            buckets, unassigned, worker_starts, budgets, shed_access,
+            deadline=deadline,
         )
         if len(remaining) < len(best_unassigned):
             best_buckets, best_unassigned = repaired, remaining
@@ -413,18 +469,23 @@ def hands_needed(
     existing_hand_starts=(),
     shed_access=SHED_ACCESS,
     pending_hand_budget=HAND_BUDGET,
-    max_hands=MAX_HANDS,
+    max_hands=MAX_HANDS, deadline=None,
 ):
     """Fewest hands that fit all mandatory work within the day."""
     minimum = len(existing_hand_starts)
     for count in range(minimum, max_hands + 1):
+        if deadline is not None and perf_counter() >= deadline:
+            # Under compute pressure prefer excess labor to silently dropping
+            # survival work.  The caller's affordability guard still caps the
+            # hires that can actually be ordered.
+            return max_hands, list(tasks)
         starts = [tuple(farmer_start)] + predicted_hand_starts(
             farmer_start, existing_hand_starts, count
         )
         budgets = [FARMER_BUDGET]
         budgets += [HAND_BUDGET] * min(count, len(existing_hand_starts))
         budgets += [pending_hand_budget] * max(0, count - len(existing_hand_starts))
-        _, unassigned = _pack(tasks, starts, budgets, shed_access)
+        _, unassigned = _pack(tasks, starts, budgets, shed_access, deadline)
         if not unassigned:
             return count, []
     starts = [tuple(farmer_start)] + predicted_hand_starts(
@@ -433,7 +494,7 @@ def hands_needed(
     budgets = [FARMER_BUDGET]
     budgets += [HAND_BUDGET] * min(max_hands, len(existing_hand_starts))
     budgets += [pending_hand_budget] * max(0, max_hands - len(existing_hand_starts))
-    _, unassigned = _pack(tasks, starts, budgets, shed_access)
+    _, unassigned = _pack(tasks, starts, budgets, shed_access, deadline)
     return max_hands, unassigned
 
 
@@ -445,7 +506,7 @@ def build_queues(
     shed_access=SHED_ACCESS,
     pending_hand_budget=HAND_BUDGET,
     existing_hand_budget=None,
-    worker_budgets=None,
+    worker_budgets=None, deadline=None,
 ):
     """Assign mandatory work, then append safe post-HARVEST replacement tails."""
     starts = [tuple(farmer_start)] + predicted_hand_starts(
@@ -460,7 +521,7 @@ def build_queues(
         if len(worker_budgets) != len(starts):
             raise ValueError("worker_budgets must contain one budget per worker")
         budgets = list(worker_budgets)
-    buckets, unassigned = _pack(tasks, starts, budgets, shed_access)
+    buckets, unassigned = _pack(tasks, starts, budgets, shed_access, deadline)
 
     plans = []
     for start, budget, bucket in zip(starts, budgets, buckets):
