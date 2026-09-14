@@ -76,6 +76,16 @@ python -m experiments.play_match --opponent path/to/notebook.ipynb
 The production agent always runs as player 0. Match outputs are written under
 `replays/` by default.
 
+Generate an offline sales/cashflow analysis from a replay JSON:
+
+```bash
+python -m experiments.sales_report replays/current_vs_pass_seed1.json
+```
+
+This writes `<replay>.sales.html` plus `<replay>.sales.json`, comparing both
+players' executed `SELL` volume, average sale prices, daily cash, and actual
+market costs.
+
 Validate the crop and animal maintenance schedules:
 
 ```bash
