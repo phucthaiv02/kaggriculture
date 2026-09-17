@@ -88,12 +88,59 @@ CASES = {
     },
 }
 
+YIELD_WINDOW_START = {
+    "WHEAT": 2,
+    "CARROT": 2,
+    "MELON": 5,
+    "TOMATO": 7,
+    "STRAWBERRY": 9,
+}
+
+
+def find_equivalent_water_schedules(crop, use_fertilizer, limit=20):
+    """Find several WATER calendars with the same verified crop output.
+
+    Yield-relevant days from the interpreter-verified schedule remain fixed;
+    protective WATER days are rearranged exhaustively.  A downstream scheduler
+    can therefore choose a calendar whose busy days fit its current workload.
+    """
+    baseline = CASES[(crop, use_fertilizer)]
+    last_harvest = max(baseline["harvest"])
+    start = YIELD_WINDOW_START[crop]
+    if baseline["ongoing"] and not use_fertilizer:
+        required = {0}
+    else:
+        required = {0} | {day for day in baseline["water"] if day >= start}
+
+    candidates = []
+    for mask in range(1 << (last_harvest + 1)):
+        days = {day for day in range(last_harvest + 1) if mask & (1 << day)}
+        if not required <= days:
+            continue
+        # HARVEST precedes the final refresh, so dying that night is harmless.
+        if any(
+            day not in days and day + 1 not in days
+            for day in range(last_harvest - 1)
+        ):
+            continue
+        candidates.append(days)
+    candidates.sort(
+        key=lambda days: (
+            len(days),
+            len(days ^ baseline["water"]),
+            tuple(sorted(days)),
+        )
+    )
+    return candidates[:limit]
+
+
 def pass_agent(_obs):
     return {"farmer": ["PASS"], "hands": [], "market": []}
 
 
-def run_case(crop, use_fertilizer, seed):
+def run_case(crop, use_fertilizer, seed, water_days=None):
     schedule = CASES[(crop, use_fertilizer)]
+    water_days = schedule["water"] if water_days is None else set(water_days)
     trace = []
     action_counts = Counter()
 
@@ -122,7 +169,7 @@ def run_case(crop, use_fertilizer, seed):
         day_ops = []
         if day == 0:
             day_ops.append(["PLANT", crop])
-            if day in schedule["water"]:
+            if day in water_days:
                 day_ops.append(["WATER"])
         else:
             if schedule["ongoing"] and day in schedule["harvest"]:
@@ -132,7 +179,7 @@ def run_case(crop, use_fertilizer, seed):
                 # action but is not an action on the crop tile, so it is excluded
                 # from expected_tile_actions.
                 day_ops.extend([["PICKUP", "FERTILIZER", 1], ["FERTILIZE"]])
-            if day in schedule["water"]:
+            if day in water_days:
                 day_ops.append(["WATER"])
             if not schedule["ongoing"] and day in schedule["harvest"]:
                 day_ops.append(["HARVEST"])
@@ -166,7 +213,13 @@ def run_case(crop, use_fertilizer, seed):
     yields = [amount for _, event, amount in trace if event == "HARVEST"]
     tile_actions = sum(action_counts.values())
     assert yields == schedule["expected_yields"], (crop, use_fertilizer, trace)
-    assert tile_actions == schedule["expected_tile_actions"], action_counts
+    expected_actions = (
+        1
+        + len(water_days)
+        + len(schedule["fertilize"])
+        + len(schedule["harvest"])
+    )
+    assert tile_actions == expected_actions, action_counts
     return trace, action_counts
 
 
@@ -179,12 +232,27 @@ def main():
                 f"harvests={trace} actions={dict(counts)} total={sum(counts.values())}"
             )
     print(f"All {len((1, 7, 42)) * len(CASES)} crop games passed.")
+    print("\nAlternative WATER calendars with baseline-equivalent yield:")
+    for crop, use_fertilizer in CASES:
+        schedules = find_equivalent_water_schedules(crop, use_fertilizer, limit=5)
+        print(
+            f"crop={crop:<10} fertilizer={str(use_fertilizer):<5} "
+            f"options={[sorted(days) for days in schedules]}"
+        )
 
 
 def test_crop_schedules():
     for seed in (1, 7, 42):
         for crop, use_fertilizer in CASES:
             run_case(crop, use_fertilizer, seed)
+
+
+def test_alternative_water_schedules_match_baseline_yield():
+    for crop, use_fertilizer in CASES:
+        schedules = find_equivalent_water_schedules(crop, use_fertilizer, limit=5)
+        assert schedules
+        for water_days in {frozenset(schedules[0]), frozenset(schedules[-1])}:
+            run_case(crop, use_fertilizer, seed=1, water_days=water_days)
 
 
 if __name__ == "__main__":

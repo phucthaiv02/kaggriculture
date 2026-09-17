@@ -38,6 +38,117 @@ OPTIMAL_SCHEDULES = {
     },
 }
 
+PRODUCTION = {
+    "GOOSE": {"first": 4, "interval": 1, "max_held": 4},
+    "COW": {"first": 8, "interval": 2, "max_held": 6},
+    "SHEEP": {"first": 6, "interval": 3, "max_held": 6},
+}
+
+
+def find_equivalent_schedules(animal, days=30, limit=20):
+    """Find several low-action schedules matching daily FEED+CARE output.
+
+    This is a small dynamic program over the public animal state.  It models
+    survival, the CARE bank, scheduled production, ``max_held``, and optional
+    harvests.  The winning schedule is still replayed through the real
+    interpreter by :func:`run_optimal_schedule`; this model is only the search
+    mechanism.
+    """
+    target = ANIMALS[animal]["expected"][True]
+    production = PRODUCTION[animal]
+    # (held, care bank, consecutive misses, harvested) -> (actions, schedule)
+    states = {(0, 0, 0, 0): [(0, (frozenset(), frozenset(), frozenset()))]}
+    for age in range(days):
+        next_states = {}
+        produces = (
+            age + 1 >= production["first"]
+            and (age + 1 - production["first"]) % production["interval"] == 0
+        )
+        for (held, bank, missed, harvested), paths in states.items():
+            for cost, schedule in paths:
+                harvest_days, feed_days, care_days = schedule
+                for harvest in (False, True):
+                    if harvest and not held:
+                        continue
+                    held_after_harvest = 0 if harvest else held
+                    next_harvested = harvested + (held if harvest else 0)
+                    if next_harvested > target:
+                        continue
+                    for feed, care in ((False, False), (True, False), (True, True)):
+                        next_held = held_after_harvest
+                        next_missed = 0 if feed else missed + 1
+                        # Escaping after the final playable day cannot reduce yield.
+                        if next_missed >= 2 and age < days - 1:
+                            continue
+                        next_bank = bank
+                        if produces:
+                            produced = 1 + (next_bank if feed else 0)
+                            next_bank = 0
+                            next_held = min(
+                                production["max_held"], next_held + produced
+                            )
+                        # The current day's CARE is banked after its production
+                        # tick, so it applies to the following scheduled yield.
+                        next_bank += int(feed and care)
+                        key = (next_held, next_bank, next_missed, next_harvested)
+                        candidate = (
+                            cost + int(harvest) + int(feed) + int(care),
+                            (
+                                harvest_days | ({age} if harvest else set()),
+                                feed_days | ({age} if feed else set()),
+                                care_days | ({age} if care else set()),
+                            ),
+                        )
+                        bucket = next_states.setdefault(key, [])
+                        bucket.append(candidate)
+                        # Keeping several paths per engine state preserves schedules
+                        # with different busy days without making the DP explode.
+                        bucket.sort(key=lambda value: value[0])
+                        unique = []
+                        seen = set()
+                        for value in bucket:
+                            if value[1] not in seen:
+                                seen.add(value[1])
+                                unique.append(value)
+                            if len(unique) == limit:
+                                break
+                        next_states[key] = unique
+        states = next_states
+
+    matches = [
+        value
+        for state, values in states.items()
+        if state[3] == target
+        for value in values
+    ]
+    if not matches:
+        raise RuntimeError(f"no {animal} schedule reaches baseline yield {target}")
+    matches.sort(key=lambda value: value[0])
+    results = []
+    seen = set()
+    for _, (harvest, feed, care) in matches:
+        signature = (harvest, feed, care)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        results.append(
+            {
+                "feed": set(feed),
+                "care": set(care),
+                "harvest": set(harvest),
+                "collect_fertilizer": set(),
+                "max_yield": target,
+            }
+        )
+        if len(results) == limit:
+            break
+    return results
+
+
+def find_equivalent_schedule(animal, days=30):
+    """Backward-compatible shortcut returning the first searched schedule."""
+    return find_equivalent_schedules(animal, days=days, limit=1)[0]
+
 
 def pass_agent(_obs):
     return {"farmer": ["PASS"], "hands": [], "market": []}
@@ -108,10 +219,12 @@ def measure_animal(animal, use_care, seed, days=30):
     return trace, action_counts
 
 
-def run_optimal_schedule(animal, seed, collect_fertilizer=True, days=30):
+def run_optimal_schedule(
+    animal, seed, collect_fertilizer=True, days=30, schedule=None
+):
     """Run the max-product, minimum-maintenance-action 30-day schedule."""
     cfg = ANIMALS[animal]
-    schedule = OPTIMAL_SCHEDULES[animal]
+    schedule = schedule or OPTIMAL_SCHEDULES[animal]
     trace = []
     action_counts = Counter()
     queues = {}
@@ -185,6 +298,16 @@ def test_optimal_animal_schedules():
             run_optimal_schedule(animal, seed)
 
 
+def test_searched_animal_schedules_match_daily_care_yield():
+    for animal in ANIMALS:
+        schedules = find_equivalent_schedules(animal, limit=5)
+        assert len(schedules) == 5
+        for schedule in (schedules[0], schedules[-1]):
+            run_optimal_schedule(
+                animal, seed=1, collect_fertilizer=False, schedule=schedule
+            )
+
+
 def main():
     for seed in (1, 7, 42):
         for animal in ANIMALS:
@@ -202,6 +325,22 @@ def main():
             f"optimal animal={animal:<5} harvests={trace} "
             f"total_yield={sum(x[1] for x in trace)} tile_actions={sum(counts.values())}"
         )
+    print("\nSchedules found by dynamic programming (same yield as daily FEED+CARE):")
+    for animal in ANIMALS:
+        schedules = find_equivalent_schedules(animal, limit=5)
+        for index, schedule in enumerate(schedules, 1):
+            trace, counts = run_optimal_schedule(
+                animal, seed=1, collect_fertilizer=False, schedule=schedule
+            )
+            maintenance = len(schedule["feed"]) + len(schedule["care"])
+            baseline = 2 * 30
+            print(
+                f"searched animal={animal:<5} option={index} "
+                f"yield={sum(x[1] for x in trace):>2} "
+                f"feed={sorted(schedule['feed'])} care={sorted(schedule['care'])} "
+                f"harvest={sorted(schedule['harvest'])} maintenance={maintenance} "
+                f"saved_vs_daily={baseline - maintenance}"
+            )
 
 
 if __name__ == "__main__":

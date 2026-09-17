@@ -417,10 +417,10 @@ def render(report: dict, source: str) -> str:
 
 def run(replay_path: Path, output: Path | None = None) -> Path:
     report = analyze(json.loads(replay_path.read_text(encoding="utf-8")))
-    output = output or replay_path.with_suffix(".sales.html")
+    output = output or replay_path.parent / "sales_analysis.html"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(render(report, replay_path.name), encoding="utf-8")
-    output.with_suffix(".json").write_text(
+    output.with_name("sales_analysis.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -443,7 +443,7 @@ def _project_command(replay: Path, output: Path | None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("replay", type=Path, help="JSON replay exported by play_match")
-    parser.add_argument("--output", type=Path, help="HTML output (default: <replay>.sales.html)")
+    parser.add_argument("--output", type=Path, help="HTML output (default: replay directory/sales_analysis.html)")
     args = parser.parse_args()
     command = _project_command(args.replay, args.output)
     if command is not None:

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import re
+from datetime import datetime
 from importlib.metadata import version
 from pathlib import Path
 
@@ -89,6 +90,10 @@ def _slug(value: str) -> str:
     return slug or "opponent"
 
 
+def _timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
 def run(opponent="pass", seed=1, output_dir=None):
     opponent_agent, opponent_name, opponent_meta = resolve_opponent(str(opponent))
     current = make_agent(END_DAY - 1, seed=seed)
@@ -100,10 +105,11 @@ def run(opponent="pass", seed=1, output_dir=None):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     final = env.steps[-1]
-    stem = f"current_vs_{_slug(opponent_name)}_seed{seed}"
-    html_path = output_dir / f"{stem}.html"
-    replay_path = output_dir / f"{stem}.json"
-    result_path = output_dir / f"{stem}.result.json"
+    run_dir = output_dir / f"current_vs_{_slug(opponent_name)}_seed{seed}_{_timestamp()}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    html_path = run_dir / "replay.html"
+    replay_path = run_dir / "replay.json"
+    result_path = run_dir / "result.json"
 
     html_path.write_text(
         env.render(mode="html", width=1200, height=800),
@@ -123,6 +129,7 @@ def run(opponent="pass", seed=1, output_dir=None):
         "frames": len(env.steps),
         "engine": version("kaggle-environments"),
         "configuration": dict(env.configuration),
+        "output_dir": str(run_dir),
         "html": str(html_path),
         "replay_json": str(replay_path),
         **opponent_meta,
