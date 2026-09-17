@@ -15,7 +15,13 @@ from agents.opening_book import make_opening_controller, should_buy_land_on_sche
 from agents.planner import SEASON_END_DAY, plan_targets, should_buy_land
 from agents.selling import SELLABLE
 from agents.v2_lifecycle import ScheduleBook
-from agents.v2_scheduler import MAX_HANDS, build_plans, global_supply_plan, hands_needed
+from agents.v2_scheduler import (
+    MAX_HANDS,
+    build_plans,
+    global_supply_plan,
+    hands_needed,
+    predicted_spawn_starts,
+)
 from agents.v2_tasks import build_v2_jobs
 
 BOARD_SIZE = 10
@@ -99,6 +105,36 @@ def _supply_buy_orders(shortfall):
     return orders
 
 
+def _extra_hires_to_fit(jobs, starts, hour, shed_access):
+    """Minimum extra hands that make the real jobs fit after one HIRE turn.
+
+    While an unplanned day is still being solved every real worker PASSes, so
+    their post-movement positions are exactly ``starts``. HIRE is processed
+    after those PASSes. That makes the spawn rule deterministic here: predict
+    from the real current occupancy, give every worker one fewer remaining
+    step, and retry the exact same packer used for execution.
+    """
+    existing_hands = max(0, len(starts) - 1)
+    room = max(0, MAX_HANDS - existing_hands)
+    next_budget = max(0, 24 - (hour + 1))
+    if not room or not next_budget:
+        return 0
+
+    for extra in range(1, room + 1):
+        spawned = predicted_spawn_starts(starts, extra, shed_access)
+        candidate_starts = [*starts, *spawned]
+        budgets = [next_budget] * len(candidate_starts)
+        _, unassigned = build_plans(
+            jobs,
+            candidate_starts,
+            budgets,
+            shed_access=shed_access,
+        )
+        if not unassigned:
+            return extra
+    return 0
+
+
 def make_agent(end_day=SEASON_END_DAY, seed=0):
     del seed
     targets = {}
@@ -120,6 +156,9 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         if not opening:
             plan_targets(obs, targets, active, end_day)
 
+        # Daily labor sizing is independent of what happens to be in the shed
+        # right now. Required PLANT/PLACE work is part of the schedule first;
+        # Buyer is responsible for making those inputs exist before execution.
         assumed_jobs = build_v2_jobs(
             obs,
             targets,
@@ -148,28 +187,67 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
 
         # Scheduler owns the count; Buyer only places HIRE orders.
         market.extend([["HIRE"] for _ in range(max(0, desired_hands - len(farm["hands"])))])
-        market.extend(purchase_orders(obs, targets, active))
+        # Same-crop replacement seed is part of HARVEST -> PLANT -> WATER,
+        # rather than being delayed until the tile is observed empty tomorrow.
+        market.extend(
+            purchase_orders(
+                obs,
+                targets,
+                active,
+                replant_same_crop=True,
+            )
+        )
         state["pending_market"] = _dedupe_market_orders(market)
         state["plans"] = []
         state["planned"] = False
         state["last_market_submission_hour"] = -1
 
     def build_day_plan(obs, farm):
-        jobs = build_v2_jobs(obs, targets, schedules)
+        # Use the same inventory-independent job set as morning hand sizing.
+        # The old code switched back to real current inputs here, which could
+        # change atomic chains/split points and make a hand count that fitted at
+        # dawn fail once the real queue was constructed.
+        jobs = build_v2_jobs(
+            obs,
+            targets,
+            schedules,
+            assume_crop_seeds=True,
+            assume_animal_inputs=True,
+        )
         starts = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
         remaining = max(0, 24 - obs["hour"])
         budgets = [remaining] * len(starts)
+        shed_access = _open_shed_access(farm)
         plans, unassigned = build_plans(
             jobs,
             starts,
             budgets,
-            shed_access=_open_shed_access(farm),
+            shed_access=shed_access,
         )
+
+        if unassigned and len(farm["hands"]) < MAX_HANDS:
+            extra = _extra_hires_to_fit(
+                jobs,
+                starts,
+                obs["hour"],
+                shed_access,
+            )
+            if extra:
+                # This is still the scheduler solving the day, not a runtime
+                # rescue. Nothing has started yet; hire the missing capacity,
+                # observe the exact spawn next turn, then solve once more.
+                state["hand_target"] = len(farm["hands"]) + extra
+                state["pending_market"] = [["HIRE"] for _ in range(extra)]
+                state["plans"] = []
+                state["planned"] = False
+                return False
+
         if unassigned:
-            # No priority fallback and no runtime rescue. A miss is an invariant
-            # failure to fix in strategy/scheduling, not a reason to reorder
-            # survival work behind the user's back.
+            # At the hard worker/time ceiling keep the feasible queues but make
+            # the invariant visible. There is deliberately no task priority or
+            # hidden rescue ordering here.
             state["invariant_failures"] += len(unassigned)
+
         state["plans"] = plans
         state["planned"] = True
 
@@ -177,6 +255,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         state["pending_market"] = _dedupe_market_orders(
             [*state["pending_market"], *_supply_buy_orders(supply.buy_shortfall)]
         )
+        return True
 
     def agent(obs):
         farm = obs["farms"][obs["player"]]
