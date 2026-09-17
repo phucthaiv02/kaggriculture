@@ -94,8 +94,11 @@ class SupplyPlan:
 def jobs_from_tasks(tasks: Iterable) -> list[TileJob]:
     """Collapse all same-tile legacy Tasks into one atomic v2 TileJob.
 
-    Legacy urgency/deadline/drop metadata is deliberately ignored. Generic
-    DIG is not a v2 lifecycle rule and is filtered here.
+    Legacy urgency/deadline/drop metadata is deliberately ignored. DIG is
+    preserved when the task generator explicitly requires it (notably WEED
+    recovery). The v2 lifecycle layer separately removes DIG from normal
+    HARVEST -> next-lifecycle transitions, where harvesting already frees the
+    tile and no DIG rule exists.
     """
     grouped = {}
     order = []
@@ -108,7 +111,7 @@ def jobs_from_tasks(tasks: Iterable) -> list[TileJob]:
         entry["actions"].extend(
             tuple(action)
             for action in task.actions
-            if action and action[0] != "DIG"
+            if action
         )
         entry["needs"].update(task.needs)
         entry["produces"].update(task.sells)
