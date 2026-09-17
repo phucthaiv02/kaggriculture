@@ -12,6 +12,7 @@ from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 
+from agents.schedules import should_care_animal, should_feed_animal
 from experiments.animal_yields import OPTIMAL_SCHEDULES, find_equivalent_schedules
 from experiments.crop_schedules import CASES, find_equivalent_water_schedules
 
@@ -55,7 +56,14 @@ class TileLifecycle:
 
 @lru_cache(maxsize=None)
 def schedule_variants(producer: str, fertilized: bool = False):
-    """Return experiment-backed variants, cheapest-action variants first."""
+    """Return experiment-backed variants, cheapest-action variants first.
+
+    Animal setup still materializes through the verified placement rules in
+    ``farm_tasks``. Therefore an equivalent animal variant is only legal for
+    v2 if its age-0 FEED/CARE decisions match those placement-day actions.
+    Otherwise the schedule may be max-yield in isolation but starts from a
+    different engine state and can let a newly placed animal escape on age 1.
+    """
     if producer in CROPS:
         case = CASES[(producer, bool(fertilized))]
         waters = find_equivalent_water_schedules(
@@ -75,11 +83,40 @@ def schedule_variants(producer: str, fertilized: bool = False):
             for days in waters
         )
 
-    # The DP search returns schedules with equal maximum yield and minimum
-    # FEED+CARE+HARVEST cost. Fertilizer collection remains independent and is
-    # kept on the experiment's verified ages.
-    candidates = find_equivalent_schedules(producer, days=SEASON_DAYS, limit=VARIANT_LIMIT)
-    baseline_collect = frozenset(OPTIMAL_SCHEDULES[producer]["collect_fertilizer"])
+    baseline = OPTIMAL_SCHEDULES[producer]
+    searched = find_equivalent_schedules(
+        producer, days=SEASON_DAYS, limit=VARIANT_LIMIT
+    )
+
+    # Include the verified baseline even if the DP's top-N equivalent paths do
+    # not happen to contain it. Then keep only variants that begin from the
+    # same placement-day state that the real setup job creates.
+    raw_candidates = [baseline, *searched]
+    expected_feed0 = should_feed_animal(producer, 0)
+    expected_care0 = should_care_animal(producer, 0)
+    candidates = []
+    seen = set()
+    for candidate in raw_candidates:
+        signature = (
+            frozenset(candidate["harvest"]),
+            frozenset(candidate["feed"]),
+            frozenset(candidate["care"]),
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        if (0 in candidate["feed"]) != expected_feed0:
+            continue
+        if (0 in candidate["care"]) != expected_care0:
+            continue
+        candidates.append(candidate)
+
+    if not candidates:
+        # The baseline is derived from the same verified age-relative setup
+        # rules, so this is a defensive invariant rather than an expected path.
+        candidates = [baseline]
+
+    baseline_collect = frozenset(baseline["collect_fertilizer"])
     return tuple(
         LifecycleSchedule(
             producer,
@@ -89,7 +126,7 @@ def schedule_variants(producer: str, fertilized: bool = False):
             care=frozenset(candidate["care"]),
             collect=baseline_collect,
         )
-        for candidate in candidates
+        for candidate in candidates[:VARIANT_LIMIT]
     )
 
 
@@ -121,10 +158,8 @@ class ScheduleBook:
     def assign_batch(self, positions, producer, fertilized, start_day, token_by_position):
         """Assign same-day/same-producer starts as one balancing batch.
 
-        Because positions do not affect this layer's objective, repeatedly
-        placing the next identical lifecycle into the currently best variant
-        is deterministic and distributes counts across equivalent calendars.
-        Routing remains the daily scheduler's responsibility.
+        Positions do not affect this layer's objective. Routing stays in the
+        daily scheduler; this layer only balances the future action calendar.
         """
         positions = sorted(positions)
         variants = schedule_variants(producer, fertilized)
