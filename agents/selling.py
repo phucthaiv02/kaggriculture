@@ -20,13 +20,14 @@ def sell_orders(obs, reserved):
                 if not isinstance(tile, dict) or not tile.get("animal"):
                     continue
                 age = obs["day"] - tile["placed_day"]
+                last_age = obs.get("_planning_end_day", SEASON_END_DAY) - tile["placed_day"]
                 feed += int(
-                    should_feed_animal(tile["animal"], age)
+                    should_feed_animal(tile["animal"], age, last_age)
                     and not tile.get("fed_today")
                 )
                 feed += int(
                     obs["day"] < obs.get("_planning_end_day", SEASON_END_DAY)
-                    and should_feed_animal(tile["animal"], age + 1)
+                    and should_feed_animal(tile["animal"], age + 1, last_age)
                 )
         reserved["WHEAT"] = max(reserved.get("WHEAT", 0), feed)
 

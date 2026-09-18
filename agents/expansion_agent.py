@@ -18,13 +18,48 @@ from agents.farm_tasks import (
     reserved_items,
 )
 from agents.opening_book import make_opening_controller, should_buy_land_on_schedule
-from agents.intraday import queue_commitments, schedule_open_tiles
+from agents.intraday import MOVES, queue_commitments, schedule_open_tiles
 from agents.planner import SEASON_END_DAY, plan_targets
 from agents.horizon import can_start_today
 from agents.scheduler import MAX_HANDS, build_queues, hands_needed
-from agents.schedules import is_maintenance_day, should_care_animal, should_feed_animal
+from agents.schedules import is_maintenance_day, should_care_animal, should_feed_animal, should_harvest_animal
 from agents.selling import sell_orders
 from agents.liquidation import liquidate_queues
+
+def _prune_stale_harvests(farm, plans):
+    """Remove invalid harvests at their routed tile before dispatching work."""
+    positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
+    for position, plan in zip(positions, plans):
+        x, y = position
+        queue = []
+        for operation in plan.queue:
+            if operation[0] in MOVES:
+                dx, dy = MOVES[operation[0]]
+                x, y = x + dx, y + dy
+            if operation[0] == "HARVEST":
+                tile = farm["tiles"][y][x]
+                if not isinstance(tile, dict) or tile.get("yield_units", 0) <= 0:
+                    continue
+            queue.append(operation)
+        plan.queue = queue
+
+
+def _valid_harvest_operations(farm, operations):
+    """Engine workers execute in order; each tile can pay out only once."""
+    seen = set()
+    result = list(operations)
+    positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
+    for index, position in enumerate(positions[:len(result)]):
+        if result[index] != ["HARVEST"]:
+            continue
+        x, y = position
+        tile = farm["tiles"][y][x]
+        if position in seen or not isinstance(tile, dict) or tile.get("yield_units", 0) <= 0:
+            result[index] = ["PASS"]
+        else:
+            seen.add(position)
+    return result
+
 
 def _protect_animal_structures(farm, operations):
     """Discard stale DIG/PLANT commands on permanent animal structures."""
@@ -223,13 +258,15 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             # must release their tasks and inputs for intraday scheduling.
             del state["plans"][len(hands) + 1:]
 
-    def _animal_still_needs_attention(tile, name, day):
+    def _animal_still_needs_attention(tile, name, day, last_day):
         """Check outstanding harvest, scheduled feed and care for a placed animal."""
         age = day - tile["placed_day"]
-        harvest_ready = tile.get("yield_units", 0) > 0
-        needs_feed = should_feed_animal(name, age) and not tile.get("fed_today")
+        harvest_ready = should_harvest_animal(
+            name, age, tile.get("yield_units", 0), force=day == last_day,
+        )
+        needs_feed = should_feed_animal(name, age, last_day - tile["placed_day"]) and not tile.get("fed_today")
         needs_care = (
-            should_care_animal(name, age)
+            should_care_animal(name, age, last_day - tile["placed_day"])
             and tile.get("fed_today")
             and not tile.get("cared_today")
         )
@@ -284,7 +321,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 if not placed:
                     if position not in state["scheduled_placements"]:
                         pending_targets[position] = target
-                elif _animal_still_needs_attention(tile, name, day):
+                elif _animal_still_needs_attention(tile, name, day, obs.get("_planning_end_day", end_day)):
                     pending_targets[position] = target
             elif (
                 position in state["deferred_expansion_positions"]
@@ -368,6 +405,12 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             for position in new_positions:
                 targets.setdefault(position, None)
 
+        obs["_pending_targets"] = state["pending_targets"]
+        if hour > 0:
+            if state["unverified_hand_indices"]:
+                _validate_predicted_hands(farm, hour)
+            _prune_stale_harvests(farm, state["plans"])
+
         if hour == 0:
             tasks = build_tasks(
                 obs, targets,
@@ -449,6 +492,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 existing_hands,
                 shed_access,
                 pending_hand_budget=22,
+                available_wheat=obs["private"]["shed"].get("WHEAT", 0),
             )
             state["plans"], state["reserved"] = plans, reserved_items(tasks)
             # Indices beyond today's already-real hands got a route built
@@ -535,7 +579,10 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         # animal output, HARVEST now. Put its queued operation back instead
         # of discarding it, so FEED/CARE/WATER still executes next turn.
         worker_positions = positions
-        harvested_positions = set()
+        harvested_positions = {
+            position for position, operation in zip(worker_positions, worker_ops)
+            if operation == ["HARVEST"]
+        }
         for index, position in enumerate(worker_positions[:len(worker_ops)]):
             x, y = position
             tile = farm["tiles"][y][x]
@@ -554,6 +601,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 worker_ops[index] = ["HARVEST"]
             harvested_positions.add(position)
 
+        worker_ops = _valid_harvest_operations(farm, worker_ops)
         worker_ops = _protect_animal_structures(farm, worker_ops)
 
         farmer_op, hand_ops = worker_ops[0], worker_ops[1:]
