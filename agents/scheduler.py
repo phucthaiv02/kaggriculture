@@ -166,25 +166,38 @@ def _task_length(start, bucket, shed_for):
 _ANIMAL_SERVICE_OPS = ("FEED", "CARE", "COLLECT_FERTILIZER")
 
 
-def _animal_service(task):
+def _is_animal_service(task):
     return task.animal_harvest or bool(
-        task.urgent
-        and task.actions
-        and task.actions[0][0] in _ANIMAL_SERVICE_OPS
+        task.urgent and task.actions and task.actions[0][0] in _ANIMAL_SERVICE_OPS
     )
 
 
-def _priority(task, group_animal=False):
-    animal_service = group_animal and _animal_service(task)
+def _priority(task):
     return (
         not task.urgent,
-        not (animal_service or task.animal_harvest),
-        False if animal_service else not (
-            task.actions and task.actions[0][0] in _ANIMAL_SERVICE_OPS
-        ),
+        not task.animal_harvest,
+        not (task.actions and task.actions[0][0] in _ANIMAL_SERVICE_OPS),
         task.deadline if task.deadline is not None else float("inf"),
         not task.immediate_drop,
     )
+
+
+def _rescue_priority(task):
+    """Relax only the split between urgent animal harvest and maintenance.
+
+    This priority is never used for a route that already fits. It is a bounded
+    fallback for a smaller headcount that the strict safety ordering could not
+    pack, allowing one worker to service both tasks at the same pen in one visit.
+    """
+    if _is_animal_service(task):
+        return (
+            not task.urgent,
+            False,
+            False,
+            task.deadline if task.deadline is not None else float("inf"),
+            not task.immediate_drop,
+        )
+    return _priority(task)
 
 
 def _bucket_budget(base_budget, bucket, terminal_day):
@@ -199,12 +212,22 @@ def _bucket_budget(base_budget, bucket, terminal_day):
     return max(0, base_budget - 1 - int(_cashout_needed(bucket)))
 
 
-def _pack_greedy(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, variant=0):
+def _pack_greedy(
+    tasks,
+    worker_starts,
+    budgets,
+    shed_access=SHED_ACCESS,
+    variant=0,
+    group_animal=False,
+):
     """Greedy bin-pack using each candidate worker's exact queue length.
 
     The projection includes travel from the real spawn, one operation for
     every distinct PICKUP, travel between tasks, and all tile actions. The
     optional DROP trip is added later only when it fits.
+
+    group_animal is an emergency packing mode used only after the strict route
+    fails at a candidate headcount. Normal callers retain the original ordering.
     """
     buckets = [[] for _ in worker_starts]
 
@@ -214,52 +237,30 @@ def _pack_greedy(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, variant
             sheds[position] = nearest_shed(position, shed_access)
         return sheds[position]
 
-    # Keep the original opening order exactly. Once expansion has started,
-    # animal harvest and maintenance share one safety class so the insertion
-    # search can keep both visits to the same pen on one route instead of
-    # touring every harvest first and then crossing the farm again for FEED/CARE.
-    group_animal = len(shed_access) > 1
-    priorities = {id(task): _priority(task, group_animal) for task in tasks}
+    priority_for = _rescue_priority if group_animal else _priority
+    priorities = {id(task): priority_for(task) for task in tasks}
     reserve_turn = any(task.animal_harvest for task in tasks)
     terminal_day = any(task.cashout for task in tasks)
 
-    if group_animal:
-        ordered = sorted(
-            tasks,
-            key=lambda task: (
-                priorities[id(task)],
-                min(
-                    abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
-                    for start in worker_starts
-                ),
-                task.position[1],
-                task.position[0],
-                not task.animal_harvest,
-                -len(task.actions),
+    # Visit nearby work first within each priority class. The previous
+    # action-length ordering put long/far tasks at the front (notably the
+    # top rows of NW), so a worker crossed the farm and then doubled back to
+    # perform work beside the shed. Distance is measured from the closest
+    # real worker start; insertion then optimizes each worker's own route.
+    ordered = sorted(
+        tasks,
+        key=lambda task: (
+            priorities[id(task)],
+            min(
+                abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
+                for start in worker_starts
             ),
-        )
-    else:
-        # Opening order is intentionally unchanged because its fixed
-        # fertilizer-sale/refinancing sequence is sensitive to assignment.
-        ordered = sorted(
-            tasks,
-            key=lambda task: (
-                not task.urgent,
-                not task.animal_harvest,
-                not (
-                    task.actions
-                    and task.actions[0][0] in _ANIMAL_SERVICE_OPS
-                ),
-                task.deadline if task.deadline is not None else float("inf"),
-                min(
-                    abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
-                    for start in worker_starts
-                ),
-                -len(task.actions),
-                task.position[1],
-                task.position[0],
-            ),
-        )
+            -len(task.actions),
+            task.position[1],
+            task.position[0],
+            not task.animal_harvest if group_animal else False,
+        ),
+    )
     if variant:
         # Keep the safety classes, but try difficult / spatially grouped work
         # first so easy nearby jobs do not strand capacity at the farm edges.
@@ -277,7 +278,7 @@ def _pack_greedy(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, variant
         priority = priorities[id(task)]
         time_sensitive = (task.urgent or task.animal_harvest
                           or task.deadline is not None or task.immediate_drop)
-        task_is_service = group_animal and _animal_service(task)
+        task_is_service = group_animal and _is_animal_service(task)
         for worker, bucket in enumerate(buckets):
             paired_harvest = None
             paired_service = None
@@ -287,7 +288,7 @@ def _pack_greedy(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, variant
                         continue
                     if queued.animal_harvest:
                         paired_harvest = index
-                    elif _animal_service(queued):
+                    elif _is_animal_service(queued):
                         paired_service = index
             for insertion in range(len(bucket) + 1):
                 # Buckets are already priority-sorted; only the two new
@@ -296,9 +297,8 @@ def _pack_greedy(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, variant
                     continue
                 if insertion < len(bucket) and priority > priorities[id(bucket[insertion])]:
                     continue
-                # If both animal tasks for a pen share this worker, make the
-                # explicit HARVEST happen first. This avoids the runtime
-                # opportunistic-harvest guard creating a later duplicate no-op.
+                # In rescue mode, tasks at the same pen may share a visit but
+                # explicit HARVEST stays before that pen's FEED/CARE work.
                 if task_is_service:
                     if task.animal_harvest and paired_service is not None and insertion > paired_service:
                         continue
@@ -343,6 +343,18 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
     if any(op[0] in ("PLANT", "PLACE", "DIG", "BUILD_COOP", "BUILD_PASTURE")
            for task in tasks for op in task.actions):
         return best
+
+    # The strict route remains authoritative whenever it fits. Only when it
+    # leaves work behind may we relax harvest-vs-maintenance grouping, and then
+    # only if the relaxed candidate completes the whole workload. This makes
+    # the optimization capable of saving a hand without changing valid routes.
+    if best[1] and any(_is_animal_service(task) for task in tasks):
+        grouped = _pack_greedy(
+            tasks, worker_starts, budgets, shed_access, group_animal=True
+        )
+        if not grouped[1]:
+            return grouped
+
     terminal_day = any(task.cashout for task in tasks)
     def score(result):
         if result[1]:
