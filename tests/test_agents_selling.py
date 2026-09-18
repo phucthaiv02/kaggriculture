@@ -65,7 +65,7 @@ def test_last_day_sells_feed_that_has_no_remaining_use():
     obs.update(day=29, player=0, farms=[{'tiles': [[
         {'animal': 'SHEEP', 'placed_day': 10, 'fed_today': False},
     ]]}])
-    assert sell_orders(obs, {}) == [['SELL', 'WHEAT', 9]]
+    assert sell_orders(obs, {}) == [['SELL', 'WHEAT', 10]]
     obs['farms'][0]['tiles'][0][0]['fed_today'] = True
     assert sell_orders(obs, {}) == [['SELL', 'WHEAT', 10]]
 

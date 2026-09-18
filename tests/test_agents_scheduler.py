@@ -376,3 +376,67 @@ def test_rescue_preserves_nw_opening_assignments():
              for x, y in [(0, 0), (4, 4), (1, 0), (2, 1), (3, 4), (4, 0)]]
     args = (tasks, [(4, 4), (5, 4)], [23, 23], ((4, 4),))
     assert _pack(*args) == _pack_greedy(*args)
+
+
+def _feed_pair():
+    return [Task(position, [["FEED"], ["CARE"], ["COLLECT_FERTILIZER"]],
+                 needs=Counter(WHEAT=1), sells=Counter(FERTILIZER=1), urgent=True)
+            for position in ((4, 3), (5, 3))]
+
+
+def test_stocked_feed_routes_share_one_bulk_pickup():
+    plans, missing = build_queues(_feed_pair(), (4, 4), 1, available_wheat=2)
+    assert missing == []
+    queues = [plan.queue for plan in plans if plan.queue]
+    assert len(queues) == 1
+    assert [op for op in queues[0] if op[0] == "PICKUP"] == [["PICKUP", "WHEAT", 2]]
+    assert queues[0].count(["FEED"]) == 2
+    assert queues[0].count(["CARE"]) == 2
+    assert queues[0][-1] == ["DROP"]
+    assert len(queues[0]) < 14  # Two separate seven-turn deliveries.
+
+
+def test_feed_consolidation_requires_stock_and_preserves_opening():
+    tasks = _feed_pair()
+    normal, _ = build_queues(tasks, (4, 4), 1)
+    scarce, _ = build_queues(tasks, (4, 4), 1, available_wheat=1)
+    assert [p.queue for p in scarce] == [p.queue for p in normal]
+    opening, _ = build_queues(tasks, (4, 4), 1, shed_access=((4, 4),))
+    stocked, _ = build_queues(tasks, (4, 4), 1, shed_access=((4, 4),), available_wheat=2)
+    assert [p.queue for p in stocked] == [p.queue for p in opening]
+
+
+def test_feed_consolidation_respects_return_and_worker_budget():
+    plans, missing = build_queues(_feed_pair(), (4, 4), 1,
+                                 available_wheat=2, worker_budgets=[8, 8])
+    assert missing == []
+    assert all(plan.queue.count(["FEED"]) == 1 for plan in plans)
+    assert all(len(plan.queue) <= 8 for plan in plans)
+
+
+def test_feed_consolidation_batches_five_delivery_routes_into_two():
+    positions = [(4, 3), (5, 3), (6, 3), (4, 2), (5, 2)]
+    tasks = [Task(p, [["FEED"], ["CARE"], ["COLLECT_FERTILIZER"]],
+                  needs=Counter(WHEAT=1), sells=Counter(FERTILIZER=1), urgent=True)
+             for p in positions]
+    original, _ = build_queues(tasks, (4, 4), 4)
+    batched, missing = build_queues(tasks, (4, 4), 4, available_wheat=5)
+    assert missing == []
+    assert sum(bool(p.queue) for p in original) == 5
+    assert sum(bool(p.queue) for p in batched) == 2
+    assert sorted(op[2] for p in batched for op in p.queue if op[0] == "PICKUP") == [2, 3]
+    assert sum(p.queue.count(["FEED"]) for p in batched) == 5
+    assert all(not p.queue or p.queue[-1] == ["DROP"] for p in batched)
+
+
+def test_feed_rebalancing_keeps_investment_on_its_original_worker():
+    from agents.scheduler import _rebalance_feed
+    feed1, feed2 = _feed_pair()
+    plant = Task((5, 4), [["PLANT", "CARROT"], ["WATER"]])
+    buckets = [[feed1, plant], [feed2]]
+    result = _rebalance_feed(buckets, [(4, 4), (5, 4)], [23, 23],
+                             ((4, 4), (5, 4), (4, 5), (5, 5)), [feed1, feed2, plant])
+    assert plant in result[0] and plant not in result[1]
+    if feed2 in result[0]:
+        assert result[0].index(plant) < result[0].index(feed2)
+    assert sorted(id(t) for b in result for t in b) == sorted(map(id, [feed1, feed2, plant]))

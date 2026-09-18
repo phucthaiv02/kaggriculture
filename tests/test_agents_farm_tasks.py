@@ -111,7 +111,7 @@ def test_live_animal_already_fed_is_not_fed_twice_when_tasks_are_rebuilt():
 
 
 def test_live_animal_harvests_before_feeding():
-    obs = make_obs(day=3, tiles={(0, 0): animal_tile("SHEEP", placed_day=0, yield_units=4)}, shed={"WHEAT": 5})
+    obs = make_obs(day=6, tiles={(0, 0): animal_tile("SHEEP", placed_day=0, yield_units=4)}, shed={"WHEAT": 5})
     tasks = build_tasks(obs, {(0, 0): ("SHEEP", False)})
     assert [task.actions for task in tasks] == [[["HARVEST"]], [["FEED"], ["CARE"]]]
     assert tasks[0].sells == {"WOOL": 4}
@@ -119,15 +119,15 @@ def test_live_animal_harvests_before_feeding():
     assert tasks[0].animal_harvest
 
 
-def test_live_animal_harvests_urgently_even_outside_maintenance_schedule():
+def test_live_animal_harvests_at_cap_even_outside_maintenance_schedule():
     obs = make_obs(
         day=28,
-        tiles={(0, 0): animal_tile("SHEEP", placed_day=0, yield_units=4)},
+        tiles={(0, 0): animal_tile("SHEEP", placed_day=0, yield_units=6)},
         shed={"WHEAT": 5},
     )
     task = one_task(build_tasks(obs, {(0, 0): ("SHEEP", False)}))
     assert task.actions == [["HARVEST"]]
-    assert task.sells == {"WOOL": 4}
+    assert task.sells == {"WOOL": 6}
     assert task.urgent
     assert task.animal_harvest
 
@@ -485,3 +485,20 @@ def test_final_day_buyer_does_not_restock_tomorrows_feed():
     targets = {(4, 3): ('SHEEP', False)}
     assert feed_wheat_order(obs, targets, list(targets)) == []
     assert purchase_orders(obs, targets, list(targets)) == []
+
+
+def test_terminal_return_is_required_for_produce_but_not_fertilizer_only():
+    obs = make_obs(
+        29,
+        {(4, 3): animal_tile('COW', 0, fertilizer_available=True),
+         (3, 4): plant('WHEAT', 25, 29, yield_units=5)},
+        unlocked_quadrants=('NW', 'NE'),
+    )
+    tasks = build_tasks(obs, {(4, 3): ('COW', False), (3, 4): ('WHEAT', False)})
+    fertilizer = next(task for task in tasks if task.position == (4, 3))
+    crop = next(task for task in tasks if task.position == (3, 4))
+    assert fertilizer.sells == {'FERTILIZER': 1}
+    assert not fertilizer.cashout
+    assert fertilizer.terminal_day and crop.terminal_day
+    assert crop.sells['WHEAT'] == 5
+    assert crop.cashout
