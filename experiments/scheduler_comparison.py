@@ -85,6 +85,25 @@ def capture_targets(replay, baseline_source):
         sys.modules.update(saved)
 
 
+def replay_seed(replay, replay_path):
+    """Resolve the deterministic seed recorded by Kaggle replay serialization."""
+    metadata = replay_path.with_name('result.json')
+    if metadata.exists():
+        seed = json.loads(metadata.read_text()).get('seed')
+        if seed is not None:
+            return seed
+    seed = replay.get('configuration', {}).get('seed')
+    if seed is not None:
+        return seed
+    # Kaggriculture clears configuration.seed after resolving it and records
+    # the resolved value in env.info['seed']. Local replay exports therefore
+    # commonly have configuration.seed == null even though they are deterministic.
+    seed = replay.get('info', {}).get('seed')
+    if seed is not None:
+        return seed
+    raise ValueError('Replay does not record a deterministic seed')
+
+
 def run(replay_path, baseline_source, output, baseline=False):
     replay = json.loads(replay_path.read_text())
     fingerprint = hashlib.sha256(replay_path.read_bytes())
@@ -131,10 +150,7 @@ def run(replay_path, baseline_source, output, baseline=False):
         # Keep pending entries alive so the frozen trace is applied next turn.
         return kwargs.get('replan_positions', ())
 
-    metadata = replay_path.with_name('result.json')
-    seed = json.loads(metadata.read_text()).get('seed') if metadata.exists() else replay['configuration'].get('seed')
-    if seed is None:
-        raise ValueError('Replay configuration omits its seed; provide the original result.json beside it')
+    seed = replay_seed(replay, replay_path)
     config = dict(replay['configuration'], actTimeout=.75, seed=seed)
     env = make('kaggriculture', configuration=config, debug=False)
     with ExitStack() as stack:
