@@ -37,3 +37,10 @@ def test_terminal_sale_reserve_only_reduces_cashout_workers_budget():
     assert not missing
     assert sorted(len(plan.queue) for plan in plans) == [21, 22]
     assert sum(plan.queue.count(["DROP"]) for plan in plans) == 1
+
+
+def test_terminal_day_still_loses_a_turn_without_mandatory_returns():
+    task = Task((4, 4), [['WATER']] * 23, terminal_day=True)
+    plans, missing = build_queues([task], (4, 4), 0)
+    assert missing == [task]
+    assert plans[0].queue == []

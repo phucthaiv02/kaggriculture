@@ -82,6 +82,16 @@ lập queue sau lượt mua đầu ngày, không giả định lệnh mua đã t
 
 - `schedules.py` là nguồn lịch WATER/FERTILIZE/FEED/CARE theo **tuổi**
   (`day - planted_day` hoặc `day - placed_day`), không theo ngày lịch.
+- FEED/CARE của vật nuôi tính thêm tuổi vào ngày kết thúc thực tế. Giữ FEED
+  cần cho lần sinh sản phẩm cuối có thể thu hoạch và để tránh bỏ đi; không
+  FEED ngày cuối. Trong ba ngày cuối, bỏ CARE nếu bonus chỉ tới sau mùa.
+  Trước cửa sổ này giữ nhịp CARE để không xáo trộn chỗ dành cho tái trồng.
+  Kiểm tra việc còn thiếu và seller dùng cùng cửa sổ chăm sóc;
+  buyer bỏ nhu cầu hiện tại sau hạn FEED, vẫn giữ buffer ngày kế tiếp bảo thủ.
+  Giữ nguyên forecast định giá target; không đưa tiết kiệm chăm sóc mới vào
+  bộ chọn target trong lượt tối ưu scheduler này.
+  `experiments.animal_horizon` đối chiếu 90 trường hợp 1–30 ngày với engine:
+  cùng sản phẩm/phân bón và không có con vật bỏ đi trong thời gian chơi.
 - Cây mới phải có `PLANT → WATER` trong ngày. Hai lần refresh liên tiếp
   thiếu nước/thức ăn làm cây thành cỏ hoặc con vật bỏ đi.
 - Scheduler ưu tiên task khẩn cấp, sản phẩm con vật sẵn sàng, chăm sóc và
@@ -92,6 +102,13 @@ lập queue sau lượt mua đầu ngày, không giả định lệnh mua đã t
   theo cột, theo hàng). Chỉ nhận phương án xếp đủ toàn bộ task; cùng số hand
   thì ưu tiên lượng hàng có thể về kho trong ngày. Không thay route đầu tư
   chứa PLANT/PLACE/DIG/BUILD, vì buyer intraday đang dựa vào các cam kết này.
+- Khi dựng queue hour 1 và kho đủ WHEAT cho toàn bộ task, gom FEED trong
+  tối đa hai lượt duyệt. Thử chuyển từng task FEED/CARE/thu phân bón sang
+  worker đã mang WHEAT, chèn sau các task khác của worker nhận. Điểm chọn
+  bằng tổng bước bắt buộc cộng 4 lượt cho mỗi worker mang WHEAT; chỉ nhận
+  nếu điểm giảm, hàng bị giữ ngoài kho không tăng, tuyến nhận đủ lượt về
+  kho và dư một lượt. Giữ nguyên phân công/thứ tự tương đối của việc khác,
+  số hand và tập task chưa xếp được. Không gom trong opening hoặc thiếu kho.
 - Giữ nguyên phân công khi chỉ mở NW. Bỏ qua số hand chắc chắn không đủ ngay
   cả khi không phải di chuyển. Phương án thay thế có sản phẩm con vật dành
   thêm một lượt cho HARVEST phát sinh khi worker đi qua ô có sản phẩm.
@@ -132,6 +149,10 @@ lập queue sau lượt mua đầu ngày, không giả định lệnh mua đã t
   một decision sau DROP để bán. Observation terminal không thực thi SELL;
   hàng còn trong inventory ở đó không tăng cash reward. `liquidation.py`
   thực hiện bước này trước khi lấy action của worker.
+- Ngân sách quay về bắt buộc ngày cuối áp dụng cho task có sản phẩm bán được
+  ngoài FERTILIZER. Task chỉ thu phân không tự ép thuê thêm hand theo giá
+  Fibonacci; vẫn thu phân và đưa về kho khi queue còn đủ thời gian. Ngày
+  PLANT/PLACE/BUILD/DIG và target không đổi trong phép so sánh khóa replay.
 
 ## Phân công module
 

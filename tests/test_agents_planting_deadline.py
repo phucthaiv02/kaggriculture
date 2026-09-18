@@ -50,7 +50,8 @@ def test_real_game_config_overrides_erroneous_end_day_and_blocks_queued_plant(mo
     import agents.expansion_agent as module
     agent = make_agent(30)
     cells = dict(zip(agent.__code__.co_freevars, (c.cell_contents for c in agent.__closure__)))
-    obs = make_obs(22, seeds={'TOMATO': 1})
+    obs = make_obs(22, seeds={'TOMATO': 1},
+                   tiles={(5, 4): plant('WHEAT', 18, 22, yield_units=2)})
     obs['hour'] = 22
     obs['town'] = {'unlocked_shops': []}
     cells['targets'].update({(x, y): None for y in range(10) for x in range(10)})

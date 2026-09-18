@@ -15,6 +15,8 @@ in ``agents/scheduler.py``.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 
 # (crop, fertilized) -> water ages relative to planted_day. Fertilizing an
 # ongoing crop (TOMATO/STRAWBERRY) needs more frequent watering because each
@@ -97,12 +99,39 @@ def should_fertilize_today(crop, age, fertilized):
     return fertilized and age in CROP_FERTILIZE_DAYS[crop]
 
 
-def should_feed_animal(animal, age):
-    return age in ANIMAL_FEED_DAYS[animal]
+ANIMAL_PRODUCTION = {"GOOSE": (4, 1), "COW": (8, 2), "SHEEP": (6, 3)}
 
 
-def should_care_animal(animal, age):
-    return age in ANIMAL_CARE_DAYS[animal]
+@lru_cache(maxsize=128)
+def animal_last_yield_age(animal, last_age):
+    first, interval = ANIMAL_PRODUCTION[animal]
+    return first + ((last_age - first) // interval) * interval if last_age >= first else -1
+
+
+@lru_cache(maxsize=128)
+def animal_feed_end_age(animal, last_age=29):
+    # Feed on the eve of the last useful production tick. Keep enough later
+    # feeds to prevent two consecutive misses before the last playable day.
+    survival_feed = min(
+        (age for age in ANIMAL_FEED_DAYS[animal] if age >= last_age - 2),
+        default=last_age - 1,
+    )
+    return max(animal_last_yield_age(animal, last_age) - 1, survival_feed)
+
+
+def should_feed_animal(animal, age, last_age=29):
+    return (age < last_age and age in ANIMAL_FEED_DAYS[animal]
+            and age <= animal_feed_end_age(animal, last_age))
+
+
+def should_care_animal(animal, age, last_age=29):
+    # CARE is banked after today's production refresh, so care on the eve
+    # of the final useful tick would only affect a tick beyond the horizon.
+    # Trim in the terminal window only: earlier route capacity is still needed
+    # for crop turnover and late target decisions.
+    return age in ANIMAL_CARE_DAYS[animal] and (
+        age < last_age - 2 or age <= animal_last_yield_age(animal, last_age) - 2
+    )
 
 
 def should_harvest_animal(animal, age, held=0, force=False):

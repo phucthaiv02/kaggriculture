@@ -240,7 +240,7 @@ def _pack_greedy(
     priority_for = _rescue_priority if group_animal else _priority
     priorities = {id(task): priority_for(task) for task in tasks}
     reserve_turn = any(task.animal_harvest for task in tasks)
-    terminal_day = any(task.cashout for task in tasks)
+    terminal_day = any(task.terminal_day or task.cashout for task in tasks)
 
     # Keep the production greedy ordering exactly unchanged unless this is the
     # explicit hand-count rescue. Opening and already-valid schedules therefore
@@ -374,7 +374,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
         if not grouped[1]:
             return grouped
 
-    terminal_day = any(task.cashout for task in tasks)
+    terminal_day = any(task.terminal_day or task.cashout for task in tasks)
     def score(result):
         if result[1]:
             return (float("inf"), float("inf"))
@@ -437,6 +437,74 @@ def hands_needed(
     return max_hands, unassigned
 
 
+def _rebalance_feed(buckets, starts, budgets, shed_access, tasks):
+    """Consolidate stocked feed in two bounded passes without delaying other work.
+
+    Prefer fewer feed carriers (four turns per carrier in the search score),
+    then shorter mandatory routes. A receiving route must also fit its return
+    and one spare turn. Keep the caller's headcount and unassigned work intact.
+    """
+    terminal = any(t.terminal_day or t.cashout for t in tasks)
+    def service(t):
+        return t.needs.get("WHEAT", 0) > 0 and not t.immediate_drop and all(
+            op[0] in ("FEED", "CARE", "COLLECT_FERTILIZER") for op in t.actions)
+    def metrics(worker, bucket):
+        length = _task_length(starts[worker], bucket, lambda p: nearest_shed(p, shed_access))
+        if not bucket:
+            return length, 0, 0
+        end = bucket[-1].position
+        shed = nearest_shed(end, shed_access)
+        home = abs(end[0]-shed[0]) + abs(end[1]-shed[1]) + 1
+        late = (sum(sum(t.sells.values()) for t in bucket)
+                if not _cashout_needed(bucket) and length + home > _bucket_budget(budgets[worker], bucket, terminal) else 0)
+        feeds = int(any(t.needs.get("WHEAT", 0) for t in bucket))
+        return length, late, feeds
+    for _ in range(2):
+        changed = False
+        for source in range(len(buckets)-1, -1, -1):
+            for task in list(buckets[source]):
+                if not service(task):
+                    continue
+                index = buckets[source].index(task)
+                remaining = buckets[source][:index] + buckets[source][index+1:]
+                old_source = metrics(source, buckets[source])
+                new_source = metrics(source, remaining)
+                best = None
+                for target in range(len(buckets)):
+                    if source == target or not any(service(t) for t in buckets[target]):
+                        continue
+                    bucket = buckets[target]
+                    old_target = metrics(target, bucket)
+                    for insertion in range(len(bucket)+1):
+                        # Insert after fixed work so planting and harvest are not delayed.
+                        if any(not service(t) for t in bucket[insertion:]):
+                            continue
+                        # Do not delay expiry-sensitive crop work.
+                        if any(t.deadline is not None for t in bucket[insertion:]):
+                            continue
+                        merged = bucket[:insertion] + [task] + bucket[insertion:]
+                        new_target = metrics(target, merged)
+                        end = merged[-1].position
+                        shed = nearest_shed(end, shed_access)
+                        home = 0 if _cashout_needed(merged) else abs(end[0]-shed[0]) + abs(end[1]-shed[1]) + 1
+                        if new_target[0] + home + 1 > _bucket_budget(budgets[target], merged, terminal):
+                            continue
+                        if new_source[1] + new_target[1] > old_source[1] + old_target[1]:
+                            continue
+                        delta_steps = new_source[0] + new_target[0] - old_source[0] - old_target[0]
+                        delta_feeds = new_source[2] + new_target[2] - old_source[2] - old_target[2]
+                        score = delta_steps + 4 * delta_feeds
+                        if score < 0 and (best is None or score < best[0]):
+                            best = score, target, merged
+                if best:
+                    _, target, merged = best
+                    buckets[source], buckets[target] = remaining, merged
+                    changed = True
+        if not changed:
+            break
+    return buckets
+
+
 def build_queues(
     tasks,
     farmer_start,
@@ -446,6 +514,7 @@ def build_queues(
     pending_hand_budget=HAND_BUDGET,
     existing_hand_budget=None,
     worker_budgets=None,
+    available_wheat=None,
 ):
     """Assign tasks to farmer + hand_count hands and build their routes.
 
@@ -454,7 +523,8 @@ def build_queues(
     for mid-day scheduling. worker_budgets overrides every worker individually.
 
     Append a return/DROP for sellable goods only when spare turns remain;
-    never displace assigned work just to return to the shed."""
+    never displace assigned work just to return to the shed. When available_wheat
+    is supplied, consolidate stocked feed deliveries after assignment."""
     starts = [tuple(farmer_start)] + predicted_hand_starts(
         farmer_start, hand_starts, hand_count
     )
@@ -468,6 +538,10 @@ def build_queues(
             raise ValueError("worker_budgets must contain one budget per worker")
         budgets = list(worker_budgets)
     buckets, unassigned = _pack(tasks, starts, budgets, shed_access)
+
+    demand = sum(t.needs.get("WHEAT", 0) for t in tasks)
+    if available_wheat is not None and 1 < demand <= available_wheat and len(shed_access) > 1:
+        buckets = _rebalance_feed(buckets, starts, budgets, shed_access, tasks)
 
     plans = []
     for start, budget, bucket in zip(starts, budgets, buckets):
