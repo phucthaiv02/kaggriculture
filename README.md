@@ -72,32 +72,6 @@ python -m experiments.play_match --opponent path/to/notebook.ipynb
 The production agent always runs as player 0. Match outputs are written under
 `replays/` by default.
 
-Create a round-robin HTML leaderboard. Every pair plays once using the same
-randomly generated seed:
-
-```bash
-python -m experiments.agent_leaderboard
-```
-
-Matches run concurrently in four isolated processes by default. Process
-isolation is required because the game runner captures global stdout/stderr and
-is not thread-safe. Adjust concurrency based
-on available CPU and memory with `--workers 8`, or use `--workers 1` for
-sequential execution.
-
-The experiment automatically loads every `.py` and `.ipynb` file directly under
-`public/`; each agent is named after its filename without the extension. The
-production agent from `agents/` is also included as `current`. Use `--public-dir`
-to scan a different directory. Each invocation starts a run with a new random
-seed and records its seed, roster, status, and match results in
-`leaderboard/run.json`. If a run is interrupted, the next invocation resumes
-that run with its original seed; a new seed is generated only after it completes.
-Results are cached by agent content, engine configuration, and seed under
-`leaderboard/cache/`, and the HTML standings aggregate all completed runs. When
-a new public agent is added during an interrupted run, only its missing matches
-are played. Pass `--rerun-current` to replay matches involving `current`, or
-`--force` to replay every pair in the active run.
-
 Compare scheduling while freezing the baseline target trace and successful
 PLANT/PLACE/BUILD/DIG dates (save a copy of `agents/*.py` before editing):
 
