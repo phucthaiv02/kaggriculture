@@ -163,11 +163,25 @@ def _task_length(start, bucket, shed_for):
     return length + _cashout_length(current, bucket, shed_for)
 
 
-def _priority(task):
+_ANIMAL_SERVICE_OPS = ("FEED", "CARE", "COLLECT_FERTILIZER")
+
+
+def _animal_service(task):
+    return task.animal_harvest or bool(
+        task.urgent
+        and task.actions
+        and task.actions[0][0] in _ANIMAL_SERVICE_OPS
+    )
+
+
+def _priority(task, group_animal=False):
+    animal_service = group_animal and _animal_service(task)
     return (
         not task.urgent,
-        not task.animal_harvest,
-        not (task.actions and task.actions[0][0] in ("FEED", "CARE", "COLLECT_FERTILIZER")),
+        not (animal_service or task.animal_harvest),
+        False if animal_service else not (
+            task.actions and task.actions[0][0] in _ANIMAL_SERVICE_OPS
+        ),
         task.deadline if task.deadline is not None else float("inf"),
         not task.immediate_drop,
     )
@@ -200,34 +214,52 @@ def _pack_greedy(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, variant
             sheds[position] = nearest_shed(position, shed_access)
         return sheds[position]
 
-    priorities = {id(task): _priority(task) for task in tasks}
+    # Keep the original opening order exactly. Once expansion has started,
+    # animal harvest and maintenance share one safety class so the insertion
+    # search can keep both visits to the same pen on one route instead of
+    # touring every harvest first and then crossing the farm again for FEED/CARE.
+    group_animal = len(shed_access) > 1
+    priorities = {id(task): _priority(task, group_animal) for task in tasks}
     reserve_turn = any(task.animal_harvest for task in tasks)
     terminal_day = any(task.cashout for task in tasks)
 
-    # Visit nearby work first within each priority class. The previous
-    # action-length ordering put long/far tasks at the front (notably the
-    # top rows of NW), so a worker crossed the farm and then doubled back to
-    # perform work beside the shed. Distance is measured from the closest
-    # real worker start; insertion then optimizes each worker's own route.
-    ordered = sorted(
-        tasks,
-        key=lambda task: (
-            not task.urgent,
-            not task.animal_harvest,
-            not (
-                task.actions
-                and task.actions[0][0] in ("FEED", "CARE", "COLLECT_FERTILIZER")
+    if group_animal:
+        ordered = sorted(
+            tasks,
+            key=lambda task: (
+                priorities[id(task)],
+                min(
+                    abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
+                    for start in worker_starts
+                ),
+                task.position[1],
+                task.position[0],
+                not task.animal_harvest,
+                -len(task.actions),
             ),
-            task.deadline if task.deadline is not None else float("inf"),
-            min(
-                abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
-                for start in worker_starts
+        )
+    else:
+        # Opening order is intentionally unchanged because its fixed
+        # fertilizer-sale/refinancing sequence is sensitive to assignment.
+        ordered = sorted(
+            tasks,
+            key=lambda task: (
+                not task.urgent,
+                not task.animal_harvest,
+                not (
+                    task.actions
+                    and task.actions[0][0] in _ANIMAL_SERVICE_OPS
+                ),
+                task.deadline if task.deadline is not None else float("inf"),
+                min(
+                    abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
+                    for start in worker_starts
+                ),
+                -len(task.actions),
+                task.position[1],
+                task.position[0],
             ),
-            -len(task.actions),
-            task.position[1],
-            task.position[0],
-        ),
-    )
+        )
     if variant:
         # Keep the safety classes, but try difficult / spatially grouped work
         # first so easy nearby jobs do not strand capacity at the farm edges.
@@ -245,7 +277,18 @@ def _pack_greedy(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, variant
         priority = priorities[id(task)]
         time_sensitive = (task.urgent or task.animal_harvest
                           or task.deadline is not None or task.immediate_drop)
+        task_is_service = group_animal and _animal_service(task)
         for worker, bucket in enumerate(buckets):
+            paired_harvest = None
+            paired_service = None
+            if task_is_service:
+                for index, queued in enumerate(bucket):
+                    if queued.position != task.position:
+                        continue
+                    if queued.animal_harvest:
+                        paired_harvest = index
+                    elif _animal_service(queued):
+                        paired_service = index
             for insertion in range(len(bucket) + 1):
                 # Buckets are already priority-sorted; only the two new
                 # neighbours can violate the invariant after insertion.
@@ -253,6 +296,14 @@ def _pack_greedy(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, variant
                     continue
                 if insertion < len(bucket) and priority > priorities[id(bucket[insertion])]:
                     continue
+                # If both animal tasks for a pen share this worker, make the
+                # explicit HARVEST happen first. This avoids the runtime
+                # opportunistic-harvest guard creating a later duplicate no-op.
+                if task_is_service:
+                    if task.animal_harvest and paired_service is not None and insertion > paired_service:
+                        continue
+                    if not task.animal_harvest and paired_harvest is not None and insertion <= paired_harvest:
+                        continue
                 candidate = bucket[:insertion] + [task] + bucket[insertion:]
                 projected = _task_length(worker_starts[worker], candidate, shed_for)
                 # Keep one turn for an opportunistic animal harvest or DROP;
