@@ -15,6 +15,8 @@ from unittest.mock import patch
 from kaggle_environments.envs.kaggriculture import kaggriculture as game
 from kaggle_environments.utils import structify
 
+from experiments.operations_report import Operations, render as render_operations
+
 
 def daily_cash(replay: dict, player: int) -> list[dict]:
     """Return the last post-action cash observed for each replay day."""
@@ -46,6 +48,7 @@ def analyze(replay: dict) -> dict:
     capacity = int(cfg.get("shedCapacity", 100))
     events = []
     costs = []
+    operations = Operations(len(steps[0]), turns)
     commit = game._commit_unit
     hire = game._do_hire
     buy_land = game._do_buy_land
@@ -60,14 +63,19 @@ def analyze(replay: dict) -> dict:
         for player, s in enumerate(state):
             s.action = current[player].get("action") or {}
             action = s.action if isinstance(s.action, dict) else {}
-            units = [action.get("farmer", ["PASS"]), *(action.get("hands", []) or [])]
+            hands = action.get("hands", [])
+            hands = hands if isinstance(hands, list) else []
+            units = [action.get("farmer", ["PASS"]), *hands]
             demand = {}
             for unit_action in units:
                 if isinstance(unit_action, list) and len(unit_action) >= 2 and unit_action[0] == "PLANT":
                     demand[unit_action[1]] = demand.get(unit_action[1], 0) + 1
             seeds = s.observation.private.get("seeds", {})
             blocked = {crop for crop, count in demand.items() if count > seeds.get(crop, 0)}
-            for unit, unit_action in enumerate(units):
+            for unit in range(1 + len(farms[player]["hands"])):
+                unit_action = units[unit] if unit < len(units) else ["PASS"]
+                submitted = unit_action
+                before = deepcopy((farms[player], s.observation.private))
                 if (
                     isinstance(unit_action, list)
                     and len(unit_action) >= 2
@@ -79,6 +87,7 @@ def analyze(replay: dict) -> dict:
                     farms[player], s.observation.private, unit, unit_action,
                     board, day, turns, capacity,
                 )
+                operations.action(player, tick, submitted, before != (farms[player], s.observation.private))
 
         def player_for(farm):
             return next(i for i, candidate in enumerate(farms) if candidate is farm)
@@ -107,7 +116,10 @@ def analyze(replay: dict) -> dict:
         def atomic(fn, category):
             def wrapped(farm, *args, **kwargs):
                 before = farm["money"]
+                hands_before = len(farm["hands"])
                 result = fn(farm, *args, **kwargs)
+                if category == "HIRE":
+                    operations.day(player_for(farm), tick)["hires"] += len(farm["hands"]) - hands_before
                 spent = before - farm["money"]
                 if spent:
                     costs.append({
@@ -128,6 +140,7 @@ def analyze(replay: dict) -> dict:
             game._process_market(state, SimpleNamespace(configuration=structify(cfg)))
 
         expected = current[0]["observation"]["farms"]
+        operations.finish_turn(farms, expected, tick)
         actual_money = [farm["money"] for farm in farms]
         expected_money = [farm["money"] for farm in expected]
         if any(abs(actual_money[i] - expected_money[i]) > 1e-6 for i in range(len(farms))):
@@ -207,6 +220,7 @@ def analyze(replay: dict) -> dict:
         "cost_events": costs,
         "finances": finances,
         "turns_per_day": turns,
+        "operations": operations.report(),
     }
 
 
@@ -420,11 +434,18 @@ def run(replay_path: Path, output: Path | None = None) -> Path:
     output = output or replay_path.parent / "sales_analysis.html"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(render(report, replay_path.name), encoding="utf-8")
+    operations_output = operations_path(output)
+    operations_output.write_text(render_operations(report["operations"], replay_path.name), encoding="utf-8")
     output.with_name("sales_analysis.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return output
+
+
+def operations_path(sales_output: Path) -> Path:
+    name = "operations_analysis.html" if sales_output.name == "sales_analysis.html" else sales_output.stem + ".operations.html"
+    return sales_output.with_name(name)
 
 
 def _project_command(replay: Path, output: Path | None):
@@ -450,7 +471,9 @@ def main():
         result = subprocess.run(command, cwd=Path(__file__).resolve().parents[1])
         raise SystemExit(result.returncode)
     try:
-        print(run(args.replay, args.output))
+        output = run(args.replay, args.output)
+        print(output)
+        print(operations_path(output))
     except (ValueError, KeyError, OSError) as exc:
         parser.exit(1, f"sales_report: {exc}\n")
 

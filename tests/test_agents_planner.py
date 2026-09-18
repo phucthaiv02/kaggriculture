@@ -222,6 +222,7 @@ def test_batched_planning_finishes_75_tiles_without_repricing_completed_batches(
     choose = planner._choose
 
     def record(*args, **kwargs):
+        # Support both call conventions used in different commits of the repo.
         visited.append(kwargs.get("position", args[-1] if args else None))
         return choose(*args, **kwargs)
 

@@ -1,9 +1,8 @@
-"""Function 1: read the farm and list what each tile needs done.
+"""Read the farm and list what each tile needs done.
 
 Pure function of (obs, targets) -> list[Task]. No side effects, no hidden
 state -- everything a tile needs is derivable from the current observation
-plus the standing "what should live here" decision (targets), which is
-function 4's job to produce.
+plus the standing "what should live here" decision (targets), produced by the planner.
 
 A target is `(name, fertilize) | None`: `name` is a crop or animal, and
 `fertilize` is a commitment made once at planting time (see agents/
@@ -26,12 +25,7 @@ from agents.schedules import (
     should_feed_animal, should_fertilize_today,
 )
 
-CROPS = ("WHEAT", "CARROT", "MELON", "TOMATO", "STRAWBERRY")
-ANIMALS = ("GOOSE", "COW", "SHEEP")
-BUILD = {"GOOSE": "BUILD_COOP", "COW": "BUILD_PASTURE", "SHEEP": "BUILD_PASTURE"}
-ANIMAL_STRUCTURE = {"GOOSE": "COOP", "COW": "PASTURE", "SHEEP": "PASTURE"}
-SEED_COST = {"WHEAT": 10, "CARROT": 20, "MELON": 80, "TOMATO": 50, "STRAWBERRY": 100}
-ANIMAL_COST = {name: data["cost"] for name, data in ENV_ANIMALS.items()}
+from agents.products import ANIMALS, ANIMAL_COST, ANIMAL_STRUCTURE, BUILD, CROPS, SEED_COST
 
 
 @dataclass
@@ -46,6 +40,7 @@ class Task:
     refinance_feed: bool = False  # opening-only fertilizer sale -> wheat -> feed
     animal_harvest: bool = False  # ready animal output outranks all other tile work
     deadline: int | None = None  # absolute engine step before a crop decays
+    cashout: bool = False  # reserve a return/DROP and a SELL before terminal
 
 
 def _new_planting_actions(name, fertilize_commit, seeds_available, animals_available, wheat_available,
@@ -329,6 +324,9 @@ def build_tasks(
                     deadline=(tile.get("max_lifespan_step") if ends_cycle and isinstance(tile, dict) else None),
                 )
             )
+    if day == obs.get("_planning_end_day", SEASON_END_DAY):
+        for task in tasks:
+            task.cashout = True
     return tasks
 
 
@@ -426,7 +424,10 @@ def feed_wheat_order(obs, targets, active_positions):
     )
     shed = obs["private"]["shed"]
     farm = obs["farms"][obs["player"]]
-    tomorrow_feed = (obs["day"] >= 3 and not sum(animal_missing.values())) * sum(
+    tomorrow_feed = (
+        3 <= obs["day"] < obs.get("_planning_end_day", SEASON_END_DAY)
+        and not sum(animal_missing.values())
+    ) * sum(
         1
         for position in active_positions
         if isinstance(farm["tiles"][position[1]][position[0]], dict)
@@ -470,7 +471,10 @@ def purchase_orders(
     # placement/refinance, while build_tasks decides the exact ages on which
     # FEED and CARE actions actually run.
     wheat_inventory = obs["market"]["inventory"].get("WHEAT", 0)
-    tomorrow_feed = (obs["day"] >= 3 and not sum(animal_missing.values())) * sum(
+    tomorrow_feed = (
+        3 <= obs["day"] < obs.get("_planning_end_day", SEASON_END_DAY)
+        and not sum(animal_missing.values())
+    ) * sum(
         1
         for position in active_positions
         if isinstance(farm["tiles"][position[1]][position[0]], dict)

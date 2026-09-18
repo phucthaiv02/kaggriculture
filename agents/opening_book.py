@@ -20,9 +20,8 @@ LAND_ORDER = official_game.LAND_ORDER
 OPENING_COUNTS = {"MELON": 12, "WHEAT": 9, "COW": 2, "SHEEP": 2}
 OPENING_SIZE = sum(OPENING_COUNTS.values())
 
-# Temporarily buy exactly one quadrant on engine/UI day 7 so the expansion
-# path can be inspected in isolation.
-LAND_BUY_DAYS = (7,)
+# Submit one fixed land purchase at hour 0 on each scheduled day index.
+LAND_BUY_DAYS = (7, 10)
 
 # Convert two of the initial WHEAT targets to one COW and one SHEEP together
 # on day 2 (the UI's Day 3). Their two harvested WHEAT units can then feed

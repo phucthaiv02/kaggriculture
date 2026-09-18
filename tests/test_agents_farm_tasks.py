@@ -478,3 +478,10 @@ def test_stale_target_never_digs_animal_structures():
         obs = make_obs(day=7, tiles={(0, 0): {"kind": "COOP"}},
                        seeds={"WHEAT": 1}, shed={"COW": 1, "WHEAT": 1})
         assert build_tasks(obs, {(0, 0): (name, False)}) == []
+
+
+def test_final_day_buyer_does_not_restock_tomorrows_feed():
+    obs = make_obs(29, {(4, 3): animal_tile('SHEEP', 10, fed_today=True)})
+    targets = {(4, 3): ('SHEEP', False)}
+    assert feed_wheat_order(obs, targets, list(targets)) == []
+    assert purchase_orders(obs, targets, list(targets)) == []
