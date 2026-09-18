@@ -24,6 +24,7 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as game
 
 from agents import expansion_agent, scheduler
 from experiments.play_match import pass_agent
+from experiments.sales_report import analyze as analyze_replay
 
 STARTS = {'PLANT', 'PLACE', 'BUILD_COOP', 'BUILD_PASTURE', 'DIG'}
 
@@ -144,11 +145,24 @@ def run(replay_path, baseline_source, output, baseline=False):
     generated = env.toJSON()
     actual = start_calendar(generated)
     missing, extra = expected - actual, actual - expected
+
+    analysis = analyze_replay(generated)
+    operations = next(row for row in analysis['operations']['totals'] if row['player'] == 0)
+    finances = next(row for row in analysis['finances'] if row['player'] == 0)
+    daily_hires = {
+        row['day']: row['hires']
+        for row in analysis['operations']['daily']
+        if row['player'] == 0 and row['hires']
+    }
+
     output.mkdir(parents=True, exist_ok=True)
     (output / 'replay.json').write_text(json.dumps(generated))
     (output / 'replay.html').write_text(env.render(mode='html', width=1200, height=800))
     result = {
         'cash': env.steps[-1][0].reward,
+        'successful_hires': operations['hires'],
+        'hire_cost': finances['breakdown'].get('HIRE:HIRE', 0),
+        'daily_hires': daily_hires,
         'seed': seed,
         'target_trace': str(trace_path),
         'statuses': [s.status for s in env.steps[-1]],
