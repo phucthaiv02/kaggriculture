@@ -242,25 +242,44 @@ def _pack_greedy(
     reserve_turn = any(task.animal_harvest for task in tasks)
     terminal_day = any(task.cashout for task in tasks)
 
-    # Visit nearby work first within each priority class. The previous
-    # action-length ordering put long/far tasks at the front (notably the
-    # top rows of NW), so a worker crossed the farm and then doubled back to
-    # perform work beside the shed. Distance is measured from the closest
-    # real worker start; insertion then optimizes each worker's own route.
-    ordered = sorted(
-        tasks,
-        key=lambda task: (
-            priorities[id(task)],
-            min(
-                abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
-                for start in worker_starts
+    # Keep the production greedy ordering exactly unchanged unless this is the
+    # explicit hand-count rescue. Opening and already-valid schedules therefore
+    # cannot move because of the relaxed animal grouping.
+    if group_animal:
+        ordered = sorted(
+            tasks,
+            key=lambda task: (
+                priorities[id(task)],
+                min(
+                    abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
+                    for start in worker_starts
+                ),
+                task.position[1],
+                task.position[0],
+                not task.animal_harvest,
+                -len(task.actions),
             ),
-            -len(task.actions),
-            task.position[1],
-            task.position[0],
-            not task.animal_harvest if group_animal else False,
-        ),
-    )
+        )
+    else:
+        ordered = sorted(
+            tasks,
+            key=lambda task: (
+                not task.urgent,
+                not task.animal_harvest,
+                not (
+                    task.actions
+                    and task.actions[0][0] in _ANIMAL_SERVICE_OPS
+                ),
+                task.deadline if task.deadline is not None else float("inf"),
+                min(
+                    abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
+                    for start in worker_starts
+                ),
+                -len(task.actions),
+                task.position[1],
+                task.position[0],
+            ),
+        )
     if variant:
         # Keep the safety classes, but try difficult / spatially grouped work
         # first so easy nearby jobs do not strand capacity at the farm edges.
