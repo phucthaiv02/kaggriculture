@@ -5,7 +5,7 @@ from agents.horizon import can_start_today
 
 from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 
-from agents.farm_tasks import ANIMAL_COST, CROPS, SEED_COST, build_tasks, purchase_orders
+from agents.farm_tasks import ANIMAL_COST, CROPS, SEED_COST, build_tasks, purchase_orders, executable_targets
 from agents.scheduler import WorkerPlan, build_queues, predicted_hand_starts
 
 MOVES = {"EAST": (1, 0), "WEST": (-1, 0), "SOUTH": (0, 1), "NORTH": (0, -1)}
@@ -46,6 +46,7 @@ def schedule_open_tiles(obs, targets, plans, shed_access, hire_costs=()):
     worker's committed route, including one turn for market delivery.
     Actual orders remain cash-capped by purchase_orders in the caller.
     """
+    targets = executable_targets(obs, targets)
     farm = obs["farms"][obs["player"]]
     positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
     while len(plans) < len(positions):
