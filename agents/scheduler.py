@@ -173,6 +173,18 @@ def _priority(task):
     )
 
 
+def _bucket_budget(base_budget, bucket, terminal_day):
+    """Return the executable worker budget for one terminal-day bucket.
+
+    The terminal observation removes one normally executable worker turn from
+    every worker. Only a bucket that still needs a final DROP must finish one
+    turn earlier again, leaving the following observation for the shared SELL.
+    """
+    if not terminal_day:
+        return base_budget
+    return max(0, base_budget - 1 - int(_cashout_needed(bucket)))
+
+
 def _pack_greedy(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, variant=0):
     """Greedy bin-pack using each candidate worker's exact queue length.
 
@@ -190,6 +202,7 @@ def _pack_greedy(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, variant
 
     priorities = {id(task): _priority(task) for task in tasks}
     reserve_turn = any(task.animal_harvest for task in tasks)
+    terminal_day = any(task.cashout for task in tasks)
 
     # Visit nearby work first within each priority class. The previous
     # action-length ordering put long/far tasks at the front (notably the
@@ -245,7 +258,7 @@ def _pack_greedy(tasks, worker_starts, budgets, shed_access=SHED_ACCESS, variant
                 # Keep one turn for an opportunistic animal harvest or DROP;
                 # runtime guards may insert HARVEST while crossing a ready pen.
                 projected += int(bool(variant) and reserve_turn)
-                if projected <= budgets[worker]:
+                if projected <= _bucket_budget(budgets[worker], candidate, terminal_day):
                     # Time-sensitive work must finish early for survival,
                     # crop expiry and same-day sales. For ordinary work,
                     # minimize extra travel and pickups instead.
@@ -269,10 +282,6 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
     uses identical tasks and priority constraints, only changing assignment and
     visit order. No search over targets, care dates or opening actions occurs.
     """
-    if any(task.cashout for task in tasks):
-        # Normal queues assume hours 1..23. The standard terminal observation
-        # is hour 23; DROP must finish by hour 21 so hour 22 can SELL.
-        budgets = [max(0, budget - 2) for budget in budgets]
     best = _pack_greedy(tasks, worker_starts, budgets, shed_access)
     # The initial NW-only farm is governed by the opening's cash/refinancing
     # sequence. Preserve its worker assignments until land expansion.
@@ -283,6 +292,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
     if any(op[0] in ("PLANT", "PLACE", "DIG", "BUILD_COOP", "BUILD_PASTURE")
            for task in tasks for op in task.actions):
         return best
+    terminal_day = any(task.cashout for task in tasks)
     def score(result):
         if result[1]:
             return (float("inf"), float("inf"))
@@ -294,7 +304,8 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
             end = bucket[-1].position
             shed = nearest_shed(end, shed_access)
             home = abs(end[0]-shed[0]) + abs(end[1]-shed[1]) + 1
-            if not _cashout_needed(bucket) and length + home > budget:
+            effective_budget = _bucket_budget(budget, bucket, terminal_day)
+            if not _cashout_needed(bucket) and length + home > effective_budget:
                 stranded += sum(sum(task.sells.values()) for task in bucket)
             travel += length
         return stranded, travel
