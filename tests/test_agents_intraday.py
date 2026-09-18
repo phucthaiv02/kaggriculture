@@ -138,3 +138,30 @@ def test_hire_does_not_reuse_money_for_an_already_promised_seed():
     targets = {(4, 3): ("WHEAT", False), (5, 4): ("WHEAT", False)}
     _, hires = schedule_open_tiles(obs, targets, plans, SHED_ACCESS, [1, 2])
     assert hires == 0
+
+
+def test_pending_target_does_not_replace_work_already_queued(monkeypatch):
+    import agents.expansion_agent as expansion
+
+    obs = make_obs(day=10, seeds={"WHEAT": 1}, unlocked_quadrants=("NW", "NE", "SW"))
+    agent = expansion.make_agent()
+    cells = dict(zip(agent.__code__.co_freevars, (cell.cell_contents for cell in agent.__closure__)))
+    targets, state = cells["targets"], cells["state"]
+    targets.update({(x, y): None for y in range(10) for x in range(10)})
+    position = (4, 4)
+    targets[position] = ("WHEAT", False)
+    state.update(day=10, plans=[WorkerPlan(position, [["PLANT", "WHEAT"], ["WATER"]])],
+                 pending_targets={position})
+    seen = []
+
+    def check_pending(obs, targets, positions, end_day, **kwargs):
+        seen.append(kwargs["replan_positions"])
+        assert position not in kwargs["replan_positions"]
+        return []
+
+    monkeypatch.setattr(expansion, "plan_targets", check_pending)
+    action = agent(obs)
+    assert seen == [set()]
+    assert targets[position] == ("WHEAT", False)
+    assert action["farmer"] == ["PLANT", "WHEAT"]
+    assert position in state["pending_targets"]

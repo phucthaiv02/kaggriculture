@@ -58,3 +58,21 @@ def test_surplus_sales_keep_two_days_of_animal_feed():
         ],
     )
     assert sell_orders(obs, {}) == [["SELL", "WHEAT", 8]]
+
+
+def test_last_day_sells_feed_that_has_no_remaining_use():
+    obs = make_obs({'WHEAT': 10})
+    obs.update(day=29, player=0, farms=[{'tiles': [[
+        {'animal': 'SHEEP', 'placed_day': 10, 'fed_today': False},
+    ]]}])
+    assert sell_orders(obs, {}) == [['SELL', 'WHEAT', 9]]
+    obs['farms'][0]['tiles'][0][0]['fed_today'] = True
+    assert sell_orders(obs, {}) == [['SELL', 'WHEAT', 10]]
+
+
+def test_shortened_season_respects_its_final_feed_day():
+    obs = make_obs({'WHEAT': 10})
+    obs.update(day=12, _planning_end_day=12, player=0, farms=[{'tiles': [[
+        {'animal': 'SHEEP', 'placed_day': 10, 'fed_today': True},
+    ]]}])
+    assert sell_orders(obs, {}) == [['SELL', 'WHEAT', 10]]
