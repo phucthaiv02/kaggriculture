@@ -61,3 +61,28 @@ def test_digging_exhausted_crops_and_weeds_remains_available():
     for tile in ({'kind':'WEED'}, {'kind':'PLANT','crop':'TOMATO'}):
         farm = {'tiles': [[tile]], 'farmer':[0,0], 'hands':[]}
         assert _protect_animal_structures(farm, [['DIG']]) == [['DIG']]
+
+
+def test_prepared_marginal_cost_matches_full_forecast_with_shared_tile_visits():
+    from random import Random
+    rng = Random(91)
+    labor = LaborForecast()
+    for _ in range(30):
+        baseline, candidate = Production(), Production()
+        for day in range(3):
+            baseline.visits[day] = [
+                ((rng.randrange(10), rng.randrange(10)), rng.randint(1, 8),
+                 (rng.choice(('WHEAT', 'COW', 'FERTILIZER')),), bool(rng.randrange(2)))
+                for _ in range(40)
+            ]
+            candidate.visits[day] = [(None, 2, ('WHEAT',), True), (None, 1, (), False)]
+        position = baseline.visits[0][0][0]
+        combined = Production()
+        combined.add(baseline)
+        combined.add(candidate, position)
+        combined_cost = labor.cost(combined.visits)
+        expected = (float('inf') if combined_cost == float('inf') else
+                    max(0, combined_cost - labor.cost(baseline.visits)))
+        assert labor.marginal_cost(baseline, candidate, position) == expected
+        prepared = labor.prepare(baseline.visits)
+        assert labor.marginal_cost(baseline, candidate, position, prepared=prepared) == expected

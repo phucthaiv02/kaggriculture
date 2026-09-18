@@ -327,3 +327,52 @@ if __name__ == "__main__":
                 print(f"FAIL {name}: {exc}")
     print(f"{'ALL PASSED' if not failures else f'{failures} FAILED'}")
     sys.exit(1 if failures else 0)
+
+
+def test_length_projection_matches_executable_queues_with_drops_and_refinancing():
+    from random import Random
+    from agents.scheduler import _task_length, _task_queue, nearest_shed, SHED_ACCESS
+
+    rng = Random(713)
+    for _ in range(100):
+        access = SHED_ACCESS[:rng.randint(1, 4)]
+        start = (rng.randrange(10), rng.randrange(10))
+        tasks = [
+            Task(
+                (rng.randrange(10), rng.randrange(10)),
+                [["HARVEST"]] * rng.randint(1, 4),
+                needs=Counter({"WHEAT": rng.randrange(3), "COW": rng.randrange(2)}),
+                immediate_drop=bool(rng.randrange(2)),
+                refinance_feed=bool(rng.randrange(2)),
+            )
+            for _ in range(rng.randrange(8))
+        ]
+        assert _task_length(start, tasks, lambda p: nearest_shed(p, access)) == len(
+            _task_queue(start, tasks, access)[0]
+        )
+
+
+def test_rescue_avoids_an_extra_hand_without_dropping_work():
+    from agents.scheduler import _pack_greedy, _pack
+    tasks = [Task(position, [["WATER"]] * count, urgent=True)
+             for position, count in [((1, 1), 3), ((2, 4), 4), ((3, 4), 2),
+                                     ((4, 2), 3), ((0, 4), 2), ((0, 0), 4), ((2, 4), 4)]]
+    starts = [(4, 4), (5, 4)]
+    assert _pack_greedy(tasks, starts, [23, 23])[1]
+    buckets, missing = _pack(tasks, starts, [23, 23])
+    assert not missing
+    assert Counter(id(task) for bucket in buckets for task in bucket) == Counter(map(id, tasks))
+    count, missing = hands_needed(tasks, (4, 4), max_hands=1)
+    assert (count, missing) == (1, [])
+    plans, missing = build_queues(tasks, (4, 4), count)
+    assert not missing
+    assert all(len(plan.queue) <= 23 for plan in plans)
+    assert sum(plan.queue.count(["WATER"]) for plan in plans) == 22
+
+
+def test_rescue_preserves_nw_opening_assignments():
+    from agents.scheduler import _pack_greedy, _pack
+    tasks = [Task((x, y), [["WATER"]] * 3, urgent=True)
+             for x, y in [(0, 0), (4, 4), (1, 0), (2, 1), (3, 4), (4, 0)]]
+    args = (tasks, [(4, 4), (5, 4)], [23, 23], ((4, 4),))
+    assert _pack(*args) == _pack_greedy(*args)

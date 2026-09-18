@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from agents.products import CROPS
+from agents.horizon import SEASON_END_DAY
 from agents.schedules import should_feed_animal
 
 
-CASH_CROPS = ("WHEAT", "CARROT", "MELON", "TOMATO", "STRAWBERRY")
-SELLABLE = CASH_CROPS + ("EGG", "MILK", "WOOL", "FERTILIZER")
+SELLABLE = CROPS + ("EGG", "MILK", "WOOL", "FERTILIZER")
 
 
 def sell_orders(obs, reserved):
@@ -23,7 +24,10 @@ def sell_orders(obs, reserved):
                     should_feed_animal(tile["animal"], age)
                     and not tile.get("fed_today")
                 )
-                feed += int(should_feed_animal(tile["animal"], age + 1))
+                feed += int(
+                    obs["day"] < obs.get("_planning_end_day", SEASON_END_DAY)
+                    and should_feed_animal(tile["animal"], age + 1)
+                )
         reserved["WHEAT"] = max(reserved.get("WHEAT", 0), feed)
 
     shed = obs["private"]["shed"]

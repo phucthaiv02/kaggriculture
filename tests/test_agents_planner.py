@@ -4,7 +4,7 @@ from collections import Counter
 
 from kaggle_environments.envs.kaggriculture.kaggriculture import MARKET_I0, PRODUCTS, market_price
 
-from agents.planner import _expected_price, best_target, plan_targets, should_buy_land
+from agents.planner import best_target, plan_targets
 
 BASE_INVENTORY = {p: MARKET_I0 for p in PRODUCTS}
 
@@ -27,19 +27,6 @@ def make_obs(day, tiles=(), unlocked_quadrants=("NW",), inventory=None):
         "town": {"unlocked_shops": []},
         "private": {"shed": {}, "seeds": {}, "inventories": [{}]},
     }
-
-
-def test_expected_price_matches_engine_at_zero_commitment():
-    for product in PRODUCTS:
-        assert _expected_price(product, BASE_INVENTORY, {}) == market_price(product, MARKET_I0)
-
-
-def test_expected_price_drops_as_committed_units_pile_up():
-    """Selling more of the same product must never look more profitable than
-    selling less of it -- the whole point of pricing the marginal unit."""
-    light = _expected_price("MELON", BASE_INVENTORY, {"MELON": 12})
-    heavy = _expected_price("MELON", BASE_INVENTORY, {"MELON": 120})
-    assert heavy <= light
 
 
 def test_best_target_none_when_nothing_fits_the_remaining_days():
@@ -120,40 +107,6 @@ def test_plan_targets_replans_a_finished_tile():
     assert targets[(0, 0)] is not None  # some choice was (re-)made, not left stale by construction
 
 
-def test_should_buy_land_false_below_utilization_threshold():
-    positions = [(x, y) for y in range(5) for x in range(5)]
-    tiles = {positions[i]: {"kind": "PLANT", "crop": "WHEAT"} for i in range(10)}  # 10/25 = 40%
-    farm = {"unlocked_quadrants": ["NW"], "tiles": [[None] * 10 for _ in range(10)]}
-    for (x, y), tile in tiles.items():
-        farm["tiles"][y][x] = tile
-    assert should_buy_land(farm, positions) is False
-
-
-def test_should_buy_land_true_at_or_above_threshold():
-    positions = [(x, y) for y in range(5) for x in range(5)]
-    tiles = {positions[i]: {"kind": "PLANT", "crop": "WHEAT"} for i in range(19)}  # 19/25 = 76%
-    farm = {"unlocked_quadrants": ["NW"], "tiles": [[None] * 10 for _ in range(10)]}
-    for (x, y), tile in tiles.items():
-        farm["tiles"][y][x] = tile
-    assert should_buy_land(farm, positions) is True
-
-
-def test_should_buy_land_false_once_all_quadrants_owned():
-    positions = [(x, y) for y in range(5) for x in range(5)]
-    farm = {"unlocked_quadrants": ["NW", "NE", "SW", "SE"], "tiles": [[None] * 10 for _ in range(10)]}
-    for x, y in positions:
-        farm["tiles"][y][x] = {"kind": "PLANT", "crop": "WHEAT"}
-    assert should_buy_land(farm, positions) is False
-
-
-def test_should_buy_land_ignores_a_target_decision_with_nothing_actually_planted():
-    """Regression test: a target dict fully populated on day 0 (before a
-    single seed is in the ground) must not look like 100% utilization."""
-    positions = [(x, y) for y in range(5) for x in range(5)]
-    farm = {"unlocked_quadrants": ["NW"], "tiles": [[None] * 10 for _ in range(10)]}
-    assert should_buy_land(farm, positions) is False
-
-
 def test_finished_wheat_has_no_fallback_when_no_profitable_cycle_fits():
     from agents.farm_tasks import build_tasks
 
@@ -181,3 +134,27 @@ def test_empty_animal_structures_only_get_compatible_targets():
         targets = {(0, 0): ("WHEAT", False)}
         plan_targets(obs, targets, [(0, 0)], end_day=29)
         assert targets[(0, 0)] is None or targets[(0, 0)][0] in names
+
+
+def test_batched_planning_finishes_75_tiles_without_repricing_completed_batches(monkeypatch):
+    import agents.planner as planner
+
+    positions = [(x, y) for y in range(10) for x in range(10) if y < 5 or x < 5]
+    obs = make_obs(day=10, unlocked_quadrants=("NW", "NE", "SW"))
+    targets, visited = {}, []
+    choose = planner._choose
+
+    def record(*args):
+        visited.append(args[-1])
+        return choose(*args)
+
+    monkeypatch.setattr(planner, "_choose", record)
+    pending = positions
+    while pending:
+        before = dict(targets)
+        count = len(visited)
+        pending = plan_targets(obs, targets, positions, 29, max_positions=4, replan_positions=set(pending))
+        assert 1 <= len(visited) - count <= 4
+        assert all(targets[p] == choice for p, choice in before.items())
+    assert len(visited) == len(set(visited)) == 75
+    assert set(targets) == set(positions)

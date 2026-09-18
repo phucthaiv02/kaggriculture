@@ -4,27 +4,15 @@ from copy import copy
 from dataclasses import dataclass
 
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
-from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 from agents.forecast import MarketForecast, Production, production
 from agents.labor import LaborForecast
 from agents.schedules import CROP_LAST_AGE, ONGOING_CROPS, cycle_finished
 from agents.horizon import (
-    SEASON_END_DAY, TARGET_HORIZON_DAYS, cycle_end as _cycle_end,
+    SEASON_END_DAY, cycle_end as _cycle_end,
     first_yield_age as _first_yield_age, can_start,
 )
 
-CROPS = ("WHEAT", "CARROT", "MELON", "TOMATO", "STRAWBERRY")
-ANIMALS = ("GOOSE", "COW", "SHEEP")
-SEED_COST = {name: official_game.CROPS[name]["seed"] for name in CROPS}
-ANIMAL_COST = {name: official_game.ANIMALS[name]["cost"] for name in ANIMALS}
-LAND_ORDER = official_game.LAND_ORDER
-LAND_BUY_UTILIZATION = 0.75
-# A standard 720-turn season has 30 days, indexed 0 through 29 by the engine.
-
-
-def _expected_price(product, inventory, committed_units, town_demand=None):
-    stock = inventory.get(product, 0) + committed_units.get(product, 0)
-    return market_price(product, stock - (town_demand or {}).get(product, 0))
+from agents.products import ANIMALS, ANIMAL_COST, CROPS, SEED_COST
 
 
 def _rotation(name, fertilize, day, end_day, tile=None):
@@ -92,7 +80,8 @@ def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
                 if market.day <= d <= end)
         return result
     scoped_baseline = scoped(baseline)
-    baseline_cost = labor.cost(scoped_baseline.visits)
+    prepared_labor = labor.prepare(scoped_baseline.visits)
+    baseline_cost = labor.prepared_cost(prepared_labor)
     baseline_value = scoped_market.value(scoped_baseline)
     for choice, output, cost in candidates:
         if market.day + _first_yield_age(choice[0]) > end:
@@ -101,7 +90,7 @@ def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
         results.append(TargetProfit(
             choice, output,
             scoped_market.marginal_profit(scoped_baseline, output, 0, baseline_value),
-            cost, labor.marginal_cost(scoped_baseline, output, position, baseline_cost),
+            cost, labor.marginal_cost(scoped_baseline, output, position, baseline_cost, prepared=prepared_labor),
         ))
     return results
 
@@ -136,34 +125,17 @@ def best_target(end_day, day, inventory, wheat_price, committed_units,
     return _choose(market, baseline, list(_candidates(day, end_day)), Counter())[0]
 
 
-def should_buy_land(farm, active_positions):
-    """Buy the next quadrant only once real production -- not just a target
-    decision -- already fills most of the land currently owned. A target is
-    assigned to (almost) every open tile the instant it unlocks (see
-    plan_targets), so gating on "has a target" would trigger on day 0 before
-    a single seed is planted; gating on what's actually growing/placed
-    reflects real land pressure instead."""
-    n_extra = len(farm["unlocked_quadrants"]) - 1
-    if n_extra >= len(LAND_ORDER):
-        return False
-    if not active_positions:
-        return False
-    tiles = farm["tiles"]
-    occupied = 0
-    for x, y in active_positions:
-        tile = tiles[y][x]
-        if isinstance(tile, dict) and (tile.get("kind") == "PLANT" or "animal" in tile):
-            occupied += 1
-    return occupied / len(active_positions) >= LAND_BUY_UTILIZATION
-
-
-def plan_targets(obs, targets, active_positions, end_day):
+def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None, replan_positions=None):
     """Reprice each new commitment against actual remaining production.
 
     Existing crops are forecast from their real age, held yield and watering
     state, including visible opponent crops. Unsown choices are reconsidered
     each day. No profitable candidate means no planting, with harvest-only
     cleanup handled by build_tasks.
+
+    With max_positions, price only that many eligible tiles and return the
+    remainder for later turns. replan_positions restricts this pass to pending
+    work; all other existing targets still contribute to the forecast.
     """
     day = obs["day"]
     end_day = _cycle_end(day, end_day)
@@ -173,6 +145,8 @@ def plan_targets(obs, targets, active_positions, end_day):
     replanning = []
     external = Production()
     for position in active_positions:
+        if replan_positions is not None and position not in replan_positions:
+            continue
         x, y = position
         tile = farm["tiles"][y][x]
         current = targets.get(position)
@@ -185,6 +159,17 @@ def plan_targets(obs, targets, active_positions, end_day):
             if current and current[0] != tile["crop"] and can_start(current[0], day, end_day):
                 continue
         replanning.append(position)
+
+    shed_access = ((4, 4), (5, 4), (4, 5), (5, 5))
+    def distance(p):
+        return min(abs(p[0] - s[0]) + abs(p[1] - s[1]) for s in shed_access)
+    replanning.sort(key=lambda p: (distance(p), p[1], p[0]))
+    pending = replanning[max_positions:] if max_positions is not None else []
+    if max_positions is not None:
+        replanning = replanning[:max_positions]
+    if not replanning:
+        return pending
+    replanning_set = set(replanning)
 
     for player, other_farm in enumerate(obs["farms"]):
         # Hand-built test observations may alias the same farm twice.
@@ -201,12 +186,12 @@ def plan_targets(obs, targets, active_positions, end_day):
                 fertilize = bool(target and target[0] == name and target[1])
                 # Opponent future fertilizer decisions are not observable.
                 destination = baseline if player == obs["player"] else external
-                if player == obs["player"] and (x, y) not in replanning:
+                if player == obs["player"] and (x, y) not in replanning_set:
                     future, _ = _rotation(name, fertilize, day, end_day, tile)
                 else:
                     future = production(name, fertilize, day, end_day, tile)
                 destination.add(future, (x, y))
-                if player == obs["player"] and (x, y) not in replanning:
+                if player == obs["player"] and (x, y) not in replanning_set:
                     counts[name] += 1
 
     # Include unsold goods exactly once, separately from remaining tile output.
@@ -214,7 +199,7 @@ def plan_targets(obs, targets, active_positions, end_day):
     for carried in obs["private"].get("inventories", []):
         baseline.sales[day].update({p: n for p, n in carried.items() if p in official_game.PRODUCTS})
     for position, target in targets.items():
-        if not target or position in replanning:
+        if not target or position in replanning_set:
             continue
         x, y = position
         tile = farm["tiles"][y][x]
@@ -226,12 +211,9 @@ def plan_targets(obs, targets, active_positions, end_day):
     market = MarketForecast(obs["market"]["inventory"], obs["town"]["unlocked_shops"],
                             day, end_day, obs.get("hour", 0), obs["market"].get("params"), external)
     candidates = list(_candidates(day, end_day))
-    shed_access = ((4, 4), (5, 4), (4, 5), (5, 5))
-    def distance(p):
-        return min(abs(p[0] - s[0]) + abs(p[1] - s[1]) for s in shed_access)
     labor = LaborForecast(tuple(p for p in shed_access if farm["tiles"][p[1]][p[0]] != "LOCKED"))
     # Assign in a stable order near the shed, updating supply and labor after every pick.
-    for position in sorted(replanning, key=lambda p: (distance(p), p[1], p[0])):
+    for position in replanning:
         x, y = position
         tile = farm["tiles"][y][x]
         allowed = candidates
@@ -244,3 +226,4 @@ def plan_targets(obs, targets, active_positions, end_day):
             # Include this commitment's supply and labor in the shared window.
             baseline.add(output, position)
             counts[choice[0]] += 1
+    return pending
