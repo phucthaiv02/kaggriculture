@@ -69,6 +69,21 @@ ANIMAL_CARE_DAYS = {
     "SHEEP": set(range(26)),
 }
 
+# Max-yield harvest cadence found by the same interpreter-backed experiment.
+# Harvesting every time yield_units becomes non-zero is safe but wastes a
+# worker turn and a route visit. These ages let output accumulate up to the
+# animal's held-product cap without clipping a later production tick.
+ANIMAL_HARVEST_DAYS = {
+    "GOOSE": {4, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29},
+    "COW": {8, 12, 16, 21, 25, 29},
+    "SHEEP": {6, 9, 12, 17, 18, 21, 24, 27},
+}
+ANIMAL_MAX_HELD = {
+    "GOOSE": 4,
+    "COW": 6,
+    "SHEEP": 6,
+}
+
 
 def water_days(crop, fertilized):
     return CROP_WATER_DAYS[(crop, fertilized)]
@@ -88,6 +103,20 @@ def should_feed_animal(animal, age):
 
 def should_care_animal(animal, age):
     return age in ANIMAL_CARE_DAYS[animal]
+
+
+def should_harvest_animal(animal, age, held=0, force=False):
+    """Whether ready animal output should consume a worker turn today.
+
+    ``force`` is used for terminal liquidation. The held-cap fallback keeps
+    the policy safe if a missed action causes live state to diverge from the
+    verified nominal cadence.
+    """
+    return bool(held) and (
+        force
+        or held >= ANIMAL_MAX_HELD[animal]
+        or age in ANIMAL_HARVEST_DAYS[animal]
+    )
 
 
 def cycle_finished(crop, age, tile):
