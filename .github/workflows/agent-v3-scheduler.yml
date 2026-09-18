@@ -1,0 +1,161 @@
+name: Agent v3 scheduler CI
+
+on:
+  push:
+    branches: [agent-v3]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-v3-scheduler-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BASELINE_COMMIT: 6f8b6bb320a6b1ce9d449f82c8fa66cfb691bd33
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade kaggle-environments pytest numpy matplotlib
+          python -m pip freeze > ci-requirements.txt
+
+      - name: Run regression tests
+        run: python -m pytest -q
+
+      - name: Validate care schedules
+        run: |
+          python -m experiments.crop_schedules
+          python -m experiments.animal_yields
+
+      - name: Benchmark 0.75 second decision limit
+        run: |
+          mkdir -p ci-artifacts
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from experiments.benchmark_agent import benchmark
+
+          timeout = 0.75
+          timings = benchmark(seed=1, opponent="self", timeout=timeout)
+          worst = max(timings, key=lambda row: row[1])
+          over = [row for row in timings if row[1] > timeout]
+          p95 = sorted(row[1] for row in timings)[int((len(timings) - 1) * .95)]
+          report = {
+              "actions": len(timings),
+              "p95_seconds": p95,
+              "max_seconds": worst[1],
+              "max_day": worst[2],
+              "max_hour": worst[3],
+              "over_075_seconds": len(over),
+          }
+          Path("ci-artifacts/benchmark.json").write_text(json.dumps(report, indent=2))
+          print(json.dumps(report, indent=2))
+          if over:
+              raise SystemExit(f"{len(over)} decisions exceeded {timeout}s")
+          PY
+
+      - name: Build pinned baseline replay
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/kaggriculture-baseline" "$BASELINE_COMMIT"
+          mkdir -p ci-artifacts/baseline
+          (
+            cd "$RUNNER_TEMP/kaggriculture-baseline"
+            python -m experiments.play_match \
+              --opponent pass \
+              --seed 1 \
+              --output-dir "$GITHUB_WORKSPACE/ci-artifacts/baseline"
+          )
+          BASE_RUN="$(find ci-artifacts/baseline -mindepth 1 -maxdepth 1 -type d -name 'current_vs_pass_seed1_*' | sort | tail -1)"
+          test -n "$BASE_RUN"
+          echo "BASE_RUN=$BASE_RUN" >> "$GITHUB_ENV"
+          echo "Baseline replay: $BASE_RUN"
+
+      - name: Compare scheduler with fixed targets and start calendar
+        run: |
+          python -m experiments.scheduler_comparison \
+            "$BASE_RUN/replay.json" \
+            --baseline-source "$RUNNER_TEMP/kaggriculture-baseline/agents" \
+            --output ci-artifacts/comparison
+
+      - name: Enforce optimization gates
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from experiments.sales_report import analyze
+
+          base_dir = Path(os.environ["BASE_RUN"])
+          baseline_run = json.loads((base_dir / "result.json").read_text())
+          baseline_replay = json.loads((base_dir / "replay.json").read_text())
+          baseline_analysis = analyze(baseline_replay)
+          baseline_ops = next(row for row in baseline_analysis["operations"]["totals"] if row["player"] == 0)
+          baseline_fin = next(row for row in baseline_analysis["finances"] if row["player"] == 0)
+
+          candidate = json.loads(Path("ci-artifacts/comparison/result.json").read_text())
+          baseline = {
+              "cash": baseline_run["current_cash"],
+              "successful_hires": baseline_ops["hires"],
+              "hire_cost": baseline_fin["breakdown"].get("HIRE:HIRE", 0),
+          }
+          delta = {
+              "cash": candidate["cash"] - baseline["cash"],
+              "successful_hires": candidate["successful_hires"] - baseline["successful_hires"],
+              "hire_cost": candidate["hire_cost"] - baseline["hire_cost"],
+          }
+          summary = {"baseline": baseline, "candidate": candidate, "delta": delta}
+          Path("ci-artifacts/gate-summary.json").write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary, indent=2))
+
+          failures = []
+          if candidate["statuses"] != ["DONE", "DONE"]:
+              failures.append(f"bad statuses: {candidate['statuses']}")
+          if not candidate["fixed_calendar_valid"]:
+              failures.append("PLANT/PLACE/BUILD/DIG calendar changed")
+          if candidate["over_075_seconds"]:
+              failures.append(f"comparison has {candidate['over_075_seconds']} decisions over 0.75s")
+          if candidate["max_seconds"] > 0.75:
+              failures.append(f"comparison max decision {candidate['max_seconds']:.3f}s > 0.75s")
+          if candidate["successful_hires"] > baseline["successful_hires"]:
+              failures.append(
+                  f"successful hires regressed: {candidate['successful_hires']} > {baseline['successful_hires']}"
+              )
+          if candidate["hire_cost"] > baseline["hire_cost"]:
+              failures.append(f"hire cost regressed: {candidate['hire_cost']} > {baseline['hire_cost']}")
+          if candidate["cash"] + 1e-9 < baseline["cash"]:
+              failures.append(f"cash regressed: {candidate['cash']} < {baseline['cash']}")
+
+          if failures:
+              raise SystemExit("\n".join(failures))
+          PY
+
+      - name: Upload replay and metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-v3-scheduler-${{ github.sha }}
+          path: |
+            ci-artifacts
+            ci-requirements.txt
+          if-no-files-found: warn
+          retention-days: 14
