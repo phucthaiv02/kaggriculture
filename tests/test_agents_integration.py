@@ -15,7 +15,8 @@ from kaggle_environments import make
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
 
 from agents.expansion_agent import make_agent
-from agents.schedules import should_feed_animal, should_harvest_animal
+from agents.farm_tasks import animal_output_at_risk
+from agents.schedules import should_feed_animal
 from experiments.crop_schedules import pass_agent
 
 END_DAY = 30
@@ -353,11 +354,12 @@ def test_day_three_late_placement_does_not_drop_crop_work():
         assert weeds == [], (day, weeds)
 
 
-def test_due_animal_output_is_harvested_the_same_day():
-    """Cadence permits held output between visits; due output must clear."""
+def test_at_risk_animal_output_is_harvested_the_same_day():
+    """Optional cadence harvests may wait; output at risk of clipping must clear."""
     env = make("kaggriculture", configuration=configuration(1), debug=False)
     production = make_agent(END_DAY, seed=1)
     invalid_harvests = []
+    missed_risk = []
 
     def checked_agent(obs):
         action = production(obs)
@@ -372,27 +374,19 @@ def test_due_animal_output_is_harvested_the_same_day():
             if not isinstance(tile, dict) or tile.get('yield_units', 0) <= 0 or (x, y) in harvested:
                 invalid_harvests.append((obs.day, obs.hour, x, y))
             harvested.add((x, y))
+        if obs.hour == 23 and obs.day < END_DAY:
+            missed_risk.extend(
+                (obs.day, x, y, tile['animal'], tile.get('yield_units', 0))
+                for y, row in enumerate(farm['tiles']) for x, tile in enumerate(row)
+                if isinstance(tile, dict) and tile.get('animal')
+                and animal_output_at_risk(tile, obs.day) and (x, y) not in harvested
+            )
         return action
 
     env.run([checked_agent, pass_agent])
     assert not invalid_harvests
 
-    for step in env.steps:
-        observation = step[0].observation
-        if observation.hour < 23:
-            continue
-        ready = [
-            (x, y, tile["animal"], tile.get("yield_units", 0))
-            for y, row in enumerate(observation.farms[0]["tiles"])
-            for x, tile in enumerate(row)
-            if isinstance(tile, dict)
-            and tile.get("animal")
-            and should_harvest_animal(
-                tile["animal"], observation.day - tile["placed_day"],
-                tile.get("yield_units", 0), force=observation.day == END_DAY,
-            )
-        ]
-        assert ready == [], (observation.day, observation.hour, ready)
+    assert not missed_risk
 
 
 if __name__ == "__main__":

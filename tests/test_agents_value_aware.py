@@ -159,6 +159,137 @@ def test_routine_water_and_feed_are_valued_but_not_mandatory():
 def test_feed_becomes_mandatory_after_one_miss():
     animal = animal_tile('GOOSE', 0)
     animal['consecutive_unfed'] = 1
-    task, = build_tasks(make_obs(1, {(4, 4): animal}, shed={'WHEAT': 1}),
+    tasks = build_tasks(make_obs(1, {(4, 4): animal}, shed={'WHEAT': 1}),
                         {(4, 4): ('GOOSE', False)})
-    assert task.mandatory
+    task = next(task for task in tasks if ['FEED'] in task.actions)
+    assert task.mandatory and task.actions == [['FEED']]
+    assert all(not other.mandatory for other in tasks if other is not task)
+
+
+@pytest.mark.parametrize('targets', [{}, {(4, 4): None}, {(4, 4): ('WHEAT', False)}])
+def test_live_animal_survives_target_removal(targets):
+    from agents.farm_tasks import feed_wheat_order
+    tile = animal_tile('COW', 0, yield_units=6)
+    tile['consecutive_unfed'] = 1
+    obs = make_obs(8, {(4, 4): tile})
+    tasks = build_tasks(obs, targets)
+    assert any(['FEED'] in task.actions and task.mandatory for task in tasks)
+    assert any(task.animal_harvest for task in tasks)
+    assert feed_wheat_order(obs, targets, [(4, 4)])
+
+
+def test_terminal_packing_prefers_valuable_recovery():
+    cheap = Task((4, 4), [['HARVEST']], mandatory=False, value=1, cashout=True, sells=Counter(WHEAT=1))
+    valuable = Task((6, 4), [['HARVEST']], mandatory=False, value=500, cashout=True, sells=Counter(MELON=1))
+    plans, missing = build_queues([cheap, valuable], (4, 4), 0, existing_hand_budget=7)
+    assert missing == [cheap]
+    assert plans[0].queue == [['EAST'], ['EAST'], ['HARVEST'], ['WEST'], ['DROP']]
+
+
+def test_hire_search_crosses_optional_plateau(monkeypatch):
+    import agents.scheduler as scheduler
+    valuable = Task((4, 4), [['HARVEST']], mandatory=False, value=100)
+    monkeypatch.setattr(scheduler, '_pack', lambda tasks, starts, budgets, shed:
+                        ([[] for _ in starts], [valuable] if len(starts) < 3 else []))
+    assert hands_needed([valuable], (4, 4), max_hands=2,
+                        marginal_hire_costs=[10, 20]) == (2, [])
+
+
+def test_rescue_preempts_busy_worker_and_reaches_crop_before_rollover():
+    from agents.intraday import rescue_survival
+    from agents.scheduler import WorkerPlan
+    tile = plant('STRAWBERRY', 0, 3, yield_units=0)
+    tile['consecutive_unwatered'] = 1
+    obs = make_obs(3, {(5, 4): tile})
+    obs['hour'] = 22
+    plans = [WorkerPlan((4, 4), [['PASS'], ['EAST'], ['WATER']])]
+    rescue_survival(obs, plans)
+    assert plans[0].queue[:2] == [['EAST'], ['WATER']]
+    farm, private = deepcopy(obs['farms'][0]), deepcopy(obs['private'])
+    for op in plans[0].queue[:2]:
+        game._apply_unit_action(farm, private, 0, op, 10, 3, 24)
+    game._daily_refresh_plants(farm, 3, 24)
+    assert farm['tiles'][4][5]['kind'] == 'PLANT'
+
+
+def test_owned_animal_reconciles_missing_target():
+    from agents.intraday import reconcile_animals
+    obs = make_obs(8, {(5, 4): {'kind': 'PASTURE'}}, shed={'COW': 1})
+    targets = {(5, 4): None}
+    assert reconcile_animals(obs, targets) == {(5, 4)}
+    assert targets[(5, 4)] == ('COW', False)
+
+
+def test_animal_purchase_has_committed_delivery_and_placement_route():
+    from agents.intraday import schedule_open_tiles, queue_commitments
+    from agents.scheduler import SHED_ACCESS, WorkerPlan
+    from agents.farm_tasks import purchase_orders
+    obs = make_obs(8, {(5, 4): {'kind': 'PASTURE'}}, money=1000, shed={'WHEAT': 5})
+    plans = [WorkerPlan((4, 4), [])]
+    target = {(5, 4): ('COW', False)}
+    eligible, hires = schedule_open_tiles(obs, target, plans, SHED_ACCESS)
+    assert hires == 0
+    assert ['PLACE', 'COW'] in plans[0].queue
+    assert plans[0].queue[0] == ['PASS']
+    assert queue_commitments([(4, 4)], plans)[3]['COW'] == 1
+    assert ['BUY_ANIMAL', 'COW', 1] in purchase_orders(obs, eligible, list(eligible))
+    # Until the purchase lands, the committed target must remain eligible.
+    eligible, _ = schedule_open_tiles(obs, target, plans, SHED_ACCESS)
+    assert eligible == target
+
+
+def test_unreachable_animal_is_not_eligible_for_purchase():
+    from agents.intraday import schedule_open_tiles
+    from agents.scheduler import SHED_ACCESS, WorkerPlan
+    obs = make_obs(8, money=10000)
+    obs['hour'] = 22
+    eligible, _ = schedule_open_tiles(obs, {(0, 0): ('SHEEP', False)},
+                                     [WorkerPlan((4, 4), [])], SHED_ACCESS)
+    assert eligible == {}
+
+
+def test_rescue_survival_is_separate_from_fertilizer_and_harvest():
+    tile = plant('STRAWBERRY', 0, 3, yield_units=2)
+    tile['consecutive_unwatered'] = 1
+    tasks = build_tasks(make_obs(3, {(4, 4): tile}), {(4, 4): ('STRAWBERRY', False)})
+    rescue = next(task for task in tasks if task.rescue)
+    assert rescue.actions == [['WATER']]
+    assert all(not task.mandatory for task in tasks if task is not rescue)
+
+
+def test_rescue_feed_fetches_real_wheat_before_rollover():
+    from agents.intraday import rescue_survival
+    from agents.scheduler import WorkerPlan
+    tile = animal_tile('COW', 0)
+    tile['consecutive_unfed'] = 1
+    obs = make_obs(8, {(5, 4): tile}, shed={'WHEAT': 1})
+    obs['hour'] = 21
+    # The queued FEED has no wheat: metadata/queue presence is insufficient.
+    plans = [WorkerPlan((4, 4), [['EAST'], ['FEED']])]
+    rescue_survival(obs, plans)
+    assert plans[0].queue[:3] == [['PICKUP', 'WHEAT', 1], ['EAST'], ['FEED']]
+    farm, private = deepcopy(obs['farms'][0]), deepcopy(obs['private'])
+    for op in plans[0].queue[:3]:
+        game._apply_unit_action(farm, private, 0, op, 10, 8, 24)
+    game._daily_refresh_animals(farm, 8)
+    assert farm['tiles'][4][5]['animal'] == 'COW'
+
+
+def test_harvest_is_mandatory_before_next_production_clips():
+    tile = animal_tile('COW', 0, yield_units=5)
+    tile['pending_care_bonus'] = 1
+    obs = make_obs(9, {(4, 4): tile})
+    # Force cadence-independent output detection when the next refresh clips.
+    tasks = build_tasks(obs, {(4, 4): None})
+    harvests = [task for task in tasks if task.animal_harvest]
+    assert harvests and harvests[0].mandatory
+
+
+def test_intraday_rescues_unassigned_capped_animal_output():
+    from agents.intraday import rescue_survival
+    from agents.scheduler import WorkerPlan
+    obs = make_obs(8, {(5, 4): animal_tile('COW', 0, yield_units=6)})
+    obs['hour'] = 22
+    plans = [WorkerPlan((4, 4), [['PASS'], ['PASS']])]
+    rescue_survival(obs, plans)
+    assert plans[0].queue[:2] == [['EAST'], ['HARVEST']]
