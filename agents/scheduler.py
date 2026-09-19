@@ -173,6 +173,8 @@ def _is_animal_service(task):
 
 
 def _priority(task):
+    if task.mandatory is False and not task.rescue:
+        return (True, True, True, True, True, float("inf"), True)
     return (
         not task.rescue,
         task.mandatory is False,
@@ -296,6 +298,15 @@ def _pack_greedy(
                         else (x, y) if variant == 2 else (y, x))
             return priorities[id(task)], geometry
         ordered = sorted(tasks, key=alternative)
+    def admission_key(task):
+        distance = min(abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
+                       for start in worker_starts)
+        capacity = distance + len(task.actions) + len(task.needs)
+        if task.cashout:
+            shed = shed_for(task.position)
+            capacity += abs(task.position[0] - shed[0]) + abs(task.position[1] - shed[1]) + 1
+        return priorities[id(task)], -task.value / max(1, capacity) if task.mandatory is False else 0
+    ordered.sort(key=admission_key)
     unassigned = []
     lengths = [0] * len(worker_starts)
     for task in ordered:
@@ -424,7 +435,7 @@ def hands_needed(
     """Find the fewest hands that fit today's tasks, up to max_hands.
 
     With marginal_hire_costs, cover mandatory work first, then buy capacity
-    only when its additional optional cash exceeds the next hire price.
+    when total additional optional cash exceeds cumulative extra hire prices.
     Existing hands are sunk cost. Omitted prices retain capacity-only sizing.
     Return work excluded by capacity or the economic stopping rule."""
     minimum = min(len(existing_hand_starts), max_hands)
@@ -464,18 +475,20 @@ def hands_needed(
     base_index = required_missing.index(best_required)
     chosen_count, chosen_missing = candidates[base_index]
 
-    # Required capacity is paid for regardless of price. Beyond it, every
-    # extra hand must recover enough optional value to cover its own Fibonacci
-    # increment; existing hands remain sunk cost.
-    prior_value = sum(
-        task.value for task in chosen_missing if task.mandatory is False
-    )
-    for count, missing in candidates[base_index + 1:]:
+    # Required capacity is paid for regardless of price. Compare total optional
+    # recovery against cumulative extra hire cost, including across plateaus.
+    # Existing hands remain sunk cost.
+    base_count = chosen_count
+    best_net = -sum(task.value for task in chosen_missing if task.mandatory is False)
+    for index in range(base_index + 1, len(candidates)):
+        count, missing = candidates[index]
+        if required_missing[index] != best_required:
+            continue
         lost_value = sum(task.value for task in missing if task.mandatory is False)
-        price = marginal_hire_costs[count - minimum - 1]
-        if prior_value - lost_value <= price:
-            break
-        chosen_count, chosen_missing, prior_value = count, missing, lost_value
+        price = sum(marginal_hire_costs[base_count - minimum:count - minimum])
+        net = -lost_value - price
+        if net > best_net:
+            chosen_count, chosen_missing, best_net = count, missing, net
     return chosen_count, chosen_missing
 
 
