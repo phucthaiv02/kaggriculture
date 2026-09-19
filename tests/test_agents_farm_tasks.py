@@ -487,7 +487,7 @@ def test_final_day_buyer_does_not_restock_tomorrows_feed():
     assert purchase_orders(obs, targets, list(targets)) == []
 
 
-def test_terminal_return_is_required_for_produce_but_not_fertilizer_only():
+def test_terminal_sales_including_optional_fertilizer_reserve_a_return():
     obs = make_obs(
         29,
         {(4, 3): animal_tile('COW', 0, fertilizer_available=True),
@@ -498,7 +498,10 @@ def test_terminal_return_is_required_for_produce_but_not_fertilizer_only():
     fertilizer = next(task for task in tasks if task.position == (4, 3))
     crop = next(task for task in tasks if task.position == (3, 4))
     assert fertilizer.sells == {'FERTILIZER': 1}
-    assert not fertilizer.cashout
+    assert fertilizer.cashout
+    assert not fertilizer.mandatory
     assert fertilizer.terminal_day and crop.terminal_day
-    assert crop.sells['WHEAT'] == 5
+    # WATER immediately adds the last unfertilized unit before liquidation.
+    assert crop.actions == [['WATER'], ['HARVEST']]
+    assert crop.sells['WHEAT'] == 6
     assert crop.cashout

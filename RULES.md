@@ -88,13 +88,17 @@ lập queue sau lượt mua đầu ngày, không giả định lệnh mua đã t
   Trước cửa sổ này giữ nhịp CARE để không xáo trộn chỗ dành cho tái trồng.
   Kiểm tra việc còn thiếu và seller dùng cùng cửa sổ chăm sóc;
   buyer bỏ nhu cầu hiện tại sau hạn FEED, vẫn giữ buffer ngày kế tiếp bảo thủ.
-  Giữ nguyên forecast định giá target; không đưa tiết kiệm chăm sóc mới vào
-  bộ chọn target trong lượt tối ưu scheduler này.
+  Forecast dùng cùng horizon FEED/CARE và cùng cadence HARVEST với runtime;
+  ép thu sản phẩm còn giữ vào ngày cuối cửa sổ dự báo.
   `experiments.animal_horizon` đối chiếu 90 trường hợp 1–30 ngày với engine:
   cùng sản phẩm/phân bón và không có con vật bỏ đi trong thời gian chơi.
 - Cây mới phải có `PLANT → WATER` trong ngày. Hai lần refresh liên tiếp
   thiếu nước/thức ăn làm cây thành cỏ hoặc con vật bỏ đi.
-- Scheduler ưu tiên task khẩn cấp, sản phẩm con vật sẵn sàng, chăm sóc và
+- Cây có `consecutive_unwatered >= 1` được tạo WATER dù ngoài lịch tuổi;
+  task cứu cây đứng trước mọi nhóm khác, kể cả harvest con vật. Trong opening,
+  giữ thứ tự các lượt WATER đúng lịch đã được dự trù để bảo toàn chuỗi
+  tài trợ; WATER cứu cây ngoài lịch vẫn được đẩy lên trước.
+- Scheduler ưu tiên task bắt buộc, task khẩn cấp, sản phẩm con vật sẵn sàng, chăm sóc và
   deadline cây; gộp pickup, tính đường đi và chỉ nhận task vừa ngân sách.
 - Khi thử chèn task, chỉ đếm số bước di chuyển/action/pickup; dựng queue
   thực thi sau khi chọn xong. Dự báo lao động tái sử dụng khoảng cách đến shed.
@@ -115,7 +119,20 @@ lập queue sau lượt mua đầu ngày, không giả định lệnh mua đã t
   Đây là tìm kiếm heuristic có số lần thử cố định, không chứng minh tối ưu toàn cục.
 - Farmer và hand có từ hour 1 có 23 lượt. Worker đang làm giữa ngày chỉ có
   `24 - hour` lượt, trừ queue đã cam kết và thời gian chờ hàng nếu cần.
-- Trần 16 hand/ngày; thuê theo workload, giá Fibonacci và khả năng chi trả.
+- Trần 16 hand/ngày. Sau opening, thử từng số hand với route thực tế:
+  bảo vệ WATER/FEED chống chết, animal output đã chạm held-cap và harvest
+  có deadline; WATER/FEED/CARE định kỳ còn lại được định giá như task tùy chọn;
+  chỉ mua thêm capacity tùy chọn khi giá trị công việc tăng thêm lớn hơn
+  giá thuê Fibonacci biên. Không thuê nếu task bắt buộc còn lại không thể
+  được cải thiện và phần tùy chọn không bù giá thuê. Hand đã thuê là sunk cost.
+  Opening giữ sizing cũ để bảo toàn chuỗi mua vật tư/thu phân, ngoại trừ ngày cuối.
+- Giá trị task tùy chọn lấy giá bán từng đơn vị theo stock hiện tại. Đầu tư
+  mới dùng sản lượng forecast trừ vốn/vật tư tương lai; planner đã xét chi
+  phí lao động khi chọn target, không chia thêm cho số ngày chăm sóc. WATER
+  định kỳ được tính tối thiểu một đơn vị crop; FEED/CARE dùng sản phẩm và
+  phân dự kiến trừ giá WHEAT. Chưa mô
+  phỏng toàn bộ tác động giá giữa các task cùng ngày. Thuê mở rộng giữa ngày
+  cũng chọn theo giá trị task đã được cấp vật tư trừ chi phí thuê.
   Dự báo lao động là ước lượng greedy, không phải route tương lai chính xác.
 - Spawn dự đoán sai: xóa queue của hand đó và lên lại từ vị trí quan sát được.
   Lệnh thuê thất bại/bị cắt phải giải phóng task và vật tư đã dành trước.
@@ -149,10 +166,16 @@ lập queue sau lượt mua đầu ngày, không giả định lệnh mua đã t
   một decision sau DROP để bán. Observation terminal không thực thi SELL;
   hàng còn trong inventory ở đó không tăng cash reward. `liquidation.py`
   thực hiện bước này trước khi lấy action của worker.
-- Ngân sách quay về bắt buộc ngày cuối áp dụng cho task có sản phẩm bán được
-  ngoài FERTILIZER. Task chỉ thu phân không tự ép thuê thêm hand theo giá
-  Fibonacci; vẫn thu phân và đưa về kho khi queue còn đủ thời gian. Ngày
-  PLANT/PLACE/BUILD/DIG và target không đổi trong phép so sánh khóa replay.
+- Ngày cuối tạo HARVEST cho mọi cây có sản lượng trong tập target, kể cả
+  chưa hết chu kỳ; chỉ WATER nếu tăng ngay sản lượng cây một lần, không
+  FERTILIZE hay tái trồng. Thu hoạch mới là
+  task tùy chọn, nhưng khi nhận phải đủ thời gian travel/HARVEST/return/DROP
+  và chừa SELL; giá thuê thêm phải được tiền thu dự kiến bù đắp.
+- Mọi task tạo hàng ngày cuối, kể cả FERTILIZER, phải đủ ngân sách quay về
+  để giá trị dùng quyết định thuê phản ánh hàng bán được. Task thu phân là
+  tùy chọn, không ép thuê nếu giá trị không bù giá thuê biên. Chính sách định
+  giá mới có thể đổi target/ngày đầu tư; báo riêng tính hợp lệ lịch khởi tạo
+  trong phép so sánh khóa replay, không coi lịch lệch là cải thiện thuần routing.
 
 ## Phân công module
 
