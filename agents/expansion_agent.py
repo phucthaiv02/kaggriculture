@@ -11,6 +11,7 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 
 from agents.farm_tasks import (
     ANIMAL_COST,
+    animal_output_at_risk,
     ANIMALS,
     build_tasks,
     feed_wheat_order,
@@ -18,7 +19,7 @@ from agents.farm_tasks import (
     reserved_items,
 )
 from agents.opening_book import make_opening_controller, should_buy_land_on_schedule
-from agents.intraday import MOVES, queue_commitments, schedule_open_tiles
+from agents.intraday import MOVES, queue_commitments, schedule_open_tiles, rescue_survival, reconcile_animals
 from agents.planner import SEASON_END_DAY, plan_targets
 from agents.horizon import can_start_today
 from agents.scheduler import MAX_HANDS, build_queues, hands_needed
@@ -262,7 +263,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         """Check outstanding harvest, scheduled feed and care for a placed animal."""
         age = day - tile["placed_day"]
         harvest_ready = should_harvest_animal(
-            name, age, tile.get("yield_units", 0), force=day == last_day,
+            name, age, tile.get("yield_units", 0), force=day == last_day or animal_output_at_risk(tile, day),
         )
         needs_feed = should_feed_animal(name, age, last_day - tile["placed_day"]) and not tile.get("fed_today")
         needs_care = (
@@ -285,7 +286,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             if crop == name
             else tile.get("fertilized_until_day", -1) >= tile["planted_day"]
         )
-        return is_maintenance_day(crop, age, current_fertilized)
+        return tile.get("consecutive_unwatered", 0) >= 1 or is_maintenance_day(crop, age, current_fertilized)
 
     def _schedule_late_placements(obs, farm, day, hour):
         """Assign idle workers pending placements and unfinished maintenance."""
@@ -308,7 +309,11 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         if not idle_indices:
             return
         committed = queue_commitments(worker_positions, state["plans"])[1]
-        for position, target in targets.items():
+        for position in _active_positions(farm):
+            tile = farm["tiles"][position[1]][position[0]]
+            target = targets.get(position)
+            if isinstance(tile, dict) and tile.get("animal"):
+                target = (tile["animal"], False)
             if not target:
                 continue
             if position in committed:
@@ -337,6 +342,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             obs,
             pending_targets,
             prioritize_fertilizer_drop=state["opening_active"],
+            include_physical=False,
         )
         placement_tasks = [
             task for task in tasks
@@ -388,6 +394,8 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             state["opening_active"] = opening_governs(obs, targets, positions)
             if not state["opening_active"]:
                 state["pending_targets"].update(positions if hour == 0 else new_positions)
+        pinned_animals = reconcile_animals(obs, targets)
+        state["pending_targets"].difference_update(pinned_animals)
         if not state["opening_active"] and state["pending_targets"]:
             committed = (
                 queue_commitments(
@@ -451,7 +459,9 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 "farmer": ["PASS"], "hands": [["PASS"] for _ in farm["hands"]],
                 "market": (
                     sales + _hire_and_buy_orders(
-                        obs, farm, targets, hand_target, pending_sales=sales,
+                        obs, farm, (targets if state["opening_active"] else {
+                            p: t for p, t in targets.items() if not t or t[0] not in ANIMALS
+                        }), hand_target, pending_sales=sales,
                         replant_same_crop=True,
                         reserve_hire_budget=not state["opening_active"],
                     )
@@ -522,8 +532,13 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             [_hire_costs(farm, count) for count in range(1, MAX_HANDS - len(farm["hands"]) + 1)]
             if hour >= 2 and not state["unverified_hand_indices"] else []
         )
+        if day < effective_end:
+            rescue_survival(obs, state["plans"])
         purchase_targets, expansion_hires = schedule_open_tiles(
             obs, targets, state["plans"], _open_shed_access(farm), hire_costs,
+        )
+        state["unverified_hand_indices"].update(
+            range(len(farm["hands"]) + 1, len(state["plans"]))
         )
         _schedule_late_placements(obs, farm, day, hour)
         # Remaining PICKUPs, including newly appended work, must be protected
@@ -531,6 +546,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
         state["reserved"] = queue_commitments(positions, state["plans"])[3]
 
+        placement_reserve = Counter(state["reserved"])
         plans = state["plans"]
         if day == effective_end:
             last_action_step = (effective_end + 1) * 24 - 2
@@ -600,6 +616,10 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             if not ready_animal or position in harvested_positions:
                 continue
             displaced = worker_ops[index]
+            # Opportunistic output must not push the last planned action past rollover.
+            if (displaced != ["HARVEST"] and index < len(plans)
+                    and len(plans[index].queue) + 1 >= 24 - hour):
+                continue
             if displaced != ["HARVEST"]:
                 plan = plans[index] if index < len(plans) else None
                 if plan is not None and displaced != ["PASS"]:
@@ -659,7 +679,15 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             for order in market
         )
         for order in late_orders:
-            if order[0] in ("BUY_ANIMAL", "BUY_SEED"):
+            if order[0] == "BUY_ANIMAL":
+                item = order[1]
+                shortage = max(0, placement_reserve[item] - obs["private"]["shed"].get(item, 0))
+                if state["opening_active"]:
+                    # The opening book commits its conversion/placement sequence.
+                    market.append(order)
+                elif shortage:
+                    market.append(["BUY_ANIMAL", item, min(order[2], shortage)])
+            elif order[0] == "BUY_SEED":
                 market.append(order)
             elif order[0] == "BUY_PRODUCT" and not existing_feed_buy:
                 market.append(order)
