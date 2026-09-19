@@ -24,7 +24,6 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 from agents.schedules import (
     ONGOING_CROPS, cycle_finished, is_maintenance_day, should_care_animal,
     should_feed_animal, should_fertilize_today, animal_feed_end_age, should_harvest_animal,
-    ANIMAL_MAX_HELD,
 )
 
 from agents.products import ANIMALS, ANIMAL_COST, ANIMAL_STRUCTURE, BUILD, CROPS, SEED_COST
@@ -107,18 +106,30 @@ def executable_targets(obs, targets):
     return result
 
 
+def animal_output_at_risk(tile, day):
+    """Held output is full or the next production refresh would clip it."""
+    rules = ENV_ANIMALS[tile["animal"]]
+    next_age = day + 1 - tile["placed_day"]
+    produces = (next_age >= rules["first_yield_day"]
+                and (next_age - rules["first_yield_day"]) % rules["interval"] == 0)
+    held = tile.get("yield_units", 0)
+    incoming = (1 + tile.get("pending_care_bonus", 0)) if produces else 0
+    return held >= rules["max_held"] or held + incoming > rules["max_held"]
+
+
 def build_tasks(
     obs,
     targets,
     assume_crop_seeds=False,
     assume_animal_inputs=False,
     prioritize_fertilizer_drop=False,
+    include_physical=True,
 ):
     """List every tile's required actions for today, given the standing targets.
 
-    `targets` maps position -> (name, fertilize) | None. Positions with no
-    target (planner decided nothing profitable fits there, or land not yet
-    claimed) are skipped entirely -- an unclaimed tile generates no task.
+    `targets` maps position -> (name, fertilize) | None. Physical producers
+    are maintained independently of replacement targets. Partial intraday
+    calls set include_physical=False to limit work to the supplied positions.
     """
     targets = executable_targets(obs, targets)
     day = obs["day"]
@@ -150,10 +161,10 @@ def build_tasks(
     tasks = []
 
     task_targets = dict(targets)
-    if terminal:
+    if include_physical:
         for y, row in enumerate(farm["tiles"]):
             for x, tile in enumerate(row):
-                if isinstance(tile, dict) and tile.get("kind") == "PLANT":
+                if isinstance(tile, dict) and (tile.get("animal") or tile.get("kind") == "PLANT"):
                     task_targets.setdefault((x, y), None)
 
     for position, target in task_targets.items():
@@ -177,6 +188,9 @@ def build_tasks(
                 tasks.append(Task(position, actions + [["HARVEST"]],
                                   sells=Counter({crop: amount}), mandatory=False))
             continue
+        live_animal = tile.get("animal") if isinstance(tile, dict) else None
+        if live_animal:
+            target = (live_animal, False)
         if target is None:
             # An idle target must not abandon already-grown output or buy a
             # fallback seed just to trigger a harvest.
@@ -186,8 +200,10 @@ def build_tasks(
                 crop = tile["crop"]
                 if tile.get("yield_units", 0) > 0:
                     actions = [] if tile.get("watered_today") else [["WATER"]]
+                    expiry = tile.get("max_lifespan_step")
+                    deadline = expiry if expiry is not None and expiry <= (day + 1) * 24 else None
                     tasks.append(Task(position, actions + [["HARVEST"]], urgent=True,
-                                      sells=Counter({crop: tile["yield_units"]})))
+                                      sells=Counter({crop: tile["yield_units"]}), deadline=deadline))
                 elif tile.get("consecutive_unwatered", 0) >= 1 and not tile.get("watered_today"):
                     tasks.append(Task(position, [["WATER"]], urgent=True))
                 elif cycle_finished(crop, day - tile["planted_day"], tile):
@@ -204,10 +220,13 @@ def build_tasks(
         if live_animal:
             age = day - tile["placed_day"]
             last_age = obs.get("_planning_end_day", SEASON_END_DAY) - tile["placed_day"]
-            feed_today = should_feed_animal(live_animal, age, last_age)
+            feed_today = should_feed_animal(live_animal, age, last_age) or (
+                day < obs.get("_planning_end_day", SEASON_END_DAY)
+                and tile.get("consecutive_unfed", 0) >= 1)
             care_today = should_care_animal(live_animal, age, last_age)
             harvest_ready = should_harvest_animal(
-                live_animal, age, tile.get("yield_units", 0), force=age == last_age,
+                live_animal, age, tile.get("yield_units", 0),
+                force=age == last_age or animal_output_at_risk(tile, day),
             )
             urgent = harvest_ready or feed_today or care_today
             if harvest_ready:
@@ -384,17 +403,35 @@ def build_tasks(
                     deadline=(tile.get("max_lifespan_step") if ends_cycle and isinstance(tile, dict) else None),
                 )
             )
+    # Survival must fit independently of optional care, fertilizer or a new cycle.
+    survival_followups = set()
+    if not terminal and not prioritize_fertilizer_drop:
+        separated = []
+        for task in tasks:
+            tile = farm["tiles"][task.position[1]][task.position[0]]
+            survival = None
+            if isinstance(tile, dict):
+                if tile.get("kind") == "PLANT" and tile.get("consecutive_unwatered", 0) >= 1:
+                    survival = ["WATER"]
+                elif tile.get("animal") and tile.get("consecutive_unfed", 0) >= 1:
+                    survival = ["FEED"]
+            if survival in task.actions and len(task.actions) > 1:
+                needs = Counter(WHEAT=1) if survival == ["FEED"] else Counter()
+                separated.append(Task(task.position, [survival], needs=needs, urgent=True))
+                survival_followups.add(id(task))
+                task.actions.remove(survival)
+                task.needs -= needs
+                task.urgent = task.deadline is not None or task.animal_harvest
+            separated.append(task)
+        tasks = separated
     investment_values = {}
     for task in tasks:
         tile = farm["tiles"][task.position[1]][task.position[0]]
-        task.rescue = bool(isinstance(tile, dict) and tile.get("kind") == "PLANT"
+        task.rescue = bool(id(task) not in survival_followups and isinstance(tile, dict) and tile.get("kind") == "PLANT"
                            and tile.get("consecutive_unwatered", 0) >= 1
                            and ["WATER"] in task.actions and not tile.get("watered_today"))
         if task.mandatory is None:
-            capped_animal_output = bool(
-                task.animal_harvest and isinstance(tile, dict)
-                and tile.get("yield_units", 0) >= ANIMAL_MAX_HELD[tile["animal"]]
-            )
+            capped_animal_output = bool(task.animal_harvest and animal_output_at_risk(tile, day))
             starving_animal = bool(
                 isinstance(tile, dict) and tile.get("animal")
                 and tile.get("consecutive_unfed", 0) >= 1
@@ -407,9 +444,8 @@ def build_tasks(
         task.value = 0.0 if task.mandatory else task_cash_value(obs, task, investment_values)
         if prioritize_fertilizer_drop and not terminal:
             task.mandatory = None
-            # The opening deliberately skips irrigation on some ages and
-            # already reserves the next scheduled visit. Preserve that
-            # financing order; unexpected off-schedule dryness still rescues.
+            # The fixed opening already reserves scheduled irrigation. Runtime
+            # rescue_survival still enforces its physical deadline if that route slips.
             target = targets.get(task.position)
             if task.rescue and target and is_maintenance_day(
                 tile["crop"], day - tile["planted_day"], target[1]
@@ -475,7 +511,11 @@ def task_cash_value(obs, task, investment_values=None):
         inputs = sum(output.inputs.values(), Counter())
         net = sum(quote(item, amount) for item, amount in sales.items())
         net -= sum(market["prices"].get(item, 0) * amount for item, amount in inputs.items())
-        net -= SEED_COST[name] if name in CROPS else ANIMAL_COST[name]
+        owned_animal = name in ANIMALS and (
+            obs["private"]["shed"].get(name, 0)
+            or any(inventory.get(name, 0) for inventory in obs["private"]["inventories"])
+        )
+        net -= SEED_COST[name] if name in CROPS else (0 if owned_animal else ANIMAL_COST[name])
         investment_values[name] = max(0, net)
         value += investment_values[name]
     return value
@@ -507,11 +547,20 @@ def _animal_and_seed_demand(
     wheat_incoming = 0  # WHEAT today's tasks will harvest -- see purchase_orders
     for position in active_positions:
         target = targets.get(position)
+        x, y = position
+        tile = farm["tiles"][y][x]
+        if isinstance(tile, dict) and tile.get("animal"):
+            name = tile["animal"]
+            if not tile.get("fed_today") and (
+                day - tile["placed_day"] <= animal_feed_end_age(
+                    name, obs.get("_planning_end_day", SEASON_END_DAY) - tile["placed_day"])
+                or tile.get("consecutive_unfed", 0) >= 1
+            ):
+                live_animals += 1
+            continue
         if target is None:
             continue
         name, _ = target
-        x, y = position
-        tile = farm["tiles"][y][x]
         if isinstance(tile, dict) and tile.get("kind") == "PLANT" and tile.get("crop") == "WHEAT":
             age = day - tile["planted_day"]
             exits_early = name != "WHEAT" and tile.get("yield_units", 0) > 0
@@ -534,11 +583,7 @@ def _animal_and_seed_demand(
                 ):
                     seed_demand[name] += 1
         elif name in ANIMALS:
-            if isinstance(tile, dict) and tile.get("animal") == name:
-                if (not tile.get("fed_today") and day - tile["placed_day"] <= animal_feed_end_age(
-                        name, obs.get("_planning_end_day", SEASON_END_DAY) - tile["placed_day"])):
-                    live_animals += 1
-            elif can_start_today(name, obs):
+            if can_start_today(name, obs):
                 animal_missing[name] += 1
     animal_slots = sum(animal_missing.values())
     for name in ANIMALS:
