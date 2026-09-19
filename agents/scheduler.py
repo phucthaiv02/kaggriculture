@@ -174,6 +174,8 @@ def _is_animal_service(task):
 
 def _priority(task):
     return (
+        not task.rescue,
+        task.mandatory is False,
         not task.urgent,
         not task.animal_harvest,
         not (task.actions and task.actions[0][0] in _ANIMAL_SERVICE_OPS),
@@ -191,6 +193,8 @@ def _rescue_priority(task):
     """
     if _is_animal_service(task):
         return (
+            not task.rescue,
+            task.mandatory is False,
             not task.urgent,
             False,
             False,
@@ -264,6 +268,8 @@ def _pack_greedy(
         ordered = sorted(
             tasks,
             key=lambda task: (
+                not task.rescue,
+                task.mandatory is False,
                 not task.urgent,
                 not task.animal_harvest,
                 not (
@@ -413,15 +419,24 @@ def hands_needed(
     shed_access=SHED_ACCESS,
     pending_hand_budget=HAND_BUDGET,
     max_hands=MAX_HANDS,
+    marginal_hire_costs=None,
 ):
     """Find the fewest hands that fit today's tasks, up to max_hands.
 
-    Return unassigned tasks when even the maximum headcount cannot fit them."""
+    With marginal_hire_costs, cover mandatory work first, then buy capacity
+    only when its additional optional cash exceeds the next hire price.
+    Existing hands are sunk cost. Omitted prices retain capacity-only sizing.
+    Return work excluded by capacity or the economic stopping rule."""
     minimum = min(len(existing_hand_starts), max_hands)
     # Every action and each distinct positive supply pickup is unavoidable,
     # even with zero travel. Skip headcounts below this admissible bound.
-    mandatory_steps = sum(len(task.actions) for task in tasks)
-    mandatory_steps += len({item for task in tasks for item, amount in task.needs.items() if amount > 0})
+    required = tasks if marginal_hire_costs is None else [
+        task for task in tasks if task.mandatory is not False
+        and len(task.actions) <= max(FARMER_BUDGET, HAND_BUDGET, pending_hand_budget)
+    ]
+    mandatory_steps = sum(len(task.actions) for task in required)
+    mandatory_steps += len({item for task in required for item, amount in task.needs.items() if amount > 0})
+    candidates = []
     for count in range(minimum, max_hands + 1):
         starts = [tuple(farmer_start)] + predicted_hand_starts(
             farmer_start, existing_hand_starts, count
@@ -432,9 +447,36 @@ def hands_needed(
         if count < max_hands and sum(budgets) < mandatory_steps:
             continue
         _, unassigned = _pack(tasks, starts, budgets, shed_access)
-        if not unassigned:
+        if marginal_hire_costs is None and not unassigned:
             return count, []
-    return max_hands, unassigned
+        candidates.append((count, unassigned))
+    if marginal_hire_costs is None:
+        return max_hands, unassigned
+
+    # A single added hand can leave the same number of required tasks behind
+    # while unlocking a better packing at the following headcount. Inspect the
+    # bounded search as a whole instead of stopping on that local plateau.
+    required_missing = [
+        sum(task.mandatory is not False for task in missing)
+        for _, missing in candidates
+    ]
+    best_required = min(required_missing)
+    base_index = required_missing.index(best_required)
+    chosen_count, chosen_missing = candidates[base_index]
+
+    # Required capacity is paid for regardless of price. Beyond it, every
+    # extra hand must recover enough optional value to cover its own Fibonacci
+    # increment; existing hands remain sunk cost.
+    prior_value = sum(
+        task.value for task in chosen_missing if task.mandatory is False
+    )
+    for count, missing in candidates[base_index + 1:]:
+        lost_value = sum(task.value for task in missing if task.mandatory is False)
+        price = marginal_hire_costs[count - minimum - 1]
+        if prior_value - lost_value <= price:
+            break
+        chosen_count, chosen_missing, prior_value = count, missing, lost_value
+    return chosen_count, chosen_missing
 
 
 def _rebalance_feed(buckets, starts, budgets, shed_access, tasks):
