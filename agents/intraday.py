@@ -145,7 +145,8 @@ def schedule_open_tiles(obs, targets, plans, shed_access, hire_costs=()):
             funded, starts[0], len(starts) - 1, starts[1:], shed_access,
             worker_budgets=candidate_budgets,
         )
-        score = len(funded) - len(unfitted)
+        unfitted_ids = {id(task) for task in unfitted}
+        score = sum(task.value for task in funded if id(task) not in unfitted_ids) - hire_cost
         if score > best_funded:
             selected, hire_count, best_funded = candidate, count, score
             rejected_funded = {id(task) for task in unfitted}

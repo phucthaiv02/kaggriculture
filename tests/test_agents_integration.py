@@ -259,10 +259,11 @@ def test_day_five_buys_seven_wheat_seeds_and_replants_all_harvested_tiles():
     assert not weeds, "a tile decayed to WEED instead of just replanting a day late"
 
 
-def test_every_opening_animal_is_fed_on_each_verified_feed_age():
+def test_opening_animals_may_skip_routine_feed_but_never_escape():
     env = make("kaggriculture", configuration=configuration(1), debug=False)
     env.run([make_agent(END_DAY, seed=1), pass_agent])
 
+    previous_count = 0
     for step in env.steps:
         obs = step[0].observation
         if not (1 <= obs.day <= 10 and obs.hour == 0):
@@ -273,14 +274,12 @@ def test_every_opening_animal_is_fed_on_each_verified_feed_age():
             for tile in row
             if isinstance(tile, dict) and tile.get("animal")
         ]
-        required_yesterday = [
-            tile for tile in animals
-            if should_feed_animal(tile["animal"], obs.day - 1 - tile["placed_day"])
-        ]
-        assert all(tile.get("consecutive_unfed", 0) == 0 for tile in required_yesterday), (
-            obs.day,
-            [(tile["animal"], tile.get("consecutive_unfed", 0)) for tile in required_yesterday],
-        )
+        # Routine FEED is value-aware after the fixed opening has expanded.
+        # One miss is safe; the following rescue FEED is mandatory, so the
+        # live population must never shrink or reach the escape threshold.
+        assert len(animals) >= previous_count, (obs.day, previous_count, len(animals))
+        assert all(tile.get("consecutive_unfed", 0) <= 1 for tile in animals)
+        previous_count = len(animals)
 
 
 def test_day_three_places_cow_on_the_nearest_conversion_pasture():

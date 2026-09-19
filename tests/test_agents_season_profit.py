@@ -58,7 +58,7 @@ def test_score_and_selector_share_cycle_labor_cost(monkeypatch):
     assert after == before - 123
 
 
-@pytest.mark.parametrize('name,last', [('GOOSE', 16), ('COW', 16), ('SHEEP', 15)])
+@pytest.mark.parametrize('name,last', [('GOOSE', 16), ('COW', 16), ('SHEEP', 16)])
 def test_animal_cycle_includes_only_harvests_through_age_sixteen(name, last):
     flow, cost = _rotation(name, False, 3, SEASON_END_DAY)
     product = game.ANIMALS[name]['product']

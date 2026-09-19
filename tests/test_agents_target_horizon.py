@@ -4,6 +4,7 @@ from collections import Counter
 import pytest
 
 from agents.forecast import MarketForecast, Production
+from agents.schedules import should_harvest_animal
 from agents.planner import _candidates, _rotation, _score, evaluate_targets
 from kaggle_environments.envs.kaggriculture import kaggriculture as game
 
@@ -38,6 +39,15 @@ def test_each_harvest_cutoff_and_first_yield_filter(name, remaining, start):
         flow, cost = candidates[choice]
         expected = {start + age: units for age, units in HARVESTS[name].items()
                     if age <= horizon}
+        if name in game.ANIMALS:
+            # The verified production ticks stay the same; runtime batches
+            # held output and liquidates it at the forecast endpoint.
+            held, batched = 0, {}
+            for age in range(horizon + 1):
+                held += HARVESTS[name].get(age, 0)
+                if should_harvest_animal(name, age, held, force=age == horizon):
+                    batched[start + age], held = held, 0
+            expected = batched
         if fertilize:
             if name in ('TOMATO', 'STRAWBERRY'):
                 expected = {d: units * 2 for d, units in expected.items()}

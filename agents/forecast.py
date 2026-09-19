@@ -13,7 +13,7 @@ from itertools import zip_longest
 from kaggle_environments.envs.kaggriculture import kaggriculture as game
 from agents.schedules import (
     CROP_LAST_AGE, ONGOING_CROPS, is_maintenance_day,
-    should_fertilize_today, should_feed_animal, should_care_animal,
+    should_fertilize_today, should_feed_animal, should_care_animal, should_harvest_animal,
 )
 
 
@@ -62,15 +62,16 @@ def production(name, fertilize, day, end_day, tile=None):
             if not live.get('animal'):
                 break
             age = when - live['placed_day']
-            if live.get('yield_units', 0):
+            last_age = end_day - live['placed_day']
+            if should_harvest_animal(name, age, live.get('yield_units', 0), force=when == end_day):
                 act('HARVEST', when)
             if live.get('fertilizer_available'):
                 act('COLLECT_FERTILIZER', when)
-            if should_feed_animal(name, age) and not live.get('fed_today'):
+            if should_feed_animal(name, age, last_age) and not live.get('fed_today'):
                 result.inputs[when]['WHEAT'] += 1
                 inventory['WHEAT'] = inventory.get('WHEAT', 0) + 1
                 act('FEED', when)
-            if should_care_animal(name, age) and not live.get('cared_today'):
+            if should_care_animal(name, age, last_age) and not live.get('cared_today'):
                 act('CARE', when)
         else:
             age = when - live['planted_day']
@@ -81,7 +82,7 @@ def production(name, fertilize, day, end_day, tile=None):
             # Match build_tasks: ongoing ready output gets WATER then HARVEST.
             ready = name in ONGOING_CROPS and live.get('yield_units', 0) > 0
             finished = age >= CROP_LAST_AGE[name]
-            if is_maintenance_day(name, age, fertilize) or ready or (finished and name not in ONGOING_CROPS):
+            if live.get('consecutive_unwatered', 0) >= 1 or is_maintenance_day(name, age, fertilize) or ready or (finished and name not in ONGOING_CROPS):
                 act('WATER', when)
             if ready or (finished and name not in ONGOING_CROPS):
                 act('HARVEST', when)
