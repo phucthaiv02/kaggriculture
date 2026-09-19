@@ -18,11 +18,13 @@ from agents.horizon import SEASON_END_DAY, can_start, can_start_today
 from dataclasses import dataclass, field
 
 from kaggle_environments.envs.kaggriculture.kaggriculture import ANIMALS as ENV_ANIMALS
+from kaggle_environments.envs.kaggriculture.kaggriculture import CROPS as ENV_CROPS
 from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 
 from agents.schedules import (
     ONGOING_CROPS, cycle_finished, is_maintenance_day, should_care_animal,
     should_feed_animal, should_fertilize_today, animal_feed_end_age, should_harvest_animal,
+    ANIMAL_MAX_HELD,
 )
 
 from agents.products import ANIMALS, ANIMAL_COST, ANIMAL_STRUCTURE, BUILD, CROPS, SEED_COST
@@ -42,6 +44,9 @@ class Task:
     deadline: int | None = None  # absolute engine step before a crop decays
     cashout: bool = False  # reserve a return/DROP and a SELL before terminal
     terminal_day: bool = False  # terminal observation removes a worker turn
+    mandatory: bool | None = None  # None preserves legacy hand-built tasks
+    rescue: bool = False  # a second dry refresh would kill the plant
+    value: float = 0.0  # estimated incremental cash before today's extra labor
 
 
 def _new_planting_actions(name, fertilize_commit, seeds_available, animals_available, wheat_available,
@@ -141,9 +146,37 @@ def build_tasks(
                 wheat_left += int(should_feed_animal(target[0], 0))
     fertilizer_left = shed.get("FERTILIZER", 0)
     prices = obs["market"]["prices"]
+    terminal = day == obs.get("_planning_end_day", SEASON_END_DAY)
     tasks = []
 
-    for position, target in targets.items():
+    task_targets = dict(targets)
+    if terminal:
+        for y, row in enumerate(farm["tiles"]):
+            for x, tile in enumerate(row):
+                if isinstance(tile, dict) and tile.get("kind") == "PLANT":
+                    task_targets.setdefault((x, y), None)
+
+    for position, target in task_targets.items():
+        x, y = position
+        tile = farm["tiles"][y][x]
+        if terminal and isinstance(tile, dict) and tile.get("kind") == "PLANT":
+            if tile.get("yield_units", 0) > 0:
+                crop = tile["crop"]
+                rules = ENV_CROPS[crop]
+                age = day - tile["planted_day"]
+                amount = tile["yield_units"]
+                actions = []
+                # WATER can still add an immediate unit on a one-time crop;
+                # retain that profitable last increment, not growth next day.
+                if (not rules["ongoing"] and not tile.get("watered_today")
+                        and (rules["max_yield_day"] + 1) // 2 <= age <= rules["max_yield_day"]
+                        and amount < rules["max_yield"]):
+                    actions.append(["WATER"])
+                    amount = min(rules["max_yield"], amount + (
+                        2 if tile.get("fertilized_until_day", -1) >= day else 1))
+                tasks.append(Task(position, actions + [["HARVEST"]],
+                                  sells=Counter({crop: amount}), mandatory=False))
+            continue
         if target is None:
             # An idle target must not abandon already-grown output or buy a
             # fallback seed just to trigger a harvest.
@@ -155,6 +188,8 @@ def build_tasks(
                     actions = [] if tile.get("watered_today") else [["WATER"]]
                     tasks.append(Task(position, actions + [["HARVEST"]], urgent=True,
                                       sells=Counter({crop: tile["yield_units"]})))
+                elif tile.get("consecutive_unwatered", 0) >= 1 and not tile.get("watered_today"):
+                    tasks.append(Task(position, [["WATER"]], urgent=True))
                 elif cycle_finished(crop, day - tile["planted_day"], tile):
                     tasks.append(Task(position, [["DIG"]], ends_cycle=True))
             continue
@@ -231,7 +266,8 @@ def build_tasks(
                 fertilizer_left -= 1
                 needs["FERTILIZER"] += 1
                 actions.append(["FERTILIZE"])
-            if is_maintenance_day(crop, age, fertilize_commit) and not tile.get("watered_today"):
+            if (is_maintenance_day(crop, age, fertilize_commit)
+                    or tile.get("consecutive_unwatered", 0) >= 1) and not tile.get("watered_today"):
                 actions.append(["WATER"])
                 # Every scheduled WATER is protective work. Waiting until a
                 # crop has already missed once leaves no scheduling margin:
@@ -348,15 +384,101 @@ def build_tasks(
                     deadline=(tile.get("max_lifespan_step") if ends_cycle and isinstance(tile, dict) else None),
                 )
             )
-    if day == obs.get("_planning_end_day", SEASON_END_DAY):
+    investment_values = {}
+    for task in tasks:
+        tile = farm["tiles"][task.position[1]][task.position[0]]
+        task.rescue = bool(isinstance(tile, dict) and tile.get("kind") == "PLANT"
+                           and tile.get("consecutive_unwatered", 0) >= 1
+                           and ["WATER"] in task.actions and not tile.get("watered_today"))
+        if task.mandatory is None:
+            capped_animal_output = bool(
+                task.animal_harvest and isinstance(tile, dict)
+                and tile.get("yield_units", 0) >= ANIMAL_MAX_HELD[tile["animal"]]
+            )
+            starving_animal = bool(
+                isinstance(tile, dict) and tile.get("animal")
+                and tile.get("consecutive_unfed", 0) >= 1
+                and ["FEED"] in task.actions
+            )
+            task.mandatory = bool(
+                task.rescue or capped_animal_output or starving_animal
+                or task.deadline is not None
+            )
+        task.value = 0.0 if task.mandatory else task_cash_value(obs, task, investment_values)
+        if prioritize_fertilizer_drop and not terminal:
+            task.mandatory = None
+            # The opening deliberately skips irrigation on some ages and
+            # already reserves the next scheduled visit. Preserve that
+            # financing order; unexpected off-schedule dryness still rescues.
+            target = targets.get(task.position)
+            if task.rescue and target and is_maintenance_day(
+                tile["crop"], day - tile["planted_day"], target[1]
+            ):
+                task.rescue = False
+    if terminal:
         for task in tasks:
             task.terminal_day = True
-            # Returning saleable produce is mandatory. A fertilizer-only
-            # service visit should not force an expensive extra Fibonacci
-            # hire; liquidation still brings its inventory back when it fits.
-            task.cashout = any(item != "FERTILIZER" and amount > 0
-                               for item, amount in task.sells.items())
+            # A sale has value only if the worker can bring it home. The
+            # economic hire gate now also protects fertilizer-only returns.
+            task.cashout = any(amount > 0 for amount in task.sells.values())
     return tasks
+
+
+def task_cash_value(obs, task, investment_values=None):
+    """Conservative current sale quote; investments use remaining net output.
+
+    Route travel/returns are priced by the capacity and marginal hire search.
+    New investments use remaining sales minus seeds/animals and future inputs.
+    The target planner has already charged forecast labor when choosing them;
+    dividing their cash again by visit count would reject profitable starts.
+    """
+    from agents.forecast import production
+
+    market = obs["market"]
+    if investment_values is None:
+        investment_values = {}
+
+    def quote(item, amount):
+        stock = market["inventory"].get(item, 0)
+        cash = 0
+        for _ in range(max(0, amount)):
+            price = market_price(item, stock, market.get("params"))
+            cash += price
+            stock += int(price > 1)
+        return cash
+
+    value = sum(quote(item, amount) for item, amount in task.sells.items())
+    tile = obs["farms"][obs["player"]]["tiles"][task.position[1]][task.position[0]]
+    operations = {op[0] for op in task.actions}
+    if isinstance(tile, dict) and tile.get("kind") == "PLANT" and "WATER" in operations:
+        # A scheduled irrigation protects at least one unit of the crop's
+        # remaining yield. Terminal WATER+HARVEST already includes that unit
+        # in task.sells, so do not count it twice.
+        if "HARVEST" not in operations:
+            value += quote(tile["crop"], 1)
+    elif isinstance(tile, dict) and tile.get("animal"):
+        product = ENV_ANIMALS[tile["animal"]]["product"]
+        if "FEED" in operations:
+            value += max(0, quote(product, 1) + quote("FERTILIZER", 1)
+                         - market["prices"].get("WHEAT", 0))
+        if "CARE" in operations:
+            value += quote(product, 1)
+    for op in task.actions:
+        if op[0] not in ("PLANT", "PLACE"):
+            continue
+        name = op[1]
+        if name in investment_values:
+            value += investment_values[name]
+            continue
+        output = production(name, False, obs["day"], obs.get("_planning_end_day", SEASON_END_DAY))
+        sales = sum(output.sales.values(), Counter())
+        inputs = sum(output.inputs.values(), Counter())
+        net = sum(quote(item, amount) for item, amount in sales.items())
+        net -= sum(market["prices"].get(item, 0) * amount for item, amount in inputs.items())
+        net -= SEED_COST[name] if name in CROPS else ANIMAL_COST[name]
+        investment_values[name] = max(0, net)
+        value += investment_values[name]
+    return value
 
 
 def reserved_items(tasks):

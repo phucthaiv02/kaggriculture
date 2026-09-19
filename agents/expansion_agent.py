@@ -428,6 +428,9 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 tuple(farm["farmer"]),
                 tuple(map(tuple, farm["hands"])),
                 _open_shed_access(farm),
+                marginal_hire_costs=(None if state["opening_active"] and day < effective_end else
+                    [_hire_costs(farm, n + 1) - _hire_costs(farm, n)
+                     for n in range(MAX_HANDS - len(farm["hands"]))]),
             )
             state.update(
                 day=day, hand_target=hand_target, plans=[], reserved={},
@@ -478,6 +481,9 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 existing_hands,
                 shed_access,
                 pending_hand_budget=22,
+                marginal_hire_costs=(None if state["opening_active"] and day < effective_end else
+                    [_hire_costs(farm, n + 1) - _hire_costs(farm, n)
+                     for n in range(MAX_HANDS - len(existing_hands))]),
             )
             missing_hands = max(0, hand_count - len(existing_hands))
             affordable_hands = _affordable_hires(
