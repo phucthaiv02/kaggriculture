@@ -128,9 +128,10 @@ class MarketForecast:
                 stock -= 1
         return cash, stock
 
-    def value(self, flows):
+    def value(self, flows, discount=1.0):
+        """Forecast total cash; optionally discount each future day's net cash."""
         stocks = dict(self.inventory)
-        cash = 0
+        cash = 0.0
         previous = self.day * 24 + self.hour - 1
         for when in range(self.day, self.end_day + 1):
             # Forecast delivery by the end of each harvest day. Today's held
@@ -143,7 +144,8 @@ class MarketForecast:
                 if product in self.center_products:
                     stocks[product] -= center_ticks
             previous = step
-            cash += self._settle_day(stocks, flows, when)
+            daily_cash = self._settle_day(stocks, flows, when)
+            cash += (discount ** (when - self.day)) * daily_cash
         return cash
 
     def _settle_day(self, stocks, flows, when):
