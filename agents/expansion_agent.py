@@ -81,7 +81,7 @@ def _protect_animal_structures(farm, operations):
 BOARD_SIZE = 10
 # Bound expensive ROI work per morning while a persistent backlog guarantees
 # that every eligible tile is visited before the cycle restarts.
-TARGETS_PER_DAY = 2
+TARGETS_PER_DAY = 10
 INVESTMENTS_PER_DAY = 20
 
 
@@ -188,11 +188,21 @@ def _hire_and_buy_orders(
     mandatory_hand_target=None,
 ):
     hires = max(0, hand_target - len(farm["hands"]))
+    mandatory_hires = (
+        max(
+            0,
+            (mandatory_hand_target if mandatory_hand_target is not None else len(farm["hands"]))
+            - len(farm["hands"]),
+        )
+        if reserve_hire_budget else 0
+    )
     hire_orders = [["HIRE"] for _ in range(hires)]
     purchase = []
     if buy_inputs:
+        # Optional hires execute after admitted inputs, so only mandatory
+        # survival capacity may reduce the money those inputs can spend.
         available_money = _maximum_cash_after_sales(
-            obs, farm, pending_sales, hires if reserve_hire_budget else 0
+            obs, farm, pending_sales, mandatory_hires
         )
         wheat_sold = sum(
             int(order[2]) for order in pending_sales
@@ -218,9 +228,6 @@ def _hire_and_buy_orders(
         # investment inputs. Optional expansion hires follow those inputs so
         # the market-order cap cannot create hired workers with nothing to
         # PLANT/PLACE.
-        mandatory_hires = max(
-            0, (mandatory_hand_target or len(farm["hands"])) - len(farm["hands"])
-        )
         orders = (
             feed + hire_orders[:mandatory_hires] + animals + seeds
             + hire_orders[mandatory_hires:]
@@ -360,6 +367,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         farm = obs["farms"][obs["player"]]
 
         positions = _active_positions(farm)
+        active_position_set = set(positions)
         new_positions = [position for position in positions if position not in targets]
         if hour == 0:
             # Land discovered after the previous day's freeze becomes eligible
@@ -372,9 +380,23 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             if isinstance(tile, dict) and (tile.get("crop") or tile.get("animal"))
         }
         if hour == 0:
-            # Empty desired targets from an older plan are not commitments.
-            # Owned animals are re-added below by reconciliation.
-            state["committed_targets"].intersection_update(physical_positions)
+            # An admitted investment remains committed until it is physically
+            # realized, explicitly invalidated, or can no longer start.  Do
+            # not drop a bought seed/animal merely because PLACE/PLANT slipped
+            # past the previous day's queue.
+            stale_commitments = {
+                position for position in state["committed_targets"]
+                if position not in active_position_set or not targets.get(position)
+            }
+            expired_commitments = {
+                position for position in state["committed_targets"] - physical_positions
+                if position in active_position_set and targets.get(position)
+                and not can_start_today(targets[position][0], obs)
+            }
+            state["committed_targets"].difference_update(
+                stale_commitments | expired_commitments
+            )
+            state["pending_targets"].update(expired_commitments)
         if hour > 0 and new_positions:
             state["deferred_expansion_positions"].update(new_positions)
         if hour == 0 or new_positions:
@@ -382,13 +404,21 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             if not state["opening_active"]:
                 state["pending_targets"].update(new_positions)
                 if hour == 0 and not state["pending_targets"]:
-                    state["pending_targets"].update(positions)
+                    unrealized_committed = (
+                        state["committed_targets"] - physical_positions
+                    )
+                    state["pending_targets"].update(
+                        active_position_set - unrealized_committed
+                    )
         pinned_animals = reconcile_animals(obs, targets)
         state["committed_targets"].update(physical_positions | pinned_animals)
         state["investment_backlog"].difference_update(
             physical_positions | state["committed_targets"]
         )
         state["pending_targets"].difference_update(pinned_animals)
+        state["pending_targets"].difference_update(
+            state["committed_targets"] - physical_positions
+        )
         obs["_committed_targets"] = set(state["committed_targets"])
         if hour == 0 and not state["opening_active"] and state["pending_targets"]:
             pending_before = set(state["pending_targets"])
@@ -468,21 +498,27 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 tuple(map(tuple, farm["hands"])), _open_shed_access(farm),
             )
             rejected_ids = {id(task) for task in rejected}
+            investment_task_positions = {
+                task.position for task in tasks
+                if any(op[0] in ("PLANT", "PLACE") for op in task.actions)
+            }
             state["purchase_positions"] = {
                 task.position for task in tasks
                 if id(task) not in rejected_ids
-                and any(op[0] in ("PLANT", "PLACE") for op in task.actions)
+                and task.position in investment_task_positions
             }
             rejected_investments = {
                 task.position for task in rejected
-                if any(op[0] in ("PLANT", "PLACE") for op in task.actions)
+                if task.position in investment_task_positions
             }
             state["investment_backlog"].update(rejected_investments)
             admitted_targets = {
                 p: t for p, t in daily_targets.items()
-                if p in state["purchase_positions"] or p in physical_positions
+                if p in state["purchase_positions"]
+                or (p in physical_positions and p not in investment_task_positions)
             }
-            reservations = reserved_items(tasks)
+            assigned_tasks = [task for task in tasks if id(task) not in rejected_ids]
+            reservations = reserved_items(assigned_tasks)
             reservations["WHEAT"] = max(
                 reservations.get("WHEAT", 0),
                 feed_wheat_reserve(obs, admitted_targets, positions),
@@ -492,9 +528,13 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             non_wheat_reservations = dict(reservations)
             non_wheat_reservations["WHEAT"] = obs["private"]["shed"].get("WHEAT", 0)
             non_wheat_sales = sell_orders(obs, non_wheat_reservations)
-            hires = max(0, hand_target - len(farm["hands"]))
+            protected_hires = (
+                0 if state["opening_active"] else
+                max(0, mandatory_hand_target - len(farm["hands"]))
+            )
             reservations = _reserve_feed_for_affordable_animals(
-                obs, farm, admitted_targets, reservations, non_wheat_sales, hires
+                obs, farm, admitted_targets, reservations,
+                non_wheat_sales, protected_hires,
             )
             sales = sell_orders(obs, reservations)
             return {
@@ -557,16 +597,24 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 [task for task in tasks if id(task) in assigned_ids]
             )
             state["frozen_positions"] = {task.position for task in tasks}
+            investment_task_positions = {
+                task.position for task in tasks
+                if any(op[0] in ("PLANT", "PLACE") for op in task.actions)
+            }
             admitted_investments = {
                 task.position for task in tasks
                 if id(task) in assigned_ids
-                and any(op[0] in ("PLANT", "PLACE") for op in task.actions)
+                and task.position in investment_task_positions
             }
+            # Replacing a producer is a new commitment.  If its investment
+            # task cannot fit the real hour-1 workforce, do not let the old
+            # physical commitment make future forecast supply look guaranteed.
+            state["committed_targets"].difference_update(investment_task_positions)
             state["committed_targets"].update(admitted_investments)
             state["investment_backlog"].difference_update(admitted_investments)
             state["investment_backlog"].update(
                 task.position for task in unassigned
-                if any(op[0] in ("PLANT", "PLACE") for op in task.actions)
+                if task.position in investment_task_positions
             )
             state["plan_frozen"] = True
 
