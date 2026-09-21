@@ -140,6 +140,7 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
     day = obs["day"]
     end_day = _cycle_end(day, end_day)
     farm = obs["farms"][obs["player"]]
+    committed_positions = obs.get("_committed_targets")
     baseline = Production()
     counts = Counter()
     replanning = []
@@ -204,7 +205,8 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
         x, y = position
         tile = farm["tiles"][y][x]
         actual = tile.get("animal") or tile.get("crop") if isinstance(tile, dict) else None
-        if actual != target[0] and not actual:
+        if (actual != target[0] and not actual
+                and (committed_positions is None or position in committed_positions)):
             baseline.add(_rotation(*target, day, end_day)[0], position)
             counts[target[0]] += 1
 

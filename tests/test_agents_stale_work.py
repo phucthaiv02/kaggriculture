@@ -92,3 +92,27 @@ def test_invalid_front_action_triggers_global_remaining_day_replan():
     result = agent(obs)
     assert result['farmer'] != ['HARVEST']
     assert any(['FEED'] in plan.queue for plan in state['plans'])
+
+
+def test_daily_target_backlog_does_not_restart_near_shed(monkeypatch):
+    import agents.expansion_agent as expansion
+
+    monkeypatch.setattr(expansion, 'make_opening_controller',
+                        lambda: lambda *args: False)
+    seen = []
+
+    def batch(_obs, _targets, _positions, _end_day, **kwargs):
+        current = set(kwargs['replan_positions'])
+        seen.append(current)
+        return set(sorted(current)[10:])
+
+    monkeypatch.setattr(expansion, 'plan_targets', batch)
+    agent = expansion.make_agent()
+    first = make_obs(10)
+    first['hour'] = 0
+    agent(first)
+    second = make_obs(11)
+    second['hour'] = 0
+    agent(second)
+    assert len(seen[0]) == 100
+    assert seen[1] == set(sorted(seen[0])[10:])
