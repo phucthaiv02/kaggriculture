@@ -158,3 +158,27 @@ def test_batched_planning_finishes_75_tiles_without_repricing_completed_batches(
         assert all(targets[p] == choice for p, choice in before.items())
     assert len(visited) == len(set(visited)) == 75
     assert set(targets) == set(positions)
+
+
+def test_uncommitted_empty_target_is_not_forecast_as_future_supply(monkeypatch):
+    import agents.planner as planner
+    from agents.forecast import Production
+
+    obs = make_obs(day=7)
+    obs['_committed_targets'] = set()
+    targets = {(0, 0): ('WHEAT', False), (1, 0): None}
+    seen = []
+
+    def capture(_market, baseline, _candidates, counts, _labor, _position):
+        seen.append((Counter(counts), sum(baseline.sales.values(), Counter())))
+        return None, Production()
+
+    monkeypatch.setattr(planner, '_choose', capture)
+    plan_targets(obs, targets, [(0, 0), (1, 0)], 29,
+                 replan_positions={(1, 0)})
+    assert seen[0][0]['WHEAT'] == 0
+
+    obs['_committed_targets'] = {(0, 0)}
+    plan_targets(obs, targets, [(0, 0), (1, 0)], 29,
+                 replan_positions={(1, 0)})
+    assert seen[1][0]['WHEAT'] == 1
