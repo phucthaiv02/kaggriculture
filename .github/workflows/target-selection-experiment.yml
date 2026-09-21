@@ -29,62 +29,34 @@ jobs:
           python - <<'PY'
           import json
           import math
-          from copy import copy
           from pathlib import Path
 
           from agents import planner
-          from agents.forecast import Production
           from experiments.play_match import run
 
           original_choose = planner._choose
+          original_discount = planner.TARGET_DISCOUNT
 
-          def clip(flow, start, end):
-              out = Production()
-              for field in ('sales', 'inputs', 'visits'):
-                  getattr(out, field).update(
-                      (d, value) for d, value in getattr(flow, field).items()
-                      if start <= d <= end
-                  )
-              return out
-
-          def economic_score(market, baseline, result, *, discount=1.0, horizon=None):
-              end = market.end_day if horizon is None else min(market.end_day, market.day + horizon)
-              if market.day + planner._first_yield_age(result.choice[0]) > end:
-                  return float('-inf')
-              scoped_market = copy(market)
-              scoped_market.end_day = end
-              b = clip(baseline, market.day, end)
-              o = clip(result.output, market.day, end)
-              combined = Production()
-              combined.add(b)
-              combined.add(o)
-              return (
-                  scoped_market.value(combined, discount=discount)
-                  - scoped_market.value(b, discount=discount)
-                  - result.capital_cost
-              )
-
-          def make_choose(variant):
+          def make_choose(kind, base_option=1):
               def choose(market, baseline, candidates, counts, labor=None, position=(4, 4), *, target_option=None):
                   results = planner.evaluate_targets(
-                      market, baseline, candidates, labor, position, target_option=1
+                      market, baseline, candidates, labor, position,
+                      target_option=base_option,
                   )
                   scored = []
                   for r in results:
-                      if variant == 'd90':
-                          score = economic_score(market, baseline, r, discount=0.90)
-                      elif variant == 'd94':
-                          score = economic_score(market, baseline, r, discount=0.94)
-                      elif variant == 'softroi':
-                          score = r.profit / math.sqrt(max(r.capital_cost, 100.0))
-                      elif variant == 'h8':
-                          score = economic_score(market, baseline, r, horizon=8)
-                      elif variant == 'h10':
-                          score = economic_score(market, baseline, r, horizon=10)
-                      elif variant == 'h12':
-                          score = economic_score(market, baseline, r, horizon=12)
+                      base = r.score(base_option)
+                      capital = max(r.capital_cost, planner.TARGET_ROI_CAPITAL_FLOOR)
+                      if kind == 'soft25':
+                          score = base / (capital ** 0.25)
+                      elif kind == 'soft50':
+                          score = base / math.sqrt(capital)
+                      elif kind == 'cap125':
+                          score = base - 0.25 * r.capital_cost
+                      elif kind == 'cap150':
+                          score = base - 0.50 * r.capital_cost
                       else:
-                          raise ValueError(variant)
+                          raise ValueError(kind)
                       if score > 0:
                           scored.append((score, r))
                   if not scored:
@@ -96,16 +68,45 @@ jobs:
                   return result.choice, result.output
               return choose
 
-          variants = ['o1', 'o2', 'o3', 'd90', 'd94', 'softroi', 'h8', 'h10', 'h12']
+          variants = [
+              'o1', 'o2', 'o3',
+              'd90', 'd94',
+              'soft25', 'soft50',
+              'dsoft25', 'dsoft50',
+              'cap125', 'cap150',
+          ]
           rows = []
           for seed in (1, 2):
               for variant in variants:
                   planner._choose = original_choose
-                  if variant in ('o1', 'o2', 'o3'):
-                      option = int(variant[-1])
-                  else:
+                  planner.TARGET_DISCOUNT = original_discount
+                  option = 1
+                  if variant == 'o1':
                       option = 1
-                      planner._choose = make_choose(variant)
+                  elif variant == 'o2':
+                      option = 2
+                  elif variant == 'o3':
+                      option = 3
+                  elif variant == 'd90':
+                      planner.TARGET_DISCOUNT = 0.90
+                      option = 2
+                  elif variant == 'd94':
+                      planner.TARGET_DISCOUNT = 0.94
+                      option = 2
+                  elif variant == 'soft25':
+                      planner._choose = make_choose('soft25', 1)
+                  elif variant == 'soft50':
+                      planner._choose = make_choose('soft50', 1)
+                  elif variant == 'dsoft25':
+                      planner._choose = make_choose('soft25', 2)
+                      option = 2
+                  elif variant == 'dsoft50':
+                      planner._choose = make_choose('soft50', 2)
+                      option = 2
+                  elif variant == 'cap125':
+                      planner._choose = make_choose('cap125', 1)
+                  elif variant == 'cap150':
+                      planner._choose = make_choose('cap150', 1)
                   result = run(
                       opponent='public/A.ipynb',
                       seed=seed,
@@ -121,6 +122,7 @@ jobs:
                       'statuses': result['statuses'],
                   })
           planner._choose = original_choose
+          planner.TARGET_DISCOUNT = original_discount
           summary = {'runs': rows}
           for variant in variants:
               values = [r['cash'] for r in rows if r['variant'] == variant]
