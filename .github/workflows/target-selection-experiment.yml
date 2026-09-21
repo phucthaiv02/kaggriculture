@@ -15,8 +15,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed: [1, 2]
-        variant: [o1, fast005, fast01, fast02, cap005, cap01, cap02, div01, combo01]
+        seed: [3, 4]
+        variant: [o1, fast0025, fast005, fast0075, eps10, eps25]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -45,7 +45,7 @@ jobs:
           variant = os.environ['VARIANT']
           original_choose = planner._choose
 
-          def make_close_choose(mode, pct):
+          def make_fast_choose(*, pct=None, epsilon=None):
               def choose(market, baseline, candidates, counts, labor=None, position=(4, 4), *, target_option=None):
                   results = planner.evaluate_targets(
                       market, baseline, candidates, labor, position, target_option=1
@@ -54,41 +54,36 @@ jobs:
                   if not profitable:
                       return None, None
                   best_score = max(score for score, _ in profitable)
-                  cutoff = best_score * (1.0 - pct)
+                  cutoff = (
+                      best_score * (1.0 - pct)
+                      if pct is not None
+                      else best_score - epsilon
+                  )
                   close = [(score, r) for score, r in profitable if score >= cutoff]
-
-                  def key(item):
-                      score, r = item
-                      age = planner._first_yield_age(r.choice[0])
-                      count = counts[r.choice[0]]
-                      if mode == 'fast':
-                          return (-age, score, -r.capital_cost, -count, r.choice)
-                      if mode == 'cap':
-                          return (-r.capital_cost, score, -age, -count, r.choice)
-                      if mode == 'div':
-                          return (-count, score, -age, -r.capital_cost, r.choice)
-                      if mode == 'combo':
-                          # Conservative tie-break: diversify first, then faster cash,
-                          # then lower capital. Economics only defines the shortlist.
-                          return (-count, -age, -r.capital_cost, score, r.choice)
-                      raise ValueError(mode)
-
-                  _, result = max(close, key=key)
+                  _, result = max(
+                      close,
+                      key=lambda item: (
+                          -planner._first_yield_age(item[1].choice[0]),
+                          item[0],
+                          -item[1].capital_cost,
+                          -counts[item[1].choice[0]],
+                          item[1].choice,
+                      ),
+                  )
                   return result.choice, result.output
               return choose
 
           if variant != 'o1':
-              spec = {
-                  'fast005': ('fast', 0.005),
-                  'fast01': ('fast', 0.01),
-                  'fast02': ('fast', 0.02),
-                  'cap005': ('cap', 0.005),
-                  'cap01': ('cap', 0.01),
-                  'cap02': ('cap', 0.02),
-                  'div01': ('div', 0.01),
-                  'combo01': ('combo', 0.01),
-              }[variant]
-              planner._choose = make_close_choose(*spec)
+              if variant == 'fast0025':
+                  planner._choose = make_fast_choose(pct=0.0025)
+              elif variant == 'fast005':
+                  planner._choose = make_fast_choose(pct=0.005)
+              elif variant == 'fast0075':
+                  planner._choose = make_fast_choose(pct=0.0075)
+              elif variant == 'eps10':
+                  planner._choose = make_fast_choose(epsilon=10.0)
+              elif variant == 'eps25':
+                  planner._choose = make_fast_choose(epsilon=25.0)
 
           result = run(
               opponent='public/A.ipynb',
