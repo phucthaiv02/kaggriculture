@@ -103,8 +103,10 @@ def test_daily_target_backlog_does_not_restart_near_shed(monkeypatch):
 
     def batch(_obs, _targets, _positions, _end_day, **kwargs):
         current = set(kwargs['replan_positions'])
+        limit = kwargs['max_positions']
+        assert limit == 10
         seen.append(current)
-        return set(sorted(current)[10:])
+        return set(sorted(current)[limit:])
 
     monkeypatch.setattr(expansion, 'plan_targets', batch)
     agent = expansion.make_agent()
@@ -116,3 +118,55 @@ def test_daily_target_backlog_does_not_restart_near_shed(monkeypatch):
     agent(second)
     assert len(seen[0]) == 100
     assert seen[1] == set(sorted(seen[0])[10:])
+
+
+def test_unrealized_committed_target_survives_next_morning(monkeypatch):
+    import agents.expansion_agent as expansion
+
+    monkeypatch.setattr(expansion, 'make_opening_controller',
+                        lambda: lambda *args: False)
+    monkeypatch.setattr(expansion, 'should_buy_land_on_schedule',
+                        lambda *args: False)
+    seen = []
+
+    def batch(_obs, _targets, _positions, _end_day, **kwargs):
+        seen.append(set(kwargs['replan_positions']))
+        return set()
+
+    monkeypatch.setattr(expansion, 'plan_targets', batch)
+    agent = expansion.make_agent()
+    cells = dict(zip(agent.__code__.co_freevars, agent.__closure__))
+    targets = cells['targets'].cell_contents
+    targets.update({(x, y): None for y in range(10) for x in range(10)})
+    committed = (0, 0)
+    targets[committed] = ('WHEAT', False)
+    state = cells['state'].cell_contents
+    state['committed_targets'] = {committed}
+
+    obs = make_obs(10, seeds={'WHEAT': 1})
+    obs['hour'] = 0
+    agent(obs)
+
+    assert committed in state['committed_targets']
+    assert seen and committed not in seen[0]
+
+
+def test_input_budget_reserves_only_mandatory_hires(monkeypatch):
+    import agents.expansion_agent as expansion
+
+    obs = make_obs(10, money=100.0)
+    farm = obs['farms'][0]
+    captured = {}
+
+    def fake_purchase(*args, **kwargs):
+        captured['available_money'] = kwargs['available_money']
+        return []
+
+    monkeypatch.setattr(expansion, 'purchase_orders', fake_purchase)
+    monkeypatch.setattr(expansion, 'should_buy_land_on_schedule',
+                        lambda *args: False)
+    expansion._hire_and_buy_orders(
+        obs, farm, {}, hand_target=5, mandatory_hand_target=1,
+        reserve_hire_budget=True,
+    )
+    assert captured['available_money'] == 99.0
