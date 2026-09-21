@@ -1,0 +1,143 @@
+name: Target selection experiment
+
+on:
+  push:
+    branches: [agent-v3]
+    paths:
+      - '.github/workflows/target-selection-experiment.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade kaggle-environments pytest numpy matplotlib
+      - name: Compare target selectors
+        run: |
+          mkdir -p ci-target-selection
+          python - <<'PY'
+          import json
+          import math
+          from copy import copy
+          from pathlib import Path
+
+          from agents import planner
+          from agents.forecast import Production
+          from experiments.play_match import run
+
+          original_choose = planner._choose
+
+          def clip(flow, start, end):
+              out = Production()
+              for field in ('sales', 'inputs', 'visits'):
+                  getattr(out, field).update(
+                      (d, value) for d, value in getattr(flow, field).items()
+                      if start <= d <= end
+                  )
+              return out
+
+          def economic_score(market, baseline, result, *, discount=1.0, horizon=None):
+              end = market.end_day if horizon is None else min(market.end_day, market.day + horizon)
+              if market.day + planner._first_yield_age(result.choice[0]) > end:
+                  return float('-inf')
+              scoped_market = copy(market)
+              scoped_market.end_day = end
+              b = clip(baseline, market.day, end)
+              o = clip(result.output, market.day, end)
+              combined = Production()
+              combined.add(b)
+              combined.add(o)
+              return (
+                  scoped_market.value(combined, discount=discount)
+                  - scoped_market.value(b, discount=discount)
+                  - result.capital_cost
+              )
+
+          def make_choose(variant):
+              def choose(market, baseline, candidates, counts, labor=None, position=(4, 4), *, target_option=None):
+                  results = planner.evaluate_targets(
+                      market, baseline, candidates, labor, position, target_option=1
+                  )
+                  scored = []
+                  for r in results:
+                      if variant == 'd90':
+                          score = economic_score(market, baseline, r, discount=0.90)
+                      elif variant == 'd94':
+                          score = economic_score(market, baseline, r, discount=0.94)
+                      elif variant == 'softroi':
+                          score = r.profit / math.sqrt(max(r.capital_cost, 100.0))
+                      elif variant == 'h8':
+                          score = economic_score(market, baseline, r, horizon=8)
+                      elif variant == 'h10':
+                          score = economic_score(market, baseline, r, horizon=10)
+                      elif variant == 'h12':
+                          score = economic_score(market, baseline, r, horizon=12)
+                      else:
+                          raise ValueError(variant)
+                      if score > 0:
+                          scored.append((score, r))
+                  if not scored:
+                      return None, None
+                  _, result = max(
+                      scored,
+                      key=lambda item: (item[0], -counts[item[1].choice[0]], item[1].choice),
+                  )
+                  return result.choice, result.output
+              return choose
+
+          variants = ['o1', 'o2', 'o3', 'd90', 'd94', 'softroi', 'h8', 'h10', 'h12']
+          rows = []
+          for seed in (1, 2):
+              for variant in variants:
+                  planner._choose = original_choose
+                  if variant in ('o1', 'o2', 'o3'):
+                      option = int(variant[-1])
+                  else:
+                      option = 1
+                      planner._choose = make_choose(variant)
+                  result = run(
+                      opponent='public/A.ipynb',
+                      seed=seed,
+                      output_dir=Path('ci-target-selection'),
+                      target_option=option,
+                  )
+                  rows.append({
+                      'seed': seed,
+                      'variant': variant,
+                      'cash': result['current_cash'],
+                      'opponent_cash': result['opponent_cash'],
+                      'margin': result['margin'],
+                      'statuses': result['statuses'],
+                  })
+          planner._choose = original_choose
+          summary = {'runs': rows}
+          for variant in variants:
+              values = [r['cash'] for r in rows if r['variant'] == variant]
+              summary[variant] = {
+                  'average_cash': sum(values) / len(values),
+                  'min_cash': min(values),
+                  'max_cash': max(values),
+              }
+          base = summary['o1']['average_cash']
+          for variant in variants:
+              summary[variant]['delta_vs_o1'] = summary[variant]['average_cash'] - base
+          Path('ci-target-selection/summary.json').write_text(json.dumps(summary, indent=2))
+          print('TARGET_SELECTION_SUMMARY=' + json.dumps(summary, sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: target-selection-experiment
+          path: ci-target-selection
+          retention-days: 7
