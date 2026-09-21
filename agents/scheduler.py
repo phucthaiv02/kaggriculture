@@ -173,36 +173,16 @@ def _is_animal_service(task):
 
 
 def _priority(task):
-    if task.mandatory is False and not task.rescue:
-        return (True, True, True, True, True, float("inf"), True)
+    if task.mandatory is False:
+        return (True, not task.immediate_drop)
     return (
-        not task.rescue,
-        task.mandatory is False,
-        not task.urgent,
-        not task.animal_harvest,
-        not (task.actions and task.actions[0][0] in _ANIMAL_SERVICE_OPS),
-        task.deadline if task.deadline is not None else float("inf"),
+        False,
         not task.immediate_drop,
     )
 
 
 def _rescue_priority(task):
-    """Relax only the split between urgent animal harvest and maintenance.
-
-    This priority is never used for a route that already fits. It is a bounded
-    fallback for a smaller headcount that the strict safety ordering could not
-    pack, allowing one worker to service both tasks at the same pen in one visit.
-    """
-    if _is_animal_service(task):
-        return (
-            not task.rescue,
-            task.mandatory is False,
-            not task.urgent,
-            False,
-            False,
-            task.deadline if task.deadline is not None else float("inf"),
-            not task.immediate_drop,
-        )
+    """Compatibility alias for the single daily priority policy."""
     return _priority(task)
 
 
@@ -245,7 +225,6 @@ def _pack_greedy(
 
     priority_for = _rescue_priority if group_animal else _priority
     priorities = {id(task): priority_for(task) for task in tasks}
-    reserve_turn = any(task.animal_harvest for task in tasks)
     terminal_day = any(task.terminal_day or task.cashout for task in tasks)
 
     # Keep the production greedy ordering exactly unchanged unless this is the
@@ -270,15 +249,7 @@ def _pack_greedy(
         ordered = sorted(
             tasks,
             key=lambda task: (
-                not task.rescue,
-                task.mandatory is False,
-                not task.urgent,
-                not task.animal_harvest,
-                not (
-                    task.actions
-                    and task.actions[0][0] in _ANIMAL_SERVICE_OPS
-                ),
-                task.deadline if task.deadline is not None else float("inf"),
+                priorities[id(task)],
                 min(
                     abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
                     for start in worker_starts
@@ -312,8 +283,7 @@ def _pack_greedy(
     for task in ordered:
         best = None
         priority = priorities[id(task)]
-        time_sensitive = (task.urgent or task.animal_harvest
-                          or task.deadline is not None or task.immediate_drop)
+        time_sensitive = task.immediate_drop or task.cashout
         task_is_service = group_animal and _is_animal_service(task)
         for worker, bucket in enumerate(buckets):
             paired_harvest = None
@@ -342,9 +312,6 @@ def _pack_greedy(
                         continue
                 candidate = bucket[:insertion] + [task] + bucket[insertion:]
                 projected = _task_length(worker_starts[worker], candidate, shed_for)
-                # Keep one turn for an opportunistic animal harvest or DROP;
-                # runtime guards may insert HARVEST while crossing a ready pen.
-                projected += int(bool(variant) and reserve_turn)
                 if projected <= _bucket_budget(budgets[worker], candidate, terminal_day):
                     # Time-sensitive work must finish early for survival,
                     # crop expiry and same-day sales. For ordinary work,
@@ -370,14 +337,7 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
     visit order. No search over targets, care dates or opening actions occurs.
     """
     best = _pack_greedy(tasks, worker_starts, budgets, shed_access)
-    # The initial NW-only farm is governed by the opening's cash/refinancing
-    # sequence. Preserve its worker assignments until land expansion.
-    if len(shed_access) == 1 or not tasks or sum(len(t.actions) for t in tasks) > sum(budgets):
-        return best
-    # Keep investment tasks on their established route: intraday buyers use
-    # these assignments to commit animals/seeds and pending hires together.
-    if any(op[0] in ("PLANT", "PLACE", "DIG", "BUILD_COOP", "BUILD_PASTURE")
-           for task in tasks for op in task.actions):
+    if not tasks or sum(len(t.actions) for t in tasks) > sum(budgets):
         return best
 
     # The strict route remains authoritative whenever it fits. Only when it
@@ -410,15 +370,12 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
         return stranded, travel
 
     best_score = score(best)
-    preserve_complete = not best[1]
     for variant in (1, 2, 3):
         candidate = _pack_greedy(tasks, worker_starts, budgets, shed_access, variant)
         candidate_score = score(candidate)
         # Do not trade away tasks. Among complete schedules prefer routes
         # that can return more goods before the shed's end-of-day capacity cap.
-        if candidate_score < best_score and (
-            not preserve_complete or candidate_score[0] < best_score[0]
-        ):
+        if candidate_score < best_score:
             best, best_score = candidate, candidate_score
     return best
 
@@ -533,9 +490,6 @@ def _rebalance_feed(buckets, starts, budgets, shed_access, tasks):
                     for insertion in range(len(bucket)+1):
                         # Insert after fixed work so planting and harvest are not delayed.
                         if any(not service(t) for t in bucket[insertion:]):
-                            continue
-                        # Do not delay expiry-sensitive crop work.
-                        if any(t.deadline is not None for t in bucket[insertion:]):
                             continue
                         merged = bucket[:insertion] + [task] + bucket[insertion:]
                         new_target = metrics(target, merged)

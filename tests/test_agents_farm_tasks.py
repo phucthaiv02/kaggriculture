@@ -487,6 +487,24 @@ def test_final_day_buyer_does_not_restock_tomorrows_feed():
     assert purchase_orders(obs, targets, list(targets)) == []
 
 
+def test_final_day_starvation_flag_does_not_create_feed_purchase():
+    tile = animal_tile('SHEEP', 10, fed_today=False)
+    tile['consecutive_unfed'] = 1
+    obs = make_obs(29, {(4, 3): tile})
+    targets = {(4, 3): ('SHEEP', False)}
+    assert feed_wheat_order(obs, targets, list(targets)) == []
+    assert not any(order[:2] == ['BUY_PRODUCT', 'WHEAT']
+                   for order in purchase_orders(obs, targets, list(targets)))
+
+
+def test_crop_harvest_has_no_intraday_deadline():
+    tile = plant('WHEAT', 0, 4, yield_units=4)
+    tile['max_lifespan_step'] = 100
+    task = one_task(build_tasks(make_obs(4, {(0, 0): tile}),
+                                {(0, 0): ('WHEAT', False)}))
+    assert not hasattr(task, 'deadline')
+
+
 def test_terminal_sales_including_optional_fertilizer_reserve_a_return():
     obs = make_obs(
         29,
