@@ -22,6 +22,30 @@ from agents.horizon import (
 )
 from agents.labor import LaborForecast
 from agents.products import ANIMALS, ANIMAL_COST, CROPS, SEED_COST
+"""Planner: choose production targets from marginal market profit and cost.
+
+This consolidated implementation preserves:
+- exhaustive fertilizer-plan enumeration
+- labor-aware marginal cost evaluation
+- selectable target-ranking options introduced across branches
+"""
+from collections import Counter
+from copy import copy
+from dataclasses import dataclass
+from typing import Optional
+
+from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
+from agents.fertilizer import FertilizerPlan, cycle_plan, plan_ages
+from agents.forecast import MarketForecast, Production, production
+from agents.schedules import (
+    CROP_FERTILIZE_DAYS, CROP_LAST_AGE, ONGOING_CROPS, cycle_turns_over_today,
+)
+from agents.horizon import (
+    cycle_end as _cycle_end,
+    first_yield_age as _first_yield_age, can_start,
+)
+from agents.labor import LaborForecast
+from agents.products import ANIMALS, ANIMAL_COST, CROPS, SEED_COST
 
 
 # Config
@@ -334,29 +358,6 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
             baseline.add(output, position)
             counts[choice[0]] += 1
     return pending
-"""Planner: choose production targets from marginal market profit and cost.
-
-This consolidated implementation preserves:
-- exhaustive fertilizer-plan enumeration
-- labor-aware marginal cost evaluation
-- selectable target-ranking options introduced across branches
-"""
-from collections import Counter
-from copy import copy
-from dataclasses import dataclass
-from typing import Optional
-
-from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
-from agents.fertilizer import FertilizerPlan, cycle_plan, plan_ages
-from agents.forecast import MarketForecast, Production, production
-from agents.schedules import (
-    CROP_FERTILIZE_DAYS, CROP_LAST_AGE, ONGOING_CROPS, cycle_turns_over_today,
-)
-from agents.horizon import (
-    cycle_end as _cycle_end,
-    first_yield_age as _first_yield_age, can_start,
-)
-from agents.labor import LaborForecast
 from agents.products import ANIMALS, ANIMAL_COST, CROPS, SEED_COST
 
 
@@ -1379,7 +1380,11 @@ def _choice_current_key(choice):
 
 def _choose(
     market, baseline, candidates, counts, labor=None, position=(4, 4), *,
+<<<<<<< HEAD
     current=None, audit=None, decision_log=None, decision_step=None,
+=======
+    target_option=None, current=None
+>>>>>>> f79c05d (targeting: keep near-tied current O1 target)
 ):
     results = evaluate_targets(market, baseline, candidates, labor, position)
     if audit is not None:
@@ -1403,6 +1408,7 @@ def _choose(
                 "candidates": [_candidate_log(row, False) for row in results],
             })
         return None, None
+<<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
     best_score, result = max(
@@ -1459,10 +1465,19 @@ def _choose(
             (score, row) for score, row in scored
             if _choice_current_key(row.choice) == current_key
         ]
+=======
+    best_score, result = max(
+        scored,
+        key=lambda item: (item[0], -counts[item[1].choice[0]], item[1].choice),
+    )
+    if current is not None:
+        current_rows = [(score, row) for score, row in scored if row.choice == current]
+>>>>>>> f79c05d (targeting: keep near-tied current O1 target)
         if current_rows:
             current_score, current_result = max(current_rows, key=lambda item: item[0])
             if current_score >= best_score - TARGET_SWITCH_MARGIN:
                 result = current_result
+<<<<<<< HEAD
                 reason = "retained_current_within_switch_margin"
     if decision_log is not None:
         decision_log.append({
@@ -1478,6 +1493,8 @@ def _choose(
                 _candidate_log(row, row.choice == result.choice) for row in results
             ],
         })
+=======
+>>>>>>> f79c05d (targeting: keep near-tied current O1 target)
     return result.choice, result.output
 
 
@@ -1661,6 +1678,7 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
 <<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
         current = targets.get(position)
         choice, output = _choose(
             market, baseline, allowed, counts, position=position, current=current,
@@ -1673,11 +1691,18 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
 =======
         choice, output = _choose(market, baseline, allowed, counts, position=position)
 >>>>>>> e7a1285 (revert: remove unsuccessful target option 4)
+=======
+        current = targets.get(position)
+        choice, output = _choose(
+            market, baseline, allowed, counts, position=position, current=current
+        )
+>>>>>>> f79c05d (targeting: keep near-tied current O1 target)
         targets[position] = choice
         if choice:
             # Include this commitment's supply in the shared window.
             baseline.add(output, position)
             counts[choice[0]] += 1
+<<<<<<< HEAD
     return pending
 """Choose production targets from marginal market profit and capital cost."""
 from collections import Counter
@@ -2140,3 +2165,6 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
             baseline.add(output, position)
             counts[choice[0]] += 1
     return pending
+=======
+    return pending
+>>>>>>> f79c05d (targeting: keep near-tied current O1 target)
