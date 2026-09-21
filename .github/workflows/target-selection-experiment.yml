@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         seed: [1, 2]
-        variant: [o1, o2, o3, d90, d94, soft25, soft50, dsoft25, dsoft50, cap125, cap150]
+        variant: [o1, fast005, fast01, fast02, cap005, cap01, cap02, div01, combo01]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -35,7 +35,6 @@ jobs:
         run: |
           python - <<'PY'
           import json
-          import math
           import os
           from pathlib import Path
 
@@ -45,72 +44,57 @@ jobs:
           seed = int(os.environ['SEED'])
           variant = os.environ['VARIANT']
           original_choose = planner._choose
-          original_discount = planner.TARGET_DISCOUNT
 
-          def make_choose(kind, base_option=1):
+          def make_close_choose(mode, pct):
               def choose(market, baseline, candidates, counts, labor=None, position=(4, 4), *, target_option=None):
                   results = planner.evaluate_targets(
-                      market, baseline, candidates, labor, position,
-                      target_option=base_option,
+                      market, baseline, candidates, labor, position, target_option=1
                   )
-                  scored = []
-                  for r in results:
-                      base = r.score(base_option)
-                      capital = max(r.capital_cost, planner.TARGET_ROI_CAPITAL_FLOOR)
-                      if kind == 'soft25':
-                          score = base / (capital ** 0.25)
-                      elif kind == 'soft50':
-                          score = base / math.sqrt(capital)
-                      elif kind == 'cap125':
-                          score = base - 0.25 * r.capital_cost
-                      elif kind == 'cap150':
-                          score = base - 0.50 * r.capital_cost
-                      else:
-                          raise ValueError(kind)
-                      if score > 0:
-                          scored.append((score, r))
-                  if not scored:
+                  profitable = [(r.score(1), r) for r in results if r.score(1) > 0]
+                  if not profitable:
                       return None, None
-                  _, result = max(
-                      scored,
-                      key=lambda item: (item[0], -counts[item[1].choice[0]], item[1].choice),
-                  )
+                  best_score = max(score for score, _ in profitable)
+                  cutoff = best_score * (1.0 - pct)
+                  close = [(score, r) for score, r in profitable if score >= cutoff]
+
+                  def key(item):
+                      score, r = item
+                      age = planner._first_yield_age(r.choice[0])
+                      count = counts[r.choice[0]]
+                      if mode == 'fast':
+                          return (-age, score, -r.capital_cost, -count, r.choice)
+                      if mode == 'cap':
+                          return (-r.capital_cost, score, -age, -count, r.choice)
+                      if mode == 'div':
+                          return (-count, score, -age, -r.capital_cost, r.choice)
+                      if mode == 'combo':
+                          # Conservative tie-break: diversify first, then faster cash,
+                          # then lower capital. Economics only defines the shortlist.
+                          return (-count, -age, -r.capital_cost, score, r.choice)
+                      raise ValueError(mode)
+
+                  _, result = max(close, key=key)
                   return result.choice, result.output
               return choose
 
-          option = 1
-          if variant == 'o1':
-              option = 1
-          elif variant == 'o2':
-              option = 2
-          elif variant == 'o3':
-              option = 3
-          elif variant == 'd90':
-              planner.TARGET_DISCOUNT = 0.90
-              option = 2
-          elif variant == 'd94':
-              planner.TARGET_DISCOUNT = 0.94
-              option = 2
-          elif variant == 'soft25':
-              planner._choose = make_choose('soft25', 1)
-          elif variant == 'soft50':
-              planner._choose = make_choose('soft50', 1)
-          elif variant == 'dsoft25':
-              planner._choose = make_choose('soft25', 2)
-              option = 2
-          elif variant == 'dsoft50':
-              planner._choose = make_choose('soft50', 2)
-              option = 2
-          elif variant == 'cap125':
-              planner._choose = make_choose('cap125', 1)
-          elif variant == 'cap150':
-              planner._choose = make_choose('cap150', 1)
+          if variant != 'o1':
+              spec = {
+                  'fast005': ('fast', 0.005),
+                  'fast01': ('fast', 0.01),
+                  'fast02': ('fast', 0.02),
+                  'cap005': ('cap', 0.005),
+                  'cap01': ('cap', 0.01),
+                  'cap02': ('cap', 0.02),
+                  'div01': ('div', 0.01),
+                  'combo01': ('combo', 0.01),
+              }[variant]
+              planner._choose = make_close_choose(*spec)
 
           result = run(
               opponent='public/A.ipynb',
               seed=seed,
               output_dir=Path('ci-target-selection'),
-              target_option=option,
+              target_option=1,
           )
           row = {
               'seed': seed,
@@ -122,5 +106,4 @@ jobs:
           }
           print('TARGET_RESULT=' + json.dumps(row, sort_keys=True))
           planner._choose = original_choose
-          planner.TARGET_DISCOUNT = original_discount
           PY
