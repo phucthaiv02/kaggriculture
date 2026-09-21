@@ -159,11 +159,12 @@ def main():
     parser.add_argument(
         "--target-option",
         type=int,
-        choices=(1, 2, 3),
+        choices=(1, 2, 3, 4),
         default=1,
         help=(
             "target ranking: 1=absolute marginal profit, "
-            "2=discounted cash (gamma=0.97), 3=profit/capital (floor=100)"
+            "2=discounted cash (gamma=0.97), 3=profit/capital (floor=100), "
+            "4=discounted-profit shortlist with labor/first-yield tie-break"
         ),
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
