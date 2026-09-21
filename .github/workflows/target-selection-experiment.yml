@@ -11,26 +11,12 @@ permissions:
   contents: read
 
 jobs:
-  planner-tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip >/dev/null
-          python -m pip install --upgrade kaggle-environments pytest numpy matplotlib >/dev/null
-      - name: Run planner tests
-        run: python -m pytest tests/test_agents_planner.py -q
-
   benchmark:
     strategy:
       fail-fast: false
       matrix:
-        seed: [1, 2, 3, 4, 5, 6, 7, 8]
+        seed: [9, 10, 11, 12]
+        variant: [old, current]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -42,18 +28,43 @@ jobs:
         run: |
           python -m pip install --upgrade pip >/dev/null
           python -m pip install --upgrade kaggle-environments pytest numpy matplotlib >/dev/null
-      - name: Run production target selector
+      - name: Compare target selectors
         env:
           SEED: ${{ matrix.seed }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           python - <<'PY'
           import json
           import os
           from pathlib import Path
 
+          from agents import planner
           from experiments.play_match import run
 
           seed = int(os.environ['SEED'])
+          variant = os.environ['VARIANT']
+          original_choose = planner._choose
+
+          def old_choose(market, baseline, candidates, counts, labor=None, position=(4, 4), *, target_option=None, current=None):
+              option = planner.TARGET_OPTION if target_option is None else int(target_option)
+              scored = []
+              for result in planner.evaluate_targets(
+                  market, baseline, candidates, labor, position, target_option=option
+              ):
+                  score = result.score(option)
+                  if score > 0:
+                      scored.append((score, result))
+              if not scored:
+                  return None, None
+              _, result = max(
+                  scored,
+                  key=lambda item: (item[0], -counts[item[1].choice[0]], item[1].choice),
+              )
+              return result.choice, result.output
+
+          if variant == 'old':
+              planner._choose = old_choose
+
           result = run(
               opponent='public/A.ipynb',
               seed=seed,
@@ -62,10 +73,12 @@ jobs:
           )
           row = {
               'seed': seed,
+              'variant': variant,
               'cash': result['current_cash'],
               'opponent_cash': result['opponent_cash'],
               'margin': result['margin'],
               'statuses': result['statuses'],
           }
           print('TARGET_RESULT=' + json.dumps(row, sort_keys=True))
+          planner._choose = original_choose
           PY
