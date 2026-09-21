@@ -12,8 +12,13 @@ permissions:
 
 jobs:
   benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [1, 2]
+        variant: [o1, o2, o3, d90, d94, soft25, soft50, dsoft25, dsoft50, cap125, cap150]
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,19 +26,24 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install --upgrade kaggle-environments pytest numpy matplotlib
-      - name: Compare target selectors
+          python -m pip install --upgrade pip >/dev/null
+          python -m pip install --upgrade kaggle-environments pytest numpy matplotlib >/dev/null
+      - name: Run target selector
+        env:
+          SEED: ${{ matrix.seed }}
+          VARIANT: ${{ matrix.variant }}
         run: |
-          mkdir -p ci-target-selection
           python - <<'PY'
           import json
           import math
+          import os
           from pathlib import Path
 
           from agents import planner
           from experiments.play_match import run
 
+          seed = int(os.environ['SEED'])
+          variant = os.environ['VARIANT']
           original_choose = planner._choose
           original_discount = planner.TARGET_DISCOUNT
 
@@ -68,78 +78,49 @@ jobs:
                   return result.choice, result.output
               return choose
 
-          variants = [
-              'o1', 'o2', 'o3',
-              'd90', 'd94',
-              'soft25', 'soft50',
-              'dsoft25', 'dsoft50',
-              'cap125', 'cap150',
-          ]
-          rows = []
-          for seed in (1, 2):
-              for variant in variants:
-                  planner._choose = original_choose
-                  planner.TARGET_DISCOUNT = original_discount
-                  option = 1
-                  if variant == 'o1':
-                      option = 1
-                  elif variant == 'o2':
-                      option = 2
-                  elif variant == 'o3':
-                      option = 3
-                  elif variant == 'd90':
-                      planner.TARGET_DISCOUNT = 0.90
-                      option = 2
-                  elif variant == 'd94':
-                      planner.TARGET_DISCOUNT = 0.94
-                      option = 2
-                  elif variant == 'soft25':
-                      planner._choose = make_choose('soft25', 1)
-                  elif variant == 'soft50':
-                      planner._choose = make_choose('soft50', 1)
-                  elif variant == 'dsoft25':
-                      planner._choose = make_choose('soft25', 2)
-                      option = 2
-                  elif variant == 'dsoft50':
-                      planner._choose = make_choose('soft50', 2)
-                      option = 2
-                  elif variant == 'cap125':
-                      planner._choose = make_choose('cap125', 1)
-                  elif variant == 'cap150':
-                      planner._choose = make_choose('cap150', 1)
-                  result = run(
-                      opponent='public/A.ipynb',
-                      seed=seed,
-                      output_dir=Path('ci-target-selection'),
-                      target_option=option,
-                  )
-                  rows.append({
-                      'seed': seed,
-                      'variant': variant,
-                      'cash': result['current_cash'],
-                      'opponent_cash': result['opponent_cash'],
-                      'margin': result['margin'],
-                      'statuses': result['statuses'],
-                  })
+          option = 1
+          if variant == 'o1':
+              option = 1
+          elif variant == 'o2':
+              option = 2
+          elif variant == 'o3':
+              option = 3
+          elif variant == 'd90':
+              planner.TARGET_DISCOUNT = 0.90
+              option = 2
+          elif variant == 'd94':
+              planner.TARGET_DISCOUNT = 0.94
+              option = 2
+          elif variant == 'soft25':
+              planner._choose = make_choose('soft25', 1)
+          elif variant == 'soft50':
+              planner._choose = make_choose('soft50', 1)
+          elif variant == 'dsoft25':
+              planner._choose = make_choose('soft25', 2)
+              option = 2
+          elif variant == 'dsoft50':
+              planner._choose = make_choose('soft50', 2)
+              option = 2
+          elif variant == 'cap125':
+              planner._choose = make_choose('cap125', 1)
+          elif variant == 'cap150':
+              planner._choose = make_choose('cap150', 1)
+
+          result = run(
+              opponent='public/A.ipynb',
+              seed=seed,
+              output_dir=Path('ci-target-selection'),
+              target_option=option,
+          )
+          row = {
+              'seed': seed,
+              'variant': variant,
+              'cash': result['current_cash'],
+              'opponent_cash': result['opponent_cash'],
+              'margin': result['margin'],
+              'statuses': result['statuses'],
+          }
+          print('TARGET_RESULT=' + json.dumps(row, sort_keys=True))
           planner._choose = original_choose
           planner.TARGET_DISCOUNT = original_discount
-          summary = {'runs': rows}
-          for variant in variants:
-              values = [r['cash'] for r in rows if r['variant'] == variant]
-              summary[variant] = {
-                  'average_cash': sum(values) / len(values),
-                  'min_cash': min(values),
-                  'max_cash': max(values),
-              }
-          base = summary['o1']['average_cash']
-          for variant in variants:
-              summary[variant]['delta_vs_o1'] = summary[variant]['average_cash'] - base
-          Path('ci-target-selection/summary.json').write_text(json.dumps(summary, indent=2))
-          print('TARGET_SELECTION_SUMMARY=' + json.dumps(summary, sort_keys=True))
           PY
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: target-selection-experiment
-          path: ci-target-selection
-          retention-days: 7
