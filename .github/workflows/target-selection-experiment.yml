@@ -11,12 +11,7 @@ permissions:
   contents: read
 
 jobs:
-  benchmark:
-    strategy:
-      fail-fast: false
-      matrix:
-        seed: [2, 4, 7, 8]
-        variant: [o1, stick05, stick1, stick2]
+  planner-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -28,66 +23,37 @@ jobs:
         run: |
           python -m pip install --upgrade pip >/dev/null
           python -m pip install --upgrade kaggle-environments pytest numpy matplotlib >/dev/null
-      - name: Run target selector
+      - name: Run planner tests
+        run: python -m pytest tests/test_agents_planner.py -q
+
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [1, 2, 3, 4, 5, 6, 7, 8]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          python -m pip install --upgrade kaggle-environments pytest numpy matplotlib >/dev/null
+      - name: Run production target selector
         env:
           SEED: ${{ matrix.seed }}
-          VARIANT: ${{ matrix.variant }}
         run: |
           python - <<'PY'
           import json
           import os
           from pathlib import Path
 
-          from agents import planner, expansion_agent
           from experiments.play_match import run
 
           seed = int(os.environ['SEED'])
-          variant = os.environ['VARIANT']
-          original_choose = planner._choose
-          original_plan_targets = expansion_agent.plan_targets
-          context = {'targets': None}
-
-          def wrapped_plan_targets(obs, targets, *args, **kwargs):
-              context['targets'] = targets
-              try:
-                  return original_plan_targets(obs, targets, *args, **kwargs)
-              finally:
-                  context['targets'] = None
-
-          def make_sticky_choose(epsilon):
-              def choose(market, baseline, candidates, counts, labor=None, position=(4, 4), *, target_option=None):
-                  results = planner.evaluate_targets(
-                      market, baseline, candidates, labor, position, target_option=1
-                  )
-                  profitable = [(r.score(1), r) for r in results if r.score(1) > 0]
-                  if not profitable:
-                      return None, None
-                  best_score, best = max(
-                      profitable,
-                      key=lambda item: (item[0], -counts[item[1].choice[0]], item[1].choice),
-                  )
-                  targets = context['targets']
-                  current = targets.get(position) if targets is not None else None
-                  if current:
-                      current_rows = [
-                          (score, r) for score, r in profitable if r.choice == current
-                      ]
-                      if current_rows:
-                          current_score, current_result = max(current_rows, key=lambda item: item[0])
-                          if current_score >= best_score - epsilon:
-                              return current_result.choice, current_result.output
-                  return best.choice, best.output
-              return choose
-
-          variants = {
-              'stick05': 0.5,
-              'stick1': 1.0,
-              'stick2': 2.0,
-          }
-          if variant in variants:
-              expansion_agent.plan_targets = wrapped_plan_targets
-              planner._choose = make_sticky_choose(variants[variant])
-
           result = run(
               opponent='public/A.ipynb',
               seed=seed,
@@ -96,13 +62,10 @@ jobs:
           )
           row = {
               'seed': seed,
-              'variant': variant,
               'cash': result['current_cash'],
               'opponent_cash': result['opponent_cash'],
               'margin': result['margin'],
               'statuses': result['statuses'],
           }
           print('TARGET_RESULT=' + json.dumps(row, sort_keys=True))
-          planner._choose = original_choose
-          expansion_agent.plan_targets = original_plan_targets
           PY
