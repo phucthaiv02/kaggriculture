@@ -247,11 +247,15 @@ def test_uncommitted_empty_target_is_not_forecast_as_future_supply(monkeypatch):
     targets = {(0, 0): ('WHEAT', False), (1, 0): None}
     seen = []
 
-<<<<<<< HEAD
-    def capture(_market, baseline, _candidates, counts, _labor=None, _position=(4, 4), **kwargs):
-=======
-    def capture(_market, baseline, _candidates, counts, _labor, _position):
->>>>>>> 79e9440 ((x) feat: enhance feed management and daily planning logic)
+    def capture(*args, **kwargs):
+        # Support multiple call conventions used across commits.
+        # Prefer kwargs but fall back to positional args.
+        counts = kwargs.get('counts')
+        baseline = kwargs.get('baseline')
+        if counts is None:
+            counts = args[3] if len(args) > 3 else Counter()
+        if baseline is None:
+            baseline = args[1] if len(args) > 1 else Production()
         seen.append((Counter(counts), sum(baseline.sales.values(), Counter())))
         return None, Production()
 
