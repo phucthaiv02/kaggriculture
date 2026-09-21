@@ -247,7 +247,11 @@ def test_uncommitted_empty_target_is_not_forecast_as_future_supply(monkeypatch):
     targets = {(0, 0): ('WHEAT', False), (1, 0): None}
     seen = []
 
+<<<<<<< HEAD
     def capture(_market, baseline, _candidates, counts, _labor=None, _position=(4, 4), **kwargs):
+=======
+    def capture(_market, baseline, _candidates, counts, _labor, _position):
+>>>>>>> 79e9440 ((x) feat: enhance feed management and daily planning logic)
         seen.append((Counter(counts), sum(baseline.sales.values(), Counter())))
         return None, Production()
 

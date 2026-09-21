@@ -564,26 +564,16 @@ def _animal_and_seed_demand(
     )
 
 
-def feed_wheat_order(obs, targets, active_positions):
-    """Just today's WHEAT-for-feed shortfall, safe (and needed) to call every
-    turn of the day, not only hour 0/1: COLLECT_FERTILIZER -> return to shed
-    -> DROP -> SELL only happens once a task queue actually runs it (hour
-    2+), so the cash to fund this same day's feed purchase may not exist
-    until partway through the day. purchase_orders' bigger seed/animal
-    purchases stay hour-0/1-only (they are not this time-sensitive and
-    shouldn't be resubmitted every turn), but wheat is cheap and this check
-    is idempotent -- it only ever asks for the current shortfall."""
+def feed_wheat_reserve(obs, targets, active_positions):
+    """WHEAT that must remain in the shed for committed feed demand."""
     (
         _seed_demand,
         animal_missing,
         live_animals,
         pending_feed,
-        wheat_incoming,
+        _wheat_incoming,
         carried_wheat,
-    ) = _animal_and_seed_demand(
-        obs, targets, active_positions
-    )
-    shed = obs["private"]["shed"]
+    ) = _animal_and_seed_demand(obs, targets, active_positions)
     farm = obs["farms"][obs["player"]]
     tomorrow_feed = (
         3 <= obs["day"] < obs.get("_planning_end_day", SEASON_END_DAY)
@@ -593,11 +583,29 @@ def feed_wheat_order(obs, targets, active_positions):
         for position in active_positions
         if isinstance(farm["tiles"][position[1]][position[0]], dict)
         and farm["tiles"][position[1]][position[0]].get("animal")
+        and should_feed_animal(
+            farm["tiles"][position[1]][position[0]]["animal"],
+            obs["day"] + 1 - farm["tiles"][position[1]][position[0]]["placed_day"],
+            obs.get("_planning_end_day", SEASON_END_DAY)
+            - farm["tiles"][position[1]][position[0]]["placed_day"],
+        )
     )
+    return max(0, live_animals + pending_feed + tomorrow_feed - carried_wheat)
+
+
+def feed_wheat_order(obs, targets, active_positions):
+    """Just today's WHEAT-for-feed shortfall, safe (and needed) to call every
+    turn of the day, not only hour 0/1: COLLECT_FERTILIZER -> return to shed
+    -> DROP -> SELL only happens once a task queue actually runs it (hour
+    2+), so the cash to fund this same day's feed purchase may not exist
+    until partway through the day. purchase_orders' bigger seed/animal
+    purchases stay hour-0/1-only (they are not this time-sensitive and
+    shouldn't be resubmitted every turn), but wheat is cheap and this check
+    is idempotent -- it only ever asks for the current shortfall."""
+    shed = obs["private"]["shed"]
     wheat_needed = max(
-        0,
-        live_animals + pending_feed + tomorrow_feed
-        - shed.get("WHEAT", 0) - carried_wheat,
+        0, feed_wheat_reserve(obs, targets, active_positions)
+        - shed.get("WHEAT", 0),
     )
     return [["BUY_PRODUCT", "WHEAT", wheat_needed]] if wheat_needed else []
 
@@ -640,6 +648,12 @@ def purchase_orders(
         for position in active_positions
         if isinstance(farm["tiles"][position[1]][position[0]], dict)
         and farm["tiles"][position[1]][position[0]].get("animal")
+        and should_feed_animal(
+            farm["tiles"][position[1]][position[0]]["animal"],
+            obs["day"] + 1 - farm["tiles"][position[1]][position[0]]["placed_day"],
+            obs.get("_planning_end_day", SEASON_END_DAY)
+            - farm["tiles"][position[1]][position[0]]["placed_day"],
+        )
     )
     wheat_needed_now = max(
         0,
