@@ -170,3 +170,85 @@ def test_input_budget_reserves_only_mandatory_hires(monkeypatch):
         reserve_hire_budget=True,
     )
     assert captured['available_money'] == 99.0
+
+
+def test_future_animal_target_does_not_buy_before_place_is_admitted(monkeypatch):
+    import agents.expansion_agent as expansion
+
+    monkeypatch.setattr(expansion, 'make_opening_controller',
+                        lambda: lambda *args: False)
+    monkeypatch.setattr(expansion, 'should_buy_land_on_schedule',
+                        lambda *args: False)
+    agent = expansion.make_agent()
+    cells = dict(zip(agent.__code__.co_freevars, agent.__closure__))
+    targets = cells['targets'].cell_contents
+    targets.update({(x, y): None for y in range(10) for x in range(10)})
+    position = (4, 4)
+    targets[position] = ('COW', False)
+    obs = make_obs(10, tiles={position: plant('WHEAT', 9, 10, yield_units=1)})
+    obs['hour'] = 0
+
+    result = agent(obs)
+
+    assert not any(order[:2] == ['BUY_ANIMAL', 'COW'] for order in result['market'])
+
+
+def test_sell_orders_leave_slots_for_all_mandatory_hires(monkeypatch):
+    import agents.expansion_agent as expansion
+
+    monkeypatch.setattr(expansion, 'make_opening_controller',
+                        lambda: lambda *args: False)
+    monkeypatch.setattr(expansion, 'should_buy_land_on_schedule',
+                        lambda *args: False)
+    monkeypatch.setattr(expansion, 'hands_needed',
+                        lambda *args, **kwargs: (7, []))
+    fake_sales = [
+        ['SELL', item, 1]
+        for item in ('WHEAT', 'CARROT', 'TOMATO', 'STRAWBERRY', 'MELON')
+    ]
+    monkeypatch.setattr(expansion, 'sell_orders',
+                        lambda *args, **kwargs: list(fake_sales))
+    monkeypatch.setattr(expansion, 'purchase_orders',
+                        lambda *args, **kwargs: [])
+    agent = expansion.make_agent()
+    cells = dict(zip(agent.__code__.co_freevars, agent.__closure__))
+    cells['targets'].cell_contents.update(
+        {(x, y): None for y in range(10) for x in range(10)}
+    )
+    obs = make_obs(10, money=1000.0)
+    obs['hour'] = 0
+
+    result = agent(obs)
+
+    assert sum(order[0] == 'HIRE' for order in result['market']) == 7
+    assert len(result['market']) == 10
+
+
+def test_missing_mandatory_capacity_keeps_plan_unfrozen_and_hires(monkeypatch):
+    import agents.expansion_agent as expansion
+
+    monkeypatch.setattr(expansion, 'make_opening_controller',
+                        lambda: lambda *args: False)
+    monkeypatch.setattr(expansion, 'should_buy_land_on_schedule',
+                        lambda *args: False)
+    agent = expansion.make_agent()
+    cells = dict(zip(agent.__code__.co_freevars, agent.__closure__))
+    targets = cells['targets'].cell_contents
+    targets.update({(x, y): None for y in range(10) for x in range(10)})
+    state = cells['state'].cell_contents
+    state.update(day=10, daily_targets={}, plan_frozen=False)
+
+    tiles = {}
+    for index in range(30):
+        position = (index % 10, index // 10)
+        tile = plant('WHEAT', 9, 10, yield_units=1)
+        tile['consecutive_unwatered'] = 1
+        tiles[position] = tile
+    obs = make_obs(10, tiles=tiles, money=10000.0)
+    obs['hour'] = 1
+
+    result = agent(obs)
+
+    assert not state['plan_frozen']
+    assert state['emergency_hires'] > 0
+    assert result['market'][0] == ['HIRE']
