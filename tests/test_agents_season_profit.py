@@ -3,7 +3,15 @@ import pytest
 
 from agents.forecast import MarketForecast, Production
 from agents.labor import LaborForecast
-from agents.planner import SEASON_END_DAY, _candidates, _choose, _rotation, _score, evaluate_targets
+from agents.planner import (
+    SEASON_END_DAY,
+    TargetProfit,
+    _candidates,
+    _choose,
+    _rotation,
+    _score,
+    evaluate_targets,
+)
 from kaggle_environments.envs.kaggriculture import kaggriculture as game
 
 
@@ -50,12 +58,43 @@ def test_animal_is_bought_once_and_only_projected_after_placement():
     assert min(day for day, units in flow.sales.items() if units['EGG']) == 11
 
 
-def test_score_and_selector_share_cycle_labor_cost(monkeypatch):
+def test_target_score_ignores_labor_forecast(monkeypatch):
     inventory = {p: game.MARKET_I0 for p in game.PRODUCTS}
     before, _ = _score('GOOSE', SEASON_END_DAY, 7, inventory, 25, Counter())
     monkeypatch.setattr(LaborForecast, 'marginal_cost', lambda *args, **kwargs: 123)
     after, _ = _score('GOOSE', SEASON_END_DAY, 7, inventory, 25, Counter())
-    assert after == before - 123
+    assert after == before
+
+
+def test_target_option_formulas_are_distinct():
+    flow = Production()
+    slow = TargetProfit(
+        ('COW', False), flow,
+        market_cash=1700, capital_cost=1000,
+        discounted_market_cash=1300,
+    )
+    fast = TargetProfit(
+        ('STRAWBERRY', False), flow,
+        market_cash=700, capital_cost=100,
+        discounted_market_cash=690,
+    )
+    # Option 1 maximizes absolute marginal profit.
+    assert slow.score(1) > fast.score(1)
+    # Option 2 rewards earlier cash enough for the fast producer to win.
+    assert fast.score(2) > slow.score(2)
+    # Option 3 maximizes profit per committed capital dollar.
+    assert fast.score(3) > slow.score(3)
+    assert slow.labor_cost == 0
+
+
+def test_discounted_market_value_weights_late_cash_less():
+    market = MarketForecast({p: game.MARKET_I0 for p in game.PRODUCTS}, (), 0, 10)
+    market.price = lambda product, stock: 100
+    early, late = Production(), Production()
+    early.sales[1]['WHEAT'] = 1
+    late.sales[10]['WHEAT'] = 1
+    assert market.value(early) == market.value(late)
+    assert market.value(early, discount=0.97) > market.value(late, discount=0.97)
 
 
 @pytest.mark.parametrize('name,last', [('GOOSE', 16), ('COW', 16), ('SHEEP', 16)])
@@ -91,6 +130,7 @@ def test_sales_and_labor_after_candidate_cycle_do_not_change_its_score():
     baseline.visits[17] = [((0, 0), 100, (), True)]
     after = evaluate_targets(market, baseline, candidate)[0]
     assert after.profit == before.profit
+    assert after.labor_cost == before.labor_cost == 0
 
 
 def test_existing_crop_forecast_charges_only_future_replants():
