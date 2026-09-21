@@ -52,6 +52,50 @@ def test_target_ranking_does_not_use_labor_cost():
     assert choice[0] == 'COW'
 
 
+def test_option4_uses_labor_to_break_close_economic_choices():
+    class Revenue:
+        day, end_day = 0, 16
+        def value(self, flows, discount=1.0):
+            return sum(
+                (discount ** day) * sum(units.values())
+                for day, units in flows.sales.items()
+            )
+
+    busy, light = Production(), Production()
+    busy.sales[0]['MILK'] = 100
+    light.sales[0]['MELON'] = 95
+    for day in range(16):
+        busy.visits[day] = [(None, 20, ('WHEAT',), True)]
+    choice, _ = _choose(
+        Revenue(), Production(),
+        [(('COW', False), busy, 0), (('MELON', False), light, 0)],
+        Counter(), labor=LaborForecast(((4, 4),)), target_option=4,
+    )
+    assert choice[0] == 'MELON'
+
+
+def test_option4_keeps_clear_economic_winner_despite_labor():
+    class Revenue:
+        day, end_day = 0, 16
+        def value(self, flows, discount=1.0):
+            return sum(
+                (discount ** day) * sum(units.values())
+                for day, units in flows.sales.items()
+            )
+
+    busy, light = Production(), Production()
+    busy.sales[0]['MILK'] = 500
+    light.sales[0]['MELON'] = 100
+    for day in range(16):
+        busy.visits[day] = [(None, 20, ('WHEAT',), True)]
+    choice, _ = _choose(
+        Revenue(), Production(),
+        [(('COW', False), busy, 0), (('MELON', False), light, 0)],
+        Counter(), labor=LaborForecast(((4, 4),)), target_option=4,
+    )
+    assert choice[0] == 'COW'
+
+
 def test_never_dig_live_animals_or_empty_animal_structures():
     for tile in ({'kind':'COOP'}, {'kind':'PASTURE'}, {'kind':'COOP','animal':'GOOSE'}):
         farm = {'tiles': [[tile]], 'farmer':[0,0], 'hands':[]}
