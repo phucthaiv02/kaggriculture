@@ -5,7 +5,10 @@ Each tile shape here is copied verbatim from the engine's own constructors
 mismatch with build_tasks' expectations, not a fixture bug.
 """
 
-from agents.farm_tasks import build_tasks, feed_wheat_order, purchase_orders, reserved_items
+from agents.farm_tasks import (
+    build_tasks, feed_wheat_order, feed_wheat_reserve, purchase_orders,
+    reserved_items,
+)
 
 PRODUCTS = ("WHEAT", "CARROT", "MELON", "TOMATO", "STRAWBERRY", "EGG", "MILK", "WOOL", "FERTILIZER")
 
@@ -113,7 +116,9 @@ def test_live_animal_already_fed_is_not_fed_twice_when_tasks_are_rebuilt():
 def test_live_animal_harvests_before_feeding():
     obs = make_obs(day=6, tiles={(0, 0): animal_tile("SHEEP", placed_day=0, yield_units=4)}, shed={"WHEAT": 5})
     tasks = build_tasks(obs, {(0, 0): ("SHEEP", False)})
-    assert [task.actions for task in tasks] == [[["HARVEST"]], [["FEED"], ["CARE"]]]
+    assert [task.actions for task in tasks] == [
+        [["HARVEST"], ["FEED"], ["CARE"]]
+    ]
     assert tasks[0].sells == {"WOOL": 4}
     assert tasks[0].urgent
     assert tasks[0].animal_harvest
@@ -495,6 +500,22 @@ def test_final_day_starvation_flag_does_not_create_feed_purchase():
     assert feed_wheat_order(obs, targets, list(targets)) == []
     assert not any(order[:2] == ['BUY_PRODUCT', 'WHEAT']
                    for order in purchase_orders(obs, targets, list(targets)))
+
+
+def test_feed_reserve_prevents_selling_wheat_that_would_be_bought_back():
+    tile = animal_tile('SHEEP', 0, fed_today=False)
+    obs = make_obs(4, {(4, 3): tile}, shed={'WHEAT': 10})
+    targets = {(4, 3): ('SHEEP', False)}
+    reserve = feed_wheat_reserve(obs, targets, list(targets))
+    assert reserve > 0
+    from agents.selling import sell_orders
+    sold = sum(order[2] for order in sell_orders(obs, {'WHEAT': reserve})
+               if order[:2] == ['SELL', 'WHEAT'])
+    remaining = obs['private']['shed']['WHEAT'] - sold
+    assert feed_wheat_order(
+        {**obs, 'private': {**obs['private'], 'shed': {'WHEAT': remaining}}},
+        targets, list(targets),
+    ) == []
 
 
 def test_crop_harvest_has_no_intraday_deadline():
