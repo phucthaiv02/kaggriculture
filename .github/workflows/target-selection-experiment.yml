@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         seed: [1, 3, 5, 6]
-        variant: [o1, early1, early2, early3, early5d2]
+        variant: [o1, stick1, stick5, stick10, stick25]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -38,14 +38,23 @@ jobs:
           import os
           from pathlib import Path
 
-          from agents import planner
+          from agents import planner, expansion_agent
           from experiments.play_match import run
 
           seed = int(os.environ['SEED'])
           variant = os.environ['VARIANT']
           original_choose = planner._choose
+          original_plan_targets = expansion_agent.plan_targets
+          context = {'targets': None}
 
-          def make_early_choose(epsilon, min_days):
+          def wrapped_plan_targets(obs, targets, *args, **kwargs):
+              context['targets'] = targets
+              try:
+                  return original_plan_targets(obs, targets, *args, **kwargs)
+              finally:
+                  context['targets'] = None
+
+          def make_sticky_choose(epsilon):
               def choose(market, baseline, candidates, counts, labor=None, position=(4, 4), *, target_option=None):
                   results = planner.evaluate_targets(
                       market, baseline, candidates, labor, position, target_option=1
@@ -53,37 +62,32 @@ jobs:
                   profitable = [(r.score(1), r) for r in results if r.score(1) > 0]
                   if not profitable:
                       return None, None
-                  # Reproduce O1 exactly first; only then consider a narrowly
-                  # cheaper-score candidate that returns its first yield sooner.
                   best_score, best = max(
                       profitable,
                       key=lambda item: (item[0], -counts[item[1].choice[0]], item[1].choice),
                   )
-                  best_age = planner._first_yield_age(best.choice[0])
-                  earlier = [
-                      (score, r) for score, r in profitable
-                      if score >= best_score - epsilon
-                      and planner._first_yield_age(r.choice[0]) <= best_age - min_days
-                  ]
-                  if not earlier:
-                      return best.choice, best.output
-                  min_age = min(planner._first_yield_age(r.choice[0]) for _, r in earlier)
-                  _, result = max(
-                      ((score, r) for score, r in earlier
-                       if planner._first_yield_age(r.choice[0]) == min_age),
-                      key=lambda item: (item[0], -counts[item[1].choice[0]], item[1].choice),
-                  )
-                  return result.choice, result.output
+                  targets = context['targets']
+                  current = targets.get(position) if targets is not None else None
+                  if current:
+                      current_rows = [
+                          (score, r) for score, r in profitable if r.choice == current
+                      ]
+                      if current_rows:
+                          current_score, current_result = max(current_rows, key=lambda item: item[0])
+                          if current_score >= best_score - epsilon:
+                              return current_result.choice, current_result.output
+                  return best.choice, best.output
               return choose
 
           variants = {
-              'early1': (1.0, 1),
-              'early2': (2.0, 1),
-              'early3': (3.0, 1),
-              'early5d2': (5.0, 2),
+              'stick1': 1.0,
+              'stick5': 5.0,
+              'stick10': 10.0,
+              'stick25': 25.0,
           }
           if variant in variants:
-              planner._choose = make_early_choose(*variants[variant])
+              expansion_agent.plan_targets = wrapped_plan_targets
+              planner._choose = make_sticky_choose(variants[variant])
 
           result = run(
               opponent='public/A.ipynb',
@@ -101,4 +105,5 @@ jobs:
           }
           print('TARGET_RESULT=' + json.dumps(row, sort_keys=True))
           planner._choose = original_choose
+          expansion_agent.plan_targets = original_plan_targets
           PY
