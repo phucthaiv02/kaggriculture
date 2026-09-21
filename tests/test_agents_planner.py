@@ -71,6 +71,42 @@ def test_unprofitable_candidates_are_rejected():
     assert choice is None
 
 
+def test_choose_keeps_current_target_inside_switch_margin(monkeypatch):
+    import agents.planner as planner
+    from agents.forecast import Production
+
+    best = planner.TargetProfit(("WHEAT", False), Production(), 110.0, 10.0)
+    current = planner.TargetProfit(("CORN", False), Production(), 109.5, 10.0)
+    monkeypatch.setattr(planner, "evaluate_targets", lambda *args, **kwargs: [best, current])
+
+    choice, _ = planner._choose(None, None, None, Counter(), current=current.choice)
+    assert choice == current.choice
+
+
+def test_choose_switches_when_current_target_loses_by_more_than_margin(monkeypatch):
+    import agents.planner as planner
+    from agents.forecast import Production
+
+    best = planner.TargetProfit(("WHEAT", False), Production(), 110.0, 10.0)
+    current = planner.TargetProfit(("CORN", False), Production(), 108.9, 10.0)
+    monkeypatch.setattr(planner, "evaluate_targets", lambda *args, **kwargs: [best, current])
+
+    choice, _ = planner._choose(None, None, None, Counter(), current=current.choice)
+    assert choice == best.choice
+
+
+def test_choose_without_current_preserves_o1_best_choice(monkeypatch):
+    import agents.planner as planner
+    from agents.forecast import Production
+
+    best = planner.TargetProfit(("WHEAT", False), Production(), 110.0, 10.0)
+    runner_up = planner.TargetProfit(("CORN", False), Production(), 109.5, 10.0)
+    monkeypatch.setattr(planner, "evaluate_targets", lambda *args, **kwargs: [runner_up, best])
+
+    choice, _ = planner._choose(None, None, None, Counter())
+    assert choice == best.choice
+
+
 def test_plan_targets_diversifies_across_many_tiles_in_one_pass():
     """Regression test for the concentration bug found via full-pipeline
     testing: a whole freshly-claimed quadrant (or a fresh 25-tile board)
@@ -144,9 +180,9 @@ def test_batched_planning_finishes_75_tiles_without_repricing_completed_batches(
     targets, visited = {}, []
     choose = planner._choose
 
-    def record(*args):
-        visited.append(args[-1])
-        return choose(*args)
+    def record(*args, **kwargs):
+        visited.append(kwargs.get("position", args[-1] if args else None))
+        return choose(*args, **kwargs)
 
     monkeypatch.setattr(planner, "_choose", record)
     pending = positions
@@ -169,7 +205,7 @@ def test_uncommitted_empty_target_is_not_forecast_as_future_supply(monkeypatch):
     targets = {(0, 0): ('WHEAT', False), (1, 0): None}
     seen = []
 
-    def capture(_market, baseline, _candidates, counts, _labor, _position):
+    def capture(_market, baseline, _candidates, counts, _labor=None, _position=(4, 4), **kwargs):
         seen.append((Counter(counts), sum(baseline.sales.values(), Counter())))
         return None, Production()
 
