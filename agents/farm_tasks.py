@@ -34,17 +34,15 @@ class Task:
     position: tuple[int, int]
     actions: list  # ordered engine ops for this tile, e.g. [["WATER"], ["HARVEST"]]
     needs: Counter = field(default_factory=Counter)  # items to PICKUP before arriving
-    urgent: bool = False  # animal care -- a missed day is a lasting loss (escape)
+    urgent: bool = False  # retained for compatibility with hand-built tasks
     sells: Counter = field(default_factory=Counter)  # units this task will add to inventory
     ends_cycle: bool = False  # tile becomes free/replantable after this task
     immediate_drop: bool = False  # opening-only return to shed after this task
     refinance_feed: bool = False  # opening-only fertilizer sale -> wheat -> feed
-    animal_harvest: bool = False  # ready animal output outranks all other tile work
-    deadline: int | None = None  # absolute engine step before a crop decays
+    animal_harvest: bool = False  # task includes a planned animal HARVEST
     cashout: bool = False  # reserve a return/DROP and a SELL before terminal
     terminal_day: bool = False  # terminal observation removes a worker turn
     mandatory: bool | None = None  # None preserves legacy hand-built tasks
-    rescue: bool = False  # a second dry refresh would kill the plant
     value: float = 0.0  # estimated incremental cash before today's extra labor
 
 
@@ -200,10 +198,8 @@ def build_tasks(
                 crop = tile["crop"]
                 if tile.get("yield_units", 0) > 0:
                     actions = [] if tile.get("watered_today") else [["WATER"]]
-                    expiry = tile.get("max_lifespan_step")
-                    deadline = expiry if expiry is not None and expiry <= (day + 1) * 24 else None
                     tasks.append(Task(position, actions + [["HARVEST"]], urgent=True,
-                                      sells=Counter({crop: tile["yield_units"]}), deadline=deadline))
+                                      sells=Counter({crop: tile["yield_units"]}), mandatory=True))
                 elif tile.get("consecutive_unwatered", 0) >= 1 and not tile.get("watered_today"):
                     tasks.append(Task(position, [["WATER"]], urgent=True))
                 elif cycle_finished(crop, day - tile["planted_day"], tile):
@@ -231,15 +227,11 @@ def build_tasks(
             urgent = harvest_ready or feed_today or care_today
             if harvest_ready:
                 product = ENV_ANIMALS[live_animal]["product"]
-                tasks.append(
-                    Task(
-                        position,
-                        [["HARVEST"]],
-                        urgent=True,
-                        sells=Counter({product: tile["yield_units"]}),
-                        animal_harvest=True,
-                    )
-                )
+                # Keep all work at one producer in one daily task.  Splitting
+                # HARVEST from FEED/CARE allowed two workers to visit the same
+                # pen and made the runtime opportunistic override look useful.
+                actions.append(["HARVEST"])
+                sells[product] += tile["yield_units"]
             fed_from_refinance = False
             if tile.get("fed_today"):
                 if care_today and not tile.get("cared_today"):
@@ -399,37 +391,12 @@ def build_tasks(
                     ends_cycle,
                     immediate_drop,
                     refinance_feed,
-                    animal_harvest=False,
-                    deadline=(tile.get("max_lifespan_step") if ends_cycle and isinstance(tile, dict) else None),
+                    animal_harvest=bool(live_animal and harvest_ready),
                 )
             )
-    # Survival must fit independently of optional care, fertilizer or a new cycle.
-    survival_followups = set()
-    if not terminal and not prioritize_fertilizer_drop:
-        separated = []
-        for task in tasks:
-            tile = farm["tiles"][task.position[1]][task.position[0]]
-            survival = None
-            if isinstance(tile, dict):
-                if tile.get("kind") == "PLANT" and tile.get("consecutive_unwatered", 0) >= 1:
-                    survival = ["WATER"]
-                elif tile.get("animal") and tile.get("consecutive_unfed", 0) >= 1:
-                    survival = ["FEED"]
-            if survival in task.actions and len(task.actions) > 1:
-                needs = Counter(WHEAT=1) if survival == ["FEED"] else Counter()
-                separated.append(Task(task.position, [survival], needs=needs, urgent=True))
-                survival_followups.add(id(task))
-                task.actions.remove(survival)
-                task.needs -= needs
-                task.urgent = task.deadline is not None or task.animal_harvest
-            separated.append(task)
-        tasks = separated
     investment_values = {}
     for task in tasks:
         tile = farm["tiles"][task.position[1]][task.position[0]]
-        task.rescue = bool(id(task) not in survival_followups and isinstance(tile, dict) and tile.get("kind") == "PLANT"
-                           and tile.get("consecutive_unwatered", 0) >= 1
-                           and ["WATER"] in task.actions and not tile.get("watered_today"))
         if task.mandatory is None:
             capped_animal_output = bool(task.animal_harvest and animal_output_at_risk(tile, day))
             starving_animal = bool(
@@ -437,20 +404,15 @@ def build_tasks(
                 and tile.get("consecutive_unfed", 0) >= 1
                 and ["FEED"] in task.actions
             )
+            physical = isinstance(tile, dict) and bool(
+                tile.get("animal") or tile.get("kind") == "PLANT"
+            )
+            required_ops = {"WATER", "FERTILIZE", "HARVEST", "FEED", "CARE", "DIG"}
             task.mandatory = bool(
-                task.rescue or capped_animal_output or starving_animal
-                or task.deadline is not None
+                capped_animal_output or starving_animal
+                or (physical and any(op[0] in required_ops for op in task.actions))
             )
         task.value = 0.0 if task.mandatory else task_cash_value(obs, task, investment_values)
-        if prioritize_fertilizer_drop and not terminal:
-            task.mandatory = None
-            # The fixed opening already reserves scheduled irrigation. Runtime
-            # rescue_survival still enforces its physical deadline if that route slips.
-            target = targets.get(task.position)
-            if task.rescue and target and is_maintenance_day(
-                tile["crop"], day - tile["planted_day"], target[1]
-            ):
-                task.rescue = False
     if terminal:
         for task in tasks:
             task.terminal_day = True
@@ -544,6 +506,7 @@ def _animal_and_seed_demand(
         carried.update(inventory)
 
     seed_demand, animal_missing, live_animals = Counter(), Counter(), 0
+    terminal = day >= obs.get("_planning_end_day", SEASON_END_DAY)
     wheat_incoming = 0  # WHEAT today's tasks will harvest -- see purchase_orders
     for position in active_positions:
         target = targets.get(position)
@@ -551,7 +514,7 @@ def _animal_and_seed_demand(
         tile = farm["tiles"][y][x]
         if isinstance(tile, dict) and tile.get("animal"):
             name = tile["animal"]
-            if not tile.get("fed_today") and (
+            if not terminal and not tile.get("fed_today") and (
                 day - tile["placed_day"] <= animal_feed_end_age(
                     name, obs.get("_planning_end_day", SEASON_END_DAY) - tile["placed_day"])
                 or tile.get("consecutive_unfed", 0) >= 1
@@ -583,7 +546,7 @@ def _animal_and_seed_demand(
                 ):
                     seed_demand[name] += 1
         elif name in ANIMALS:
-            if can_start_today(name, obs):
+            if not terminal and can_start_today(name, obs):
                 animal_missing[name] += 1
     animal_slots = sum(animal_missing.values())
     for name in ANIMALS:
