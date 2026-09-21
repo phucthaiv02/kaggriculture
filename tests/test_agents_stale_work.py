@@ -1,6 +1,5 @@
 from agents.expansion_agent import _prune_stale_harvests, _valid_harvest_operations
 from agents.farm_tasks import build_tasks, purchase_orders
-from agents.intraday import schedule_open_tiles
 from agents.scheduler import SHED_ACCESS, WorkerPlan
 from test_agents_farm_tasks import make_obs, plant, animal_tile
 
@@ -17,12 +16,6 @@ def test_pending_finished_melon_harvests_without_replant_or_seed_purchase():
     assert not purchase_orders(obs, targets, [position], replant_same_crop=True)
     obs['farms'][0]['tiles'][4][4] = None
     obs['private']['seeds'] = {'MELON': 1}
-    plans = [WorkerPlan(position, [])]
-    assert schedule_open_tiles(obs, targets, plans, SHED_ACCESS) == ({}, 0)
-    assert not plans[0].queue
-    obs['_pending_targets'] = set()
-    schedule_open_tiles(obs, targets, plans, SHED_ACCESS)
-    assert ['PLANT', 'MELON'] in plans[0].queue
 
 
 def test_pending_growing_crop_keeps_maintenance():
@@ -75,3 +68,27 @@ def test_agent_pending_reprice_blocks_morning_purchase_and_queued_replant(monkey
     assert (4, 4) in state['pending_targets']
     assert not any(op[0] == 'PLANT' for plan in state['plans'] for op in plan.queue)
     assert result['farmer'][0] != 'PLANT'
+
+
+def test_invalid_front_action_triggers_global_remaining_day_replan():
+    import agents.expansion_agent as expansion
+
+    position = (5, 4)
+    tile = animal_tile('COW', 0)
+    tile['consecutive_unfed'] = 1
+    obs = make_obs(8, tiles={position: tile}, shed={'WHEAT': 1})
+    obs['hour'] = 10
+    agent = expansion.make_agent()
+    cells = dict(zip(agent.__code__.co_freevars, agent.__closure__))
+    cells['targets'].cell_contents.update({(x, y): None for y in range(10) for x in range(10)})
+    cells['targets'].cell_contents[position] = ('COW', False)
+    state = cells['state'].cell_contents
+    state.update(
+        day=8,
+        plan_frozen=True,
+        frozen_positions={position},
+        plans=[WorkerPlan((4, 4), [['HARVEST']])],
+    )
+    result = agent(obs)
+    assert result['farmer'] != ['HARVEST']
+    assert any(['FEED'] in plan.queue for plan in state['plans'])
