@@ -1,11 +1,10 @@
-"""Choose the highest marginal net profit after forecast market slippage."""
+"""Choose production targets from marginal market profit and capital cost."""
 from collections import Counter
 from copy import copy
 from dataclasses import dataclass
 
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
 from agents.forecast import MarketForecast, Production, production
-from agents.labor import LaborForecast
 from agents.schedules import CROP_LAST_AGE, ONGOING_CROPS, cycle_finished
 from agents.horizon import (
     SEASON_END_DAY, cycle_end as _cycle_end,
@@ -13,6 +12,21 @@ from agents.horizon import (
 )
 
 from agents.products import ANIMALS, ANIMAL_COST, CROPS, SEED_COST
+
+
+TARGET_OPTIONS = (1, 2, 3)
+TARGET_OPTION = 1
+TARGET_DISCOUNT = 0.97
+TARGET_ROI_CAPITAL_FLOOR = 100.0
+
+
+def set_target_option(option):
+    """Select the target ranking formula used by plan_targets."""
+    global TARGET_OPTION
+    option = int(option)
+    if option not in TARGET_OPTIONS:
+        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")
+    TARGET_OPTION = option
 
 
 def _rotation(name, fertilize, day, end_day, tile=None):
@@ -51,27 +65,53 @@ class TargetProfit:
     output: Production
     market_cash: float
     capital_cost: float
-    labor_cost: float
+    labor_cost: float = 0.0
+    discounted_market_cash: float | None = None
 
     @property
     def profit(self):
-        """Single-cycle added cash, never divided by days, cost or tile share."""
-        return self.market_cash - self.capital_cost - self.labor_cost
+        """Marginal market cash minus target capital; labor is scheduler-owned."""
+        return self.market_cash - self.capital_cost
+
+    def score(self, option=None):
+        """Return one of the three benchmark target-ranking formulas."""
+        option = TARGET_OPTION if option is None else int(option)
+        if option == 1:
+            return self.profit
+        if option == 2:
+            market_cash = (
+                self.market_cash if self.discounted_market_cash is None
+                else self.discounted_market_cash
+            )
+            return market_cash - self.capital_cost
+        if option == 3:
+            return self.profit / max(self.capital_cost, TARGET_ROI_CAPITAL_FLOOR)
+        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")
 
 
-def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
-    """Compare every target over the same min(16, remaining days) horizon.
+def evaluate_targets(
+    market, baseline, candidates, labor=None, position=(4, 4), *, target_option=None
+):
+    """Compare targets over the same min(16, remaining days) horizon.
 
-    market_cash = change in all sales less feed/fertilizer purchases, after
-    per-unit slippage, existing production and SHOP/TOWN demand.
-    capital_cost = all seeds in the window or one animal purchase.
-    labor_cost = additional daily worker cost over the same horizon.
+    market_cash is the change in all sales less feed/fertilizer purchases after
+    per-unit slippage, existing production and SHOP/TOWN demand. capital_cost
+    is seed/replant or animal capital. Hire/labor cost is deliberately excluded
+    from target economics and remains the scheduler's responsibility.
+
+    ``labor`` and ``position`` remain accepted for compatibility with analysis
+    tools, but no labor forecast contributes to the score.
     """
-    labor = labor or LaborForecast()
+    del labor, position
+    option = TARGET_OPTION if target_option is None else int(target_option)
+    if option not in TARGET_OPTIONS:
+        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")
+
     results = []
     end = _cycle_end(market.day, market.end_day)
     scoped_market = copy(market)
     scoped_market.end_day = end
+
     def scoped(flow):
         result = Production()
         for field in ("sales", "inputs", "visits"):
@@ -79,28 +119,55 @@ def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4)):
                 (d, value) for d, value in getattr(flow, field).items()
                 if market.day <= d <= end)
         return result
+
     scoped_baseline = scoped(baseline)
-    prepared_labor = labor.prepare(scoped_baseline.visits)
-    baseline_cost = labor.prepared_cost(prepared_labor)
     baseline_value = scoped_market.value(scoped_baseline)
+    discounted_baseline_value = (
+        scoped_market.value(scoped_baseline, discount=TARGET_DISCOUNT)
+        if option == 2 else None
+    )
     for choice, output, cost in candidates:
         if market.day + _first_yield_age(choice[0]) > end:
             continue
         output = scoped(output)
+        combined = Production()
+        combined.add(scoped_baseline)
+        combined.add(output)
+        market_cash = scoped_market.value(combined) - baseline_value
+        discounted_market_cash = None
+        if option == 2:
+            discounted_market_cash = (
+                scoped_market.value(combined, discount=TARGET_DISCOUNT)
+                - discounted_baseline_value
+            )
         results.append(TargetProfit(
-            choice, output,
-            scoped_market.marginal_profit(scoped_baseline, output, 0, baseline_value),
-            cost, labor.marginal_cost(scoped_baseline, output, position, baseline_cost, prepared=prepared_labor),
+            choice,
+            output,
+            market_cash,
+            cost,
+            0.0,
+            discounted_market_cash,
         ))
     return results
 
 
-def _choose(market, baseline, candidates, counts, labor=None, position=(4, 4)):
-    profitable = [result for result in evaluate_targets(market, baseline, candidates, labor, position)
-                  if result.profit > 0]
-    if not profitable:
+def _choose(
+    market, baseline, candidates, counts, labor=None, position=(4, 4), *, target_option=None
+):
+    option = TARGET_OPTION if target_option is None else int(target_option)
+    scored = []
+    for result in evaluate_targets(
+        market, baseline, candidates, labor, position, target_option=option
+    ):
+        score = result.score(option)
+        if score > 0:
+            scored.append((score, result))
+    if not scored:
         return None, None
-    result = max(profitable, key=lambda r: (r.profit, -counts[r.choice[0]], r.choice))
+    _, result = max(
+        scored,
+        key=lambda item: (item[0], -counts[item[1].choice[0]], item[1].choice),
+    )
     return result.choice, result.output
 
 
@@ -112,17 +179,21 @@ def _score(name, end_day, day, inventory, wheat_price, committed_units, unlocked
     results = evaluate_targets(market, baseline, candidates)
     if not results:
         return None, False
-    best = max(results, key=lambda r: r.profit)
-    return best.profit, best.choice[1]
+    best = max(results, key=lambda r: r.score())
+    return best.score(), best.choice[1]
 
 
 def best_target(end_day, day, inventory, wheat_price, committed_units,
-                category_capital=None, total_capital=0, unlocked_shops=()):
+                category_capital=None, total_capital=0, unlocked_shops=(),
+                target_option=None):
     # Legacy arguments retained for callers; capital share no longer affects rank.
     market = MarketForecast(inventory, unlocked_shops, day, end_day)
     baseline = Production()
     baseline.sales[day].update(committed_units)
-    return _choose(market, baseline, list(_candidates(day, end_day)), Counter())[0]
+    return _choose(
+        market, baseline, list(_candidates(day, end_day)), Counter(),
+        target_option=target_option,
+    )[0]
 
 
 def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None, replan_positions=None):
@@ -213,8 +284,7 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
     market = MarketForecast(obs["market"]["inventory"], obs["town"]["unlocked_shops"],
                             day, end_day, obs.get("hour", 0), obs["market"].get("params"), external)
     candidates = list(_candidates(day, end_day))
-    labor = LaborForecast(tuple(p for p in shed_access if farm["tiles"][p[1]][p[0]] != "LOCKED"))
-    # Assign in a stable order near the shed, updating supply and labor after every pick.
+    # Assign in a stable order near the shed, updating supply after every pick.
     for position in replanning:
         x, y = position
         tile = farm["tiles"][y][x]
@@ -222,10 +292,10 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
         if isinstance(tile, dict) and tile.get("kind") in ("COOP", "PASTURE"):
             allowed = [c for c in candidates if c[0][0] in ANIMALS
                        and official_game.ANIMALS[c[0][0]]["structure"] == tile["kind"]]
-        choice, output = _choose(market, baseline, allowed, counts, labor, position)
+        choice, output = _choose(market, baseline, allowed, counts, position=position)
         targets[position] = choice
         if choice:
-            # Include this commitment's supply and labor in the shared window.
+            # Include this commitment's supply in the shared window.
             baseline.add(output, position)
             counts[choice[0]] += 1
     return pending
