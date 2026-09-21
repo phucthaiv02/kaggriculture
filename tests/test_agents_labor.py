@@ -28,21 +28,28 @@ def test_daily_hires_are_not_free_or_paid_only_once():
     assert labor.cost({0: busy, 1: busy}) == 2 * one
 
 
-def test_labor_cost_can_reverse_gross_profit_ranking():
+def test_target_ranking_does_not_use_labor_cost():
     class Revenue:
-        day, end_day = 0, 29
-        def value(self, _): return 0
-        def marginal_profit(self, baseline, output, cost, baseline_value):
-            return 100 if output.visits else 90
+        day, end_day = 0, 16
+        def value(self, flows, discount=1.0):
+            return sum(
+                (discount ** day) * sum(units.values())
+                for day, units in flows.sales.items()
+            )
+
     busy, light = Production(), Production()
-    # The farm already needs many workers. A daily-work producer adds
-    # costly marginal hires; the low-maintenance option fits existing labor.
-    baseline = Production()
-    for day in range(20):
-        baseline.visits[day] = [((x, y), 18, (), False) for x, y in ((4,4),(4,3),(3,4),(3,3),(4,2),(2,4))]
-        busy.visits[day] = [(None, 6, ('WHEAT',), True)]
-    choice, _ = _choose(Revenue(), baseline, [(('GOOSE',False),busy,300), (('MELON',False),light,80)], Counter())
-    assert choice[0] == 'MELON'
+    busy.sales[8]['MILK'] = 100
+    light.sales[10]['MELON'] = 90
+    # Busy has deliberately awful worker demand, but target selection now
+    # compares economics only. Scheduler admission owns this labor decision.
+    for day in range(16):
+        busy.visits[day] = [(None, 20, ('WHEAT',), True)]
+    choice, _ = _choose(
+        Revenue(), Production(),
+        [(('COW', False), busy, 0), (('MELON', False), light, 0)],
+        Counter(),
+    )
+    assert choice[0] == 'COW'
 
 
 def test_never_dig_live_animals_or_empty_animal_structures():
