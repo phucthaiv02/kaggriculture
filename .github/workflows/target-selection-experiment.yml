@@ -15,8 +15,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed: [1, 2]
-        variant: [o1, eps5, eps10, eps15, eps25]
+        seed: [3, 4, 5, 6]
+        variant: [o1, eps5]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -68,9 +68,8 @@ jobs:
                   return result.choice, result.output
               return choose
 
-          if variant != 'o1':
-              epsilon = {'eps5': 5.0, 'eps10': 10.0, 'eps15': 15.0, 'eps25': 25.0}[variant]
-              planner._choose = make_fast_choose(epsilon)
+          if variant == 'eps5':
+              planner._choose = make_fast_choose(5.0)
 
           result = run(
               opponent='public/A.ipynb',
