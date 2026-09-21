@@ -15,8 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed: [3, 5, 12]
-        margin: [0.25, 0.5, 1.0]
+        margin: [0.6, 0.7, 0.8, 0.9, 1.0]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -28,9 +27,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip >/dev/null
           python -m pip install --upgrade kaggle-environments pytest numpy matplotlib >/dev/null
-      - name: Compare switch margins
+      - name: Locate switch margin threshold
         env:
-          SEED: ${{ matrix.seed }}
           MARGIN: ${{ matrix.margin }}
         run: |
           python - <<'PY'
@@ -41,17 +39,16 @@ jobs:
           from agents import planner
           from experiments.play_match import run
 
-          seed = int(os.environ['SEED'])
           margin = float(os.environ['MARGIN'])
           planner.TARGET_SWITCH_MARGIN = margin
           result = run(
               opponent='public/A.ipynb',
-              seed=seed,
+              seed=12,
               output_dir=Path('ci-target-selection'),
               target_option=1,
           )
           print('TARGET_RESULT=' + json.dumps({
-              'seed': seed,
+              'seed': 12,
               'margin_setting': margin,
               'cash': result['current_cash'],
               'opponent_cash': result['opponent_cash'],
