@@ -185,7 +185,10 @@ def test_future_animal_target_does_not_buy_before_place_is_admitted(monkeypatch)
     targets.update({(x, y): None for y in range(10) for x in range(10)})
     position = (4, 4)
     targets[position] = ('COW', False)
-    obs = make_obs(10, tiles={position: plant('WHEAT', 9, 10, yield_units=1)})
+    obs = make_obs(
+        10,
+        tiles={position: plant('STRAWBERRY', 9, 10, yield_units=0)},
+    )
     obs['hour'] = 0
 
     result = agent(obs)
