@@ -18,6 +18,7 @@ TARGET_OPTIONS = (1, 2, 3)
 TARGET_OPTION = 1
 TARGET_DISCOUNT = 0.97
 TARGET_ROI_CAPITAL_FLOOR = 100.0
+TARGET_SWITCH_MARGIN = 1.0
 
 
 def set_target_option(option):
@@ -152,7 +153,8 @@ def evaluate_targets(
 
 
 def _choose(
-    market, baseline, candidates, counts, labor=None, position=(4, 4), *, target_option=None
+    market, baseline, candidates, counts, labor=None, position=(4, 4), *,
+    target_option=None, current=None
 ):
     option = TARGET_OPTION if target_option is None else int(target_option)
     scored = []
@@ -164,10 +166,16 @@ def _choose(
             scored.append((score, result))
     if not scored:
         return None, None
-    _, result = max(
+    best_score, result = max(
         scored,
         key=lambda item: (item[0], -counts[item[1].choice[0]], item[1].choice),
     )
+    if current is not None:
+        current_rows = [(score, row) for score, row in scored if row.choice == current]
+        if current_rows:
+            current_score, current_result = max(current_rows, key=lambda item: item[0])
+            if current_score >= best_score - TARGET_SWITCH_MARGIN:
+                result = current_result
     return result.choice, result.output
 
 
@@ -292,7 +300,10 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
         if isinstance(tile, dict) and tile.get("kind") in ("COOP", "PASTURE"):
             allowed = [c for c in candidates if c[0][0] in ANIMALS
                        and official_game.ANIMALS[c[0][0]]["structure"] == tile["kind"]]
-        choice, output = _choose(market, baseline, allowed, counts, position=position)
+        current = targets.get(position)
+        choice, output = _choose(
+            market, baseline, allowed, counts, position=position, current=current
+        )
         targets[position] = choice
         if choice:
             # Include this commitment's supply in the shared window.
