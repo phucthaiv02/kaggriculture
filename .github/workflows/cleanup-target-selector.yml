@@ -1,0 +1,80 @@
+name: Finalize validated target selector
+
+on:
+  push:
+    branches: [agent-v3]
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Keep only validated O1 target ranking
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('agents/planner.py')
+          s = p.read_text()
+
+          s = s.replace('''TARGET_OPTIONS = (1, 2, 3)\nTARGET_OPTION = 1\nTARGET_DISCOUNT = 0.97\nTARGET_ROI_CAPITAL_FLOOR = 100.0\nTARGET_SWITCH_MARGIN = 1.0\n\n\ndef set_target_option(option):\n    """Select the target ranking formula used by plan_targets."""\n    global TARGET_OPTION\n    option = int(option)\n    if option not in TARGET_OPTIONS:\n        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")\n    TARGET_OPTION = option\n''', '''TARGET_SWITCH_MARGIN = 1.0\n''')
+
+          old = '''@dataclass(frozen=True)\nclass TargetProfit:\n    choice: tuple\n    output: Production\n    market_cash: float\n    capital_cost: float\n    labor_cost: float = 0.0\n    discounted_market_cash: float | None = None\n\n    @property\n    def profit(self):\n        """Marginal market cash minus target capital; labor is scheduler-owned."""\n        return self.market_cash - self.capital_cost\n\n    def score(self, option=None):\n        """Return one of the three benchmark target-ranking formulas."""\n        option = TARGET_OPTION if option is None else int(option)\n        if option == 1:\n            return self.profit\n        if option == 2:\n            market_cash = (\n                self.market_cash if self.discounted_market_cash is None\n                else self.discounted_market_cash\n            )\n            return market_cash - self.capital_cost\n        if option == 3:\n            return self.profit / max(self.capital_cost, TARGET_ROI_CAPITAL_FLOOR)\n        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")\n'''
+          new = '''@dataclass(frozen=True)\nclass TargetProfit:\n    choice: tuple\n    output: Production\n    market_cash: float\n    capital_cost: float\n    labor_cost: float = 0.0\n\n    @property\n    def profit(self):\n        """Marginal market cash minus target capital; labor is scheduler-owned."""\n        return self.market_cash - self.capital_cost\n'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          s = s.replace('''def evaluate_targets(\n    market, baseline, candidates, labor=None, position=(4, 4), *, target_option=None\n):''', '''def evaluate_targets(\n    market, baseline, candidates, labor=None, position=(4, 4)\n):''', 1)
+          s = s.replace('''    del labor, position\n    option = TARGET_OPTION if target_option is None else int(target_option)\n    if option not in TARGET_OPTIONS:\n        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")\n\n    results = []\n''', '''    del labor, position\n    results = []\n''', 1)
+          s = s.replace('''    discounted_baseline_value = (\n        scoped_market.value(scoped_baseline, discount=TARGET_DISCOUNT)\n        if option == 2 else None\n    )\n''', '', 1)
+          s = s.replace('''        discounted_market_cash = None\n        if option == 2:\n            discounted_market_cash = (\n                scoped_market.value(combined, discount=TARGET_DISCOUNT)\n                - discounted_baseline_value\n            )\n        results.append(TargetProfit(\n            choice,\n            output,\n            market_cash,\n            cost,\n            0.0,\n            discounted_market_cash,\n        ))\n''', '''        results.append(TargetProfit(choice, output, market_cash, cost, 0.0))\n''', 1)
+
+          old = '''def _choose(\n    market, baseline, candidates, counts, labor=None, position=(4, 4), *,\n    target_option=None, current=None\n):\n    option = TARGET_OPTION if target_option is None else int(target_option)\n    scored = []\n    for result in evaluate_targets(\n        market, baseline, candidates, labor, position, target_option=option\n    ):\n        score = result.score(option)\n        if score > 0:\n            scored.append((score, result))\n'''
+          new = '''def _choose(\n    market, baseline, candidates, counts, labor=None, position=(4, 4), *, current=None\n):\n    scored = []\n    for result in evaluate_targets(market, baseline, candidates, labor, position):\n        score = result.profit\n        if score > 0:\n            scored.append((score, result))\n'''
+          assert old in s
+          s = s.replace(old, new, 1)
+          s = s.replace('''    best = max(results, key=lambda r: r.score())\n    return best.score(), best.choice[1]\n''', '''    best = max(results, key=lambda r: r.profit)\n    return best.profit, best.choice[1]\n''', 1)
+          s = s.replace('''def best_target(end_day, day, inventory, wheat_price, committed_units,\n                category_capital=None, total_capital=0, unlocked_shops=(),\n                target_option=None):''', '''def best_target(end_day, day, inventory, wheat_price, committed_units,\n                category_capital=None, total_capital=0, unlocked_shops=()):''', 1)
+          s = s.replace('''    return _choose(\n        market, baseline, list(_candidates(day, end_day)), Counter(),\n        target_option=target_option,\n    )[0]\n''', '''    return _choose(\n        market, baseline, list(_candidates(day, end_day)), Counter()\n    )[0]\n''', 1)
+          p.write_text(s)
+
+          p = Path('experiments/play_match.py')
+          s = p.read_text()
+          s = s.replace('from agents.planner import set_target_option\n', '')
+          s = s.replace('def run(opponent="pass", seed=1, output_dir=None, target_option=1):\n    target_option = int(target_option)\n    set_target_option(target_option)\n', 'def run(opponent="pass", seed=1, output_dir=None):\n')
+          s = s.replace('''    run_dir = output_dir / (\n        f"current_vs_{_slug(opponent_name)}_seed{seed}_target{target_option}_{_timestamp()}"\n    )\n''', '''    run_dir = output_dir / (\n        f"current_vs_{_slug(opponent_name)}_seed{seed}_{_timestamp()}"\n    )\n''')
+          s = s.replace('        "target_option": target_option,\n', '')
+          block = '''    parser.add_argument(\n        "--target-option",\n        type=int,\n        choices=(1, 2, 3),\n        default=1,\n        help=(\n            "target ranking: 1=absolute marginal profit, "\n            "2=discounted cash (gamma=0.97), 3=profit/capital (floor=100)"\n        ),\n    )\n'''
+          assert block in s
+          s = s.replace(block, '')
+          s = s.replace('    run(args.opponent, args.seed, args.output_dir, args.target_option)\n', '    run(args.opponent, args.seed, args.output_dir)\n')
+          p.write_text(s)
+          PY
+      - name: Verify rejected target variants are gone
+        run: |
+          ! git grep -nE 'TARGET_OPTIONS|TARGET_OPTION|TARGET_DISCOUNT|TARGET_ROI_CAPITAL_FLOOR|set_target_option|target_option|--target-option|target_sequence|choose_sequence' -- ':!*.ipynb'
+          python -m py_compile agents/planner.py experiments/play_match.py
+      - name: Install test dependency
+        run: python -m pip install kaggle-environments==1.32.7
+      - name: Run planner tests
+        run: pytest -q tests/test_agents_planner.py
+      - name: Commit cleaned selector and remove this workflow
+        run: |
+          git rm .github/workflows/cleanup-target-selector.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add agents/planner.py experiments/play_match.py
+          git commit -m 'targeting: keep only validated O1 sticky selector'
+          git push origin HEAD:agent-v3
