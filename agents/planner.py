@@ -14,20 +14,7 @@ from agents.horizon import (
 from agents.products import ANIMALS, ANIMAL_COST, CROPS, SEED_COST
 
 
-TARGET_OPTIONS = (1, 2, 3)
-TARGET_OPTION = 1
-TARGET_DISCOUNT = 0.97
-TARGET_ROI_CAPITAL_FLOOR = 100.0
 TARGET_SWITCH_MARGIN = 1.0
-
-
-def set_target_option(option):
-    """Select the target ranking formula used by plan_targets."""
-    global TARGET_OPTION
-    option = int(option)
-    if option not in TARGET_OPTIONS:
-        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")
-    TARGET_OPTION = option
 
 
 def _rotation(name, fertilize, day, end_day, tile=None):
@@ -67,31 +54,15 @@ class TargetProfit:
     market_cash: float
     capital_cost: float
     labor_cost: float = 0.0
-    discounted_market_cash: float | None = None
 
     @property
     def profit(self):
         """Marginal market cash minus target capital; labor is scheduler-owned."""
         return self.market_cash - self.capital_cost
 
-    def score(self, option=None):
-        """Return one of the three benchmark target-ranking formulas."""
-        option = TARGET_OPTION if option is None else int(option)
-        if option == 1:
-            return self.profit
-        if option == 2:
-            market_cash = (
-                self.market_cash if self.discounted_market_cash is None
-                else self.discounted_market_cash
-            )
-            return market_cash - self.capital_cost
-        if option == 3:
-            return self.profit / max(self.capital_cost, TARGET_ROI_CAPITAL_FLOOR)
-        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")
-
 
 def evaluate_targets(
-    market, baseline, candidates, labor=None, position=(4, 4), *, target_option=None
+    market, baseline, candidates, labor=None, position=(4, 4)
 ):
     """Compare targets over the same min(16, remaining days) horizon.
 
@@ -104,10 +75,6 @@ def evaluate_targets(
     tools, but no labor forecast contributes to the score.
     """
     del labor, position
-    option = TARGET_OPTION if target_option is None else int(target_option)
-    if option not in TARGET_OPTIONS:
-        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")
-
     results = []
     end = _cycle_end(market.day, market.end_day)
     scoped_market = copy(market)
@@ -123,10 +90,6 @@ def evaluate_targets(
 
     scoped_baseline = scoped(baseline)
     baseline_value = scoped_market.value(scoped_baseline)
-    discounted_baseline_value = (
-        scoped_market.value(scoped_baseline, discount=TARGET_DISCOUNT)
-        if option == 2 else None
-    )
     for choice, output, cost in candidates:
         if market.day + _first_yield_age(choice[0]) > end:
             continue
@@ -135,33 +98,16 @@ def evaluate_targets(
         combined.add(scoped_baseline)
         combined.add(output)
         market_cash = scoped_market.value(combined) - baseline_value
-        discounted_market_cash = None
-        if option == 2:
-            discounted_market_cash = (
-                scoped_market.value(combined, discount=TARGET_DISCOUNT)
-                - discounted_baseline_value
-            )
-        results.append(TargetProfit(
-            choice,
-            output,
-            market_cash,
-            cost,
-            0.0,
-            discounted_market_cash,
-        ))
+        results.append(TargetProfit(choice, output, market_cash, cost, 0.0))
     return results
 
 
 def _choose(
-    market, baseline, candidates, counts, labor=None, position=(4, 4), *,
-    target_option=None, current=None
+    market, baseline, candidates, counts, labor=None, position=(4, 4), *, current=None
 ):
-    option = TARGET_OPTION if target_option is None else int(target_option)
     scored = []
-    for result in evaluate_targets(
-        market, baseline, candidates, labor, position, target_option=option
-    ):
-        score = result.score(option)
+    for result in evaluate_targets(market, baseline, candidates, labor, position):
+        score = result.profit
         if score > 0:
             scored.append((score, result))
     if not scored:
@@ -187,20 +133,18 @@ def _score(name, end_day, day, inventory, wheat_price, committed_units, unlocked
     results = evaluate_targets(market, baseline, candidates)
     if not results:
         return None, False
-    best = max(results, key=lambda r: r.score())
-    return best.score(), best.choice[1]
+    best = max(results, key=lambda r: r.profit)
+    return best.profit, best.choice[1]
 
 
 def best_target(end_day, day, inventory, wheat_price, committed_units,
-                category_capital=None, total_capital=0, unlocked_shops=(),
-                target_option=None):
+                category_capital=None, total_capital=0, unlocked_shops=()):
     # Legacy arguments retained for callers; capital share no longer affects rank.
     market = MarketForecast(inventory, unlocked_shops, day, end_day)
     baseline = Production()
     baseline.sales[day].update(committed_units)
     return _choose(
-        market, baseline, list(_candidates(day, end_day)), Counter(),
-        target_option=target_option,
+        market, baseline, list(_candidates(day, end_day)), Counter()
     )[0]
 
 

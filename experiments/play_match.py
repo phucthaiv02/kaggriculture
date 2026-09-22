@@ -13,7 +13,6 @@ from pathlib import Path
 from kaggle_environments import make
 
 from agents.expansion_agent import make_agent
-from agents.planner import set_target_option
 from experiments.crop_schedules import pass_agent
 
 
@@ -95,9 +94,7 @@ def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def run(opponent="pass", seed=1, output_dir=None, target_option=1):
-    target_option = int(target_option)
-    set_target_option(target_option)
+def run(opponent="pass", seed=1, output_dir=None):
     opponent_agent, opponent_name, opponent_meta = resolve_opponent(str(opponent))
     current = make_agent(END_DAY - 1, seed=seed)
 
@@ -109,7 +106,7 @@ def run(opponent="pass", seed=1, output_dir=None, target_option=1):
 
     final = env.steps[-1]
     run_dir = output_dir / (
-        f"current_vs_{_slug(opponent_name)}_seed{seed}_target{target_option}_{_timestamp()}"
+        f"current_vs_{_slug(opponent_name)}_seed{seed}_{_timestamp()}"
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     html_path = run_dir / "replay.html"
@@ -126,7 +123,6 @@ def run(opponent="pass", seed=1, output_dir=None, target_option=1):
     opponent_cash = float(final[1].reward)
     result = {
         "seed": seed,
-        "target_option": target_option,
         "opponent": opponent_name,
         "current_cash": current_cash,
         "opponent_cash": opponent_cash,
@@ -156,19 +152,9 @@ def main():
         help="pass, random, or a path to a .py/.ipynb agent (default: pass)",
     )
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument(
-        "--target-option",
-        type=int,
-        choices=(1, 2, 3),
-        default=1,
-        help=(
-            "target ranking: 1=absolute marginal profit, "
-            "2=discounted cash (gamma=0.97), 3=profit/capital (floor=100)"
-        ),
-    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     args = parser.parse_args()
-    run(args.opponent, args.seed, args.output_dir, args.target_option)
+    run(args.opponent, args.seed, args.output_dir)
 
 
 if __name__ == "__main__":
