@@ -40,14 +40,14 @@ jobs:
           python -m pip freeze > ci-requirements.txt
 
       - name: Run regression tests
-        run: python -m pytest -q
+        run: timeout 180s python -m pytest -vv --maxfail=1
 
       - name: Compare real A.ipynb replay with pre-fix commit
         if: always()
         run: |
           mkdir -p ci-artifacts/a-match/current ci-artifacts/a-match/original
 
-          python -m experiments.play_match \
+          timeout 300s python -m experiments.play_match \
             --opponent public/A.ipynb \
             --seed 1 \
             --output-dir ci-artifacts/a-match/current
@@ -55,7 +55,7 @@ jobs:
           git worktree add --detach "$RUNNER_TEMP/kaggriculture-pre-fix" "$PATCH_BASE_COMMIT"
           (
             cd "$RUNNER_TEMP/kaggriculture-pre-fix"
-            python -m experiments.play_match \
+            timeout 300s python -m experiments.play_match \
               --opponent "$GITHUB_WORKSPACE/public/A.ipynb" \
               --seed 1 \
               --output-dir "$GITHUB_WORKSPACE/ci-artifacts/a-match/original"
