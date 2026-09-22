@@ -94,13 +94,12 @@ def test_buy_then_sell_round_trip_matches_engine():
     ({'WHEAT': -20}, {'WHEAT': 35}),
     ({'WHEAT': 35}, {'WHEAT': -20}),
     ({'WHEAT': -20}, {'WHEAT': -35}),
-    ({'WHEAT': 5, 'MELON': 80}, {'MELON': 15}),
     ({'MELON': 80}, {}),
     ({}, {'MELON': 80}),
 ])
 @pytest.mark.parametrize('stock', [-100, game.MARKET_I0, 100000])
 @pytest.mark.parametrize('custom_params', [False, True])
-def test_simultaneous_forecast_matches_engine(own, rival, stock, custom_params):
+def test_same_product_simultaneous_forecast_matches_engine(own, rival, stock, custom_params):
     params = deepcopy(game.MARKET_PARAMS) if custom_params else None
     if params:
         for values in params.values():
@@ -124,34 +123,65 @@ def test_simultaneous_forecast_matches_engine(own, rival, stock, custom_params):
     assert stocks == state[0].observation.market['inventory']
 
 
+def test_unrelated_product_flow_does_not_change_marginal_value():
+    inventory = {p: game.MARKET_I0 for p in game.PRODUCTS}
+    unrelated, target = game.PRODUCTS[:2]
+    external = Production()
+    external.sales[0][target] = 80
+    candidate = Production()
+    candidate.sales[0][target] = 40
+    unrelated_baseline = Production()
+    unrelated_baseline.sales[0][unrelated] = 5
+    market = MarketForecast(inventory, (), 0, 0, external=external)
+    assert market.marginal_profit(unrelated_baseline, candidate, 0) == market.marginal_profit(
+        Production(), candidate, 0
+    )
+
+
 @pytest.mark.parametrize('hour', [0, 3, 4, 23])
-def test_daily_cash_matches_engine_demand_and_settlement(hour):
-    # Replay the forecast's explicit convention: net inputs with own output,
-    # settle both players' order queues together at hour 23.
+def test_daily_cash_matches_engine_demand_and_same_product_settlement(hour):
+    # Replay every intraday shop/town tick, then settle one product at hour 23.
     shop = next(iter(game.SHOPS))
     shops = [shop, shop]  # Duplicate shops consume independently.
+    product = next(iter(game.SHOPS[shop]))
     inventory = {p: -5 for p in game.PRODUCTS}
     flow, external = Production(), Production()
-    flow.sales[2].update(WHEAT=5, MELON=80)
-    flow.inputs[2].update(WHEAT=12, FERTILIZER=3)
-    flow.sales[3].update(WHEAT=20, MELON=10)
-    external.sales[2]['MELON'] = 15
+    flow.sales[2][product] = 5
+    flow.sales[3][product] = 20
+    external.sales[2][product] = 15
     state, env = engine_market(inventory, shops=shops)
     expected = 0
     for step in range(2 * 24 + hour, 4 * 24):
         day = step // 24
         if step % 24 == 23:
             queues = []
-            for flows in (flow, external):
-                orders = []
-                for product in game.PRODUCTS:
-                    amount = flows.sales[day][product] - flows.inputs[day][product]
-                    if amount:
-                        orders.append(['SELL' if amount > 0 else 'BUY_PRODUCT', product, abs(amount)])
-                queues.append(orders)
+            for production_flow in (flow, external):
+                amount = (
+                    production_flow.sales[day][product]
+                    - production_flow.inputs[day][product]
+                )
+                queues.append(
+                    [['SELL' if amount > 0 else 'BUY_PRODUCT', product, abs(amount)]]
+                    if amount else []
+                )
             expected += settle(state, env, *queues)
         game._town_consume(env, state, step)
     assert MarketForecast(inventory, shops, 2, 3, hour, external=external).value(flow) == expected
+
+
+def test_shop_demand_applies_all_intraday_ticks_before_daily_settlement():
+    shop = next(iter(game.SHOPS))
+    products = game.SHOPS[shop]
+    product = next(iter(products))
+    per_tick = 2 if len(products) == 1 else 1
+    inventory = {p: game.MARKET_I0 for p in game.PRODUCTS}
+    adjusted = dict(inventory)
+    adjusted[product] -= per_tick * 6  # default: one shop tick every 4 turns
+    flow = Production()
+    flow.sales[0][product] = 1
+    assert MarketForecast(inventory, [shop], 0, 0).value(flow) == MarketForecast(
+        adjusted, (), 0, 0
+    ).value(flow)
 
 
 def test_marginal_profit_matches_two_engine_portfolios():
@@ -188,6 +218,28 @@ def test_late_supply_does_not_depress_an_earlier_harvest():
     assert with_late_rival.value(candidate) == without_rival.value(candidate)
 
 
+def test_earlier_rival_supply_depresses_later_same_product_harvest():
+    inventory = {p: game.MARKET_I0 for p in game.PRODUCTS}
+    candidate = Production()
+    candidate.sales[12]['WHEAT'] = 6
+    earlier = Production()
+    earlier.sales[10]['WHEAT'] = 100
+    with_earlier_rival = MarketForecast(inventory, (), 10, 12, external=earlier)
+    without_rival = MarketForecast(inventory, (), 10, 12)
+    assert with_earlier_rival.value(candidate) < without_rival.value(candidate)
+
+
+def test_earlier_unrelated_rival_supply_does_not_change_later_harvest():
+    inventory = {p: game.MARKET_I0 for p in game.PRODUCTS}
+    candidate = Production()
+    candidate.sales[12]['WHEAT'] = 6
+    earlier = Production()
+    earlier.sales[10]['CARROT'] = 100
+    with_earlier_rival = MarketForecast(inventory, (), 10, 12, external=earlier)
+    without_rival = MarketForecast(inventory, (), 10, 12)
+    assert with_earlier_rival.value(candidate) == without_rival.value(candidate)
+
+
 def test_extra_supply_accounts_for_price_impact_on_existing_crop():
     inventory = {p: game.MARKET_I0 for p in game.PRODUCTS}
     market = MarketForecast(inventory, (), 0, 10)
@@ -196,6 +248,7 @@ def test_extra_supply_accounts_for_price_impact_on_existing_crop():
     candidate = Production()
     candidate.sales[10]['MELON'] = 6
     assert market.marginal_profit(baseline, candidate, 80) < market.marginal_profit(Production(), candidate, 80)
+
 
 @pytest.mark.parametrize('custom_params', [False, True])
 def test_sale_budget_matches_engine_for_repeated_orders(custom_params):
