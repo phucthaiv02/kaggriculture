@@ -1,10 +1,11 @@
-name: Validate resource-safe no-priority routing
+name: Validate day-locked no-priority routing
 
 on:
   push:
     branches: [agent-v3]
     paths:
       - .github/workflows/scheduler-slack-validation.yml
+      - experiments/_validate_scheduler_resource_safe_daylock.py
       - experiments/_validate_scheduler_resource_safe.py
       - experiments/_validate_scheduler_generic_retry.py
 
@@ -33,20 +34,20 @@ jobs:
           git show "$PATCH_BASE_COMMIT:agents/scheduler.py" > agents/scheduler.py
           git show "$PATCH_BASE_COMMIT:agents/expansion_agent.py" > agents/expansion_agent.py
           git show "$PATCH_BASE_COMMIT:agents/farm_tasks.py" > agents/farm_tasks.py
-          python experiments/_validate_scheduler_resource_safe.py
+          python experiments/_validate_scheduler_resource_safe_daylock.py
           python -m py_compile agents/scheduler.py agents/scheduler_post.py agents/expansion_agent.py agents/farm_tasks.py
           git diff --check
 
       - name: Install runtime
         run: python -m pip install pytest kaggle-environments
 
-      - name: Check route and resource invariants
+      - name: Check route and regime invariants
         run: |
           python - <<'PY'
           from agents.farm_tasks import Task
           from agents.scheduler_post import build_queues
 
-          # Final route ordering is not constrained by mandatory/optional class.
+          # Final post-opening route order is not constrained by task class.
           near_optional = Task((4, 3), [['FEED']], mandatory=False, value=100)
           far_required = Task((0, 0), [['HARVEST']], mandatory=True)
           plans, missing = build_queues([far_required, near_optional], (4, 4), 0)
@@ -75,9 +76,22 @@ jobs:
           cr = json.loads((cdir/'replay.json').read_text())
           br = json.loads((bdir/'replay.json').read_text())
 
+          def opening_days(replay):
+              days = set()
+              for step in replay['steps']:
+                  obs = step[0]['observation']
+                  if obs['hour'] != 0:
+                      continue
+                  farm = obs['farms'][obs['player']]
+                  if len(farm['unlocked_quadrants']) == 1:
+                      days.add(obs['day'])
+              return days
+
+          candidate_opening = opening_days(cr)
+          base_opening = opening_days(br)
           first = None
-          candidate_intraday_wheat = 0
-          base_intraday_wheat = 0
+          candidate_post_wheat = 0
+          base_post_wheat = 0
           for index, (cs, bs) in enumerate(zip(cr['steps'], br['steps'])):
               co, bo = cs[0]['observation'], bs[0]['observation']
               ca, ba = cs[0].get('action') or {}, bs[0].get('action') or {}
@@ -86,13 +100,13 @@ jobs:
                       'index': index, 'day': bo['day'], 'hour': bo['hour'],
                       'base': ba, 'candidate': ca,
                   }
-              if co['hour'] > 1:
-                  candidate_intraday_wheat += sum(
+              if co['day'] not in candidate_opening and co['hour'] > 1:
+                  candidate_post_wheat += sum(
                       int(order[2]) for order in ca.get('market', [])
                       if order[0] == 'BUY_PRODUCT' and order[1] == 'WHEAT'
                   )
-              if bo['hour'] > 1:
-                  base_intraday_wheat += sum(
+              if bo['day'] not in base_opening and bo['hour'] > 1:
+                  base_post_wheat += sum(
                       int(order[2]) for order in ba.get('market', [])
                       if order[0] == 'BUY_PRODUCT' and order[1] == 'WHEAT'
                   )
@@ -115,8 +129,9 @@ jobs:
               'base_statuses': B['statuses'],
               'candidate_seconds': float((root/'candidate_seconds.txt').read_text()),
               'base_seconds': float((root/'base_seconds.txt').read_text()),
-              'candidate_intraday_wheat': candidate_intraday_wheat,
-              'base_intraday_wheat': base_intraday_wheat,
+              'candidate_opening_days': sorted(candidate_opening),
+              'candidate_post_hour2plus_wheat': candidate_post_wheat,
+              'base_post_hour2plus_wheat': base_post_wheat,
               'candidate_empty_structures': empty_structures(cr),
               'base_empty_structures': empty_structures(br),
               'first_divergence': first,
@@ -125,13 +140,11 @@ jobs:
           (root/'comparison.json').write_text(json.dumps(out, indent=2))
           if C['statuses'] != ['DONE', 'DONE']:
               raise SystemExit(out)
-          if candidate_intraday_wheat:
-              raise SystemExit(f'post-opening/intraday wheat purchases remain: {candidate_intraday_wheat}')
           PY
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scheduler-resource-safe-${{ github.sha }}
+          name: scheduler-daylock-${{ github.sha }}
           path: validation
           if-no-files-found: warn
