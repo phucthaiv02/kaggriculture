@@ -1,12 +1,11 @@
-name: Validate split opening/post scheduler
+name: Scheduler priority ablation
 
 on:
   push:
     branches: [agent-v3]
     paths:
       - .github/workflows/scheduler-slack-validation.yml
-      - experiments/_validate_scheduler_surgical.py
-      - experiments/_validate_scheduler_split_mode.py
+      - experiments/_validate_scheduler_ablation.py
 
 permissions:
   contents: read
@@ -17,7 +16,16 @@ env:
   PYTHONPATH: ${{ github.workspace }}
 
 jobs:
-  validate:
+  ablation:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - no_animal_rescue
+          - no_timesensitive_cost
+          - no_route_priority
+          - no_feed_order
+          - all_minimal
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -27,118 +35,48 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Apply surgical split scheduler candidate in runner only
+      - name: Apply one scheduler ablation in runner only
+        env:
+          SCHEDULER_ABLATION: ${{ matrix.variant }}
         run: |
           git show "$PATCH_BASE_COMMIT:agents/scheduler.py" > agents/scheduler.py
           git show "$PATCH_BASE_COMMIT:agents/expansion_agent.py" > agents/expansion_agent.py
-          python experiments/_validate_scheduler_split_mode.py
+          python experiments/_validate_scheduler_ablation.py
           python -m py_compile agents/scheduler.py agents/scheduler_post.py agents/expansion_agent.py
           git diff --check
-          grep -q 'def _priority' agents/scheduler.py
-          ! grep -q 'def _priority' agents/scheduler_post.py
-          ! grep -q 'def _rescue_priority' agents/scheduler_post.py
-          ! grep -q 'group_animal' agents/scheduler_post.py
-          ! grep -q 'planting and harvest are not delayed' agents/scheduler_post.py
-
-      - name: Install test/runtime dependencies
-        run: python -m pip install pytest kaggle-environments
-
-      - name: Run architecture-focused post-opening scheduler tests
+      - name: Install runtime
+        run: python -m pip install kaggle-environments
+      - name: Replay against A
+        env:
+          VARIANT: ${{ matrix.variant }}
         run: |
+          mkdir -p "validation/$VARIANT"
+          /usr/bin/time -f '%e' -o "validation/$VARIANT/seconds.txt" \
+            timeout 300s python -m experiments.play_match \
+              --opponent public/A.ipynb --seed 1 --output-dir "validation/$VARIANT"
           python - <<'PY'
-          from collections import Counter
-          from agents.farm_tasks import Task
-          from agents.scheduler_post import build_queues, hands_needed, SHED
-
-          required = Task((0, 0), [['WATER']] * 14, mandatory=True)
-          optional = Task((4, 4), [['HARVEST']] * 9, mandatory=False, value=999)
-          plans, missing = build_queues([optional, required], (4, 4), 0)
-          assert required not in missing
-          assert optional in missing
-
-          # Action labels do not determine route order.
-          near_feed = Task((4, 3), [['FEED']], mandatory=True)
-          far_harvest = Task((0, 0), [['HARVEST']], mandatory=True, animal_harvest=True)
-          plans, missing = build_queues([far_harvest, near_feed], (4, 4), 0)
-          assert not missing
-          assert plans[0].queue.index(['FEED']) < plans[0].queue.index(['HARVEST'])
-
-          # Marginal hire economics remains the legacy decision rule.
-          full = Task((4, 4), [['WATER']] * 23, mandatory=True)
-          extra = Task((4, 4), [['COLLECT_FERTILIZER']], mandatory=False, value=10)
-          assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[9]) == (1, [])
-          assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[11]) == (0, [extra])
-
-          # Pickup/budget accounting is unchanged.
-          task = Task((4, 3), [['WATER']], needs=Counter({'WHEAT': 1}))
-          filler = Task((4, 4), [['WATER']] * 23)
-          plans, missing = build_queues([filler, task], (4, 4), 1, hand_starts=((5, 4),))
-          assert not missing
-          assert plans[1].queue[:3] == [['PICKUP', 'WHEAT', 1], ['WEST'], ['NORTH']]
-          PY
-
-      - name: Replay split candidate and animal-fixed base against A
-        run: |
-          mkdir -p validation/candidate validation/base
-          /usr/bin/time -f '%e' -o validation/candidate_seconds.txt \
-            timeout 300s python -m experiments.play_match --opponent public/A.ipynb --seed 1 --output-dir validation/candidate
-          git worktree add --detach "$RUNNER_TEMP/animal-base" "$PATCH_BASE_COMMIT"
-          /usr/bin/time -f '%e' -o validation/base_seconds.txt \
-            bash -lc 'cd "$0" && PYTHONPATH="$0" timeout 300s python -m experiments.play_match --opponent "$1/public/A.ipynb" --seed 1 --output-dir "$1/validation/base"' "$RUNNER_TEMP/animal-base" "$GITHUB_WORKSPACE"
-          python - <<'PY'
-          import json
+          import json, os
           from pathlib import Path
-          root = Path('validation')
-          cdir = sorted((root/'candidate').glob('current_vs_A_seed1_*'))[-1]
-          bdir = sorted((root/'base').glob('current_vs_A_seed1_*'))[-1]
-          C = json.loads((cdir/'result.json').read_text())
-          B = json.loads((bdir/'result.json').read_text())
-
-          candidate_replay = json.loads((cdir/'replay.json').read_text())
-          base_replay = json.loads((bdir/'replay.json').read_text())
-          first = None
-          first_base_obs = None
-          for index, (candidate_step, base_step) in enumerate(zip(candidate_replay['steps'], base_replay['steps'])):
-              ca = candidate_step[0]['action']
-              ba = base_step[0]['action']
-              if ca != ba:
-                  obs = base_step[0]['observation']
-                  first_base_obs = obs
-                  first = {
-                      'index': index,
-                      'day': obs['day'],
-                      'hour': obs['hour'],
-                      'unlocked_quadrants': obs['farms'][obs['player']]['unlocked_quadrants'],
-                      'base': ba,
-                      'candidate': ca,
-                  }
-                  break
-
-          out = {
-              'candidate_cash': C['current_cash'],
-              'base_cash': B['current_cash'],
-              'delta': C['current_cash'] - B['current_cash'],
-              'candidate_statuses': C['statuses'],
-              'base_statuses': B['statuses'],
-              'candidate_seconds': float((root/'candidate_seconds.txt').read_text()),
-              'base_seconds': float((root/'base_seconds.txt').read_text()),
-              'first_divergence': first,
+          variant = os.environ['VARIANT']
+          root = Path('validation') / variant
+          out_dir = sorted(root.glob('current_vs_A_seed1_*'))[-1]
+          result = json.loads((out_dir / 'result.json').read_text())
+          summary = {
+              'variant': variant,
+              'cash': result['current_cash'],
+              'margin': result['margin'],
+              'statuses': result['statuses'],
+              'seconds': float((root / 'seconds.txt').read_text()),
+              'delta_vs_animal_fixed_91362': result['current_cash'] - 91362.0,
           }
-          print(json.dumps(out, indent=2))
-          (root/'comparison.json').write_text(json.dumps(out, indent=2))
-          if C['statuses'] != ['DONE', 'DONE']:
-              raise SystemExit(f"candidate statuses: {C['statuses']}")
-          # Opening is exactly the one-quadrant regime from opening_book.py.
-          if first_base_obs is not None:
-              farm = first_base_obs['farms'][first_base_obs['player']]
-              if len(farm['unlocked_quadrants']) == 1:
-                  raise SystemExit(f"opening diverged: {first}")
+          print(json.dumps(summary, indent=2))
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2))
+          if result['statuses'] != ['DONE', 'DONE']:
+              raise SystemExit(summary)
           PY
-
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scheduler-surgical-${{ github.sha }}
-          path: validation
+          name: scheduler-ablation-${{ matrix.variant }}-${{ github.sha }}
+          path: validation/${{ matrix.variant }}
           if-no-files-found: warn
