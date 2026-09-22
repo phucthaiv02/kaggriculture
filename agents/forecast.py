@@ -149,7 +149,57 @@ class MarketForecast:
             cash += (discount ** (when - self.day)) * daily_cash
         return cash
 
-    def _settle_day(self, stocks, flows, when):
+    def _value_products(self, flows, products):
+        """Value only the requested independent product markets.
+
+        Product-local settlement means a candidate cannot change cash in a
+        product it neither sells nor consumes.  Restricting valuation to the
+        touched products is therefore exactly equivalent to subtracting two
+        full-portfolio valuations, but much cheaper when many fertilizer event
+        plans are compared against the same baseline.
+        """
+        products = tuple(products)
+        if not products:
+            return 0.0
+        stocks = {product: self.inventory.get(product, 0) for product in products}
+        cash = 0.0
+        previous = self.day * 24 + self.hour - 1
+        for when in range(self.day, self.end_day + 1):
+            step = when * 24 + 23
+            shop_ticks = step // 4 - previous // 4
+            center_ticks = step // 24 - previous // 24
+            for product in products:
+                stocks[product] -= self.shop_demand[product] * shop_ticks
+                if product in self.center_products:
+                    stocks[product] -= center_ticks
+            previous = step
+            cash += self._settle_day(stocks, flows, when, products)
+        return cash
+
+    def marginal_value(self, baseline, candidate, baseline_values=None):
+        """Exact ``value(base + candidate) - value(base)`` on touched markets."""
+        touched = set()
+        for field in (candidate.sales, candidate.inputs):
+            for units in field.values():
+                touched.update(product for product, amount in units.items() if amount)
+        products = tuple(product for product in game.PRODUCTS if product in touched)
+        if not products:
+            return 0.0
+
+        key = products
+        if baseline_values is not None and key in baseline_values:
+            baseline_value = baseline_values[key]
+        else:
+            baseline_value = self._value_products(baseline, products)
+            if baseline_values is not None:
+                baseline_values[key] = baseline_value
+
+        combined = Production()
+        combined.add(baseline)
+        combined.add(candidate)
+        return self._value_products(combined, products) - baseline_value
+
+    def _settle_day(self, stocks, flows, when, products=None):
         """Settle daily market pressure independently for each product.
 
         The planner knows forecast product flows by day, not either player's
@@ -165,7 +215,7 @@ class MarketForecast:
         rival_inputs = self.external.inputs.get(when, {})
         cash = 0
 
-        for product in game.PRODUCTS:
+        for product in (game.PRODUCTS if products is None else products):
             own_amount = own_sales.get(product, 0) - own_inputs.get(product, 0)
             rival_amount = rival_sales.get(product, 0) - rival_inputs.get(product, 0)
             if not own_amount and not rival_amount:
@@ -194,9 +244,7 @@ class MarketForecast:
         return cash
 
     def marginal_profit(self, baseline, candidate, fixed_cost, baseline_value=None):
-        combined = Production()
-        combined.add(baseline)
-        combined.add(candidate)
-        if baseline_value is None:
-            baseline_value = self.value(baseline)
-        return self.value(combined) - baseline_value - fixed_cost
+        # baseline_value is retained for call compatibility; product-local
+        # marginal valuation is exact and avoids full-portfolio rescoring.
+        del baseline_value
+        return self.marginal_value(baseline, candidate) - fixed_cost
