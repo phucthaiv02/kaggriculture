@@ -5,13 +5,10 @@ legacy = Path("agents/scheduler.py")
 post = Path("agents/scheduler_post.py")
 post.write_text(legacy.read_text())
 
-patcher = Path("experiments/_validate_scheduler_no_priority.py").read_text()
-patcher = patcher.replace(
-    'Path("agents/scheduler.py")',
-    'Path("agents/scheduler_post.py")',
-    1,
-)
-exec(compile(patcher, "_validate_scheduler_no_priority.py", "exec"), {})
+# Remove only action-label ordering/rescue behavior. Keep the legacy packing,
+# head-count search, terminal accounting and route scoring otherwise intact.
+patcher = Path("experiments/_validate_scheduler_surgical.py").read_text()
+exec(compile(patcher, "_validate_scheduler_surgical.py", "exec"), {})
 
 # Expansion uses the legacy scheduler only while the opening controller governs.
 # Every post-opening call, including a global replan, routes through scheduler_post.
