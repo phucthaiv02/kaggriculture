@@ -1,11 +1,11 @@
-name: Validate admission-route separation
+name: Validate resource-safe no-priority routing
 
 on:
   push:
     branches: [agent-v3]
     paths:
       - .github/workflows/scheduler-slack-validation.yml
-      - experiments/_validate_scheduler_fixed_admission_route.py
+      - experiments/_validate_scheduler_resource_safe.py
       - experiments/_validate_scheduler_generic_retry.py
 
 permissions:
@@ -27,54 +27,111 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Apply admission-route split in runner only
+
+      - name: Apply candidate in runner only
         run: |
           git show "$PATCH_BASE_COMMIT:agents/scheduler.py" > agents/scheduler.py
           git show "$PATCH_BASE_COMMIT:agents/expansion_agent.py" > agents/expansion_agent.py
-          python experiments/_validate_scheduler_fixed_admission_route.py
-          python -m py_compile agents/scheduler.py agents/scheduler_post.py agents/expansion_agent.py
+          git show "$PATCH_BASE_COMMIT:agents/farm_tasks.py" > agents/farm_tasks.py
+          python experiments/_validate_scheduler_resource_safe.py
+          python -m py_compile agents/scheduler.py agents/scheduler_post.py agents/expansion_agent.py agents/farm_tasks.py
           git diff --check
+
       - name: Install runtime
-        run: python -m pip install kaggle-environments
-      - name: Check fixed workload routes ignore task class
+        run: python -m pip install pytest kaggle-environments
+
+      - name: Check route and resource invariants
         run: |
           python - <<'PY'
           from agents.farm_tasks import Task
           from agents.scheduler_post import build_queues
 
+          # Final route ordering is not constrained by mandatory/optional class.
           near_optional = Task((4, 3), [['FEED']], mandatory=False, value=100)
           far_required = Task((0, 0), [['HARVEST']], mandatory=True)
           plans, missing = build_queues([far_required, near_optional], (4, 4), 0)
           assert not missing
           assert plans[0].queue.index(['FEED']) < plans[0].queue.index(['HARVEST']), plans[0].queue
           PY
-      - name: Replay against A
+
+      - name: Replay candidate and stable base against A
         run: |
-          mkdir -p validation/fixed_admission_route
-          /usr/bin/time -f '%e' -o validation/fixed_admission_route/seconds.txt \
+          mkdir -p validation/candidate validation/base
+          /usr/bin/time -f '%e' -o validation/candidate_seconds.txt \
             timeout 300s python -m experiments.play_match \
-              --opponent public/A.ipynb --seed 1 --output-dir validation/fixed_admission_route
+              --opponent public/A.ipynb --seed 1 --output-dir validation/candidate
+          git worktree add --detach "$RUNNER_TEMP/base" "$PATCH_BASE_COMMIT"
+          /usr/bin/time -f '%e' -o validation/base_seconds.txt \
+            bash -lc 'cd "$0" && PYTHONPATH="$0" timeout 300s python -m experiments.play_match --opponent "$1/public/A.ipynb" --seed 1 --output-dir "$1/validation/base"' "$RUNNER_TEMP/base" "$GITHUB_WORKSPACE"
           python - <<'PY'
           import json
           from pathlib import Path
-          root = Path('validation/fixed_admission_route')
-          out_dir = sorted(root.glob('current_vs_A_seed1_*'))[-1]
-          result = json.loads((out_dir / 'result.json').read_text())
-          summary = {
-              'cash': result['current_cash'],
-              'margin': result['margin'],
-              'statuses': result['statuses'],
-              'seconds': float((root / 'seconds.txt').read_text()),
-              'delta_vs_animal_fixed_91362': result['current_cash'] - 91362.0,
+
+          root = Path('validation')
+          cdir = sorted((root/'candidate').glob('current_vs_A_seed1_*'))[-1]
+          bdir = sorted((root/'base').glob('current_vs_A_seed1_*'))[-1]
+          C = json.loads((cdir/'result.json').read_text())
+          B = json.loads((bdir/'result.json').read_text())
+          cr = json.loads((cdir/'replay.json').read_text())
+          br = json.loads((bdir/'replay.json').read_text())
+
+          first = None
+          candidate_intraday_wheat = 0
+          base_intraday_wheat = 0
+          for index, (cs, bs) in enumerate(zip(cr['steps'], br['steps'])):
+              co, bo = cs[0]['observation'], bs[0]['observation']
+              ca, ba = cs[0].get('action') or {}, bs[0].get('action') or {}
+              if first is None and ca != ba:
+                  first = {
+                      'index': index, 'day': bo['day'], 'hour': bo['hour'],
+                      'base': ba, 'candidate': ca,
+                  }
+              if co['hour'] > 1:
+                  candidate_intraday_wheat += sum(
+                      int(order[2]) for order in ca.get('market', [])
+                      if order[0] == 'BUY_PRODUCT' and order[1] == 'WHEAT'
+                  )
+              if bo['hour'] > 1:
+                  base_intraday_wheat += sum(
+                      int(order[2]) for order in ba.get('market', [])
+                      if order[0] == 'BUY_PRODUCT' and order[1] == 'WHEAT'
+                  )
+
+          def empty_structures(replay):
+              obs = replay['steps'][-1][0]['observation']
+              farm = obs['farms'][obs['player']]
+              return sum(
+                  1 for row in farm['tiles'] for tile in row
+                  if isinstance(tile, dict)
+                  and tile.get('kind') in ('COOP', 'PASTURE')
+                  and not tile.get('animal')
+              )
+
+          out = {
+              'candidate_cash': C['current_cash'],
+              'base_cash': B['current_cash'],
+              'delta': C['current_cash'] - B['current_cash'],
+              'candidate_statuses': C['statuses'],
+              'base_statuses': B['statuses'],
+              'candidate_seconds': float((root/'candidate_seconds.txt').read_text()),
+              'base_seconds': float((root/'base_seconds.txt').read_text()),
+              'candidate_intraday_wheat': candidate_intraday_wheat,
+              'base_intraday_wheat': base_intraday_wheat,
+              'candidate_empty_structures': empty_structures(cr),
+              'base_empty_structures': empty_structures(br),
+              'first_divergence': first,
           }
-          print(json.dumps(summary, indent=2))
-          (root / 'summary.json').write_text(json.dumps(summary, indent=2))
-          if result['statuses'] != ['DONE', 'DONE']:
-              raise SystemExit(summary)
+          print(json.dumps(out, indent=2))
+          (root/'comparison.json').write_text(json.dumps(out, indent=2))
+          if C['statuses'] != ['DONE', 'DONE']:
+              raise SystemExit(out)
+          if candidate_intraday_wheat:
+              raise SystemExit(f'post-opening/intraday wheat purchases remain: {candidate_intraday_wheat}')
           PY
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scheduler-fixed-admission-route-${{ github.sha }}
-          path: validation/fixed_admission_route
+          name: scheduler-resource-safe-${{ github.sha }}
+          path: validation
           if-no-files-found: warn
