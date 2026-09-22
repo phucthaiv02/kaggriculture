@@ -1,0 +1,105 @@
+name: Validate same-day turnover successors
+
+on:
+  push:
+    branches: [agent-v3]
+    paths:
+      - .github/workflows/turnover-replay-validation.yml
+
+permissions:
+  contents: read
+
+env:
+  PATCH_BASE_COMMIT: 9c81e171a80ce495491776649ce8a2f755bfb3ca
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Apply turnover candidate in runner only
+        run: |
+          git show "$PATCH_BASE_COMMIT:agents/expansion_agent.py" > agents/expansion_agent.py
+          python experiments/_validate_turnover_candidate.py
+          python -m py_compile agents/expansion_agent.py
+          git diff --check
+          git diff -- agents/expansion_agent.py
+      - name: Install Kaggriculture runtime
+        run: python -m pip install --upgrade kaggle-environments
+      - name: Run candidate and animal-fixed base against A.ipynb
+        run: |
+          mkdir -p validation/turnover validation/base
+          timeout 300s python -m experiments.play_match --opponent public/A.ipynb --seed 1 --output-dir validation/turnover
+          git worktree add --detach "$RUNNER_TEMP/animal-base" "$PATCH_BASE_COMMIT"
+          (cd "$RUNNER_TEMP/animal-base" && timeout 300s python -m experiments.play_match --opponent "$GITHUB_WORKSPACE/public/A.ipynb" --seed 1 --output-dir "$GITHUB_WORKSPACE/validation/base")
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('validation')
+          cdir = sorted((root/'turnover').glob('current_vs_A_seed1_*'))[-1]
+          bdir = sorted((root/'base').glob('current_vs_A_seed1_*'))[-1]
+          C = json.loads((cdir/'result.json').read_text())
+          B = json.loads((bdir/'result.json').read_text())
+
+          def turnover_stats(replay_path):
+              replay = json.loads(Path(replay_path).read_text())
+              observations = [step[0]['observation'] for step in replay['steps']]
+              freed = []
+              for i in range(len(observations)-1):
+                  a = observations[i]
+                  b = observations[i+1]
+                  ta = a['farms'][0]['tiles']
+                  tb = b['farms'][0]['tiles']
+                  for y in range(len(ta)):
+                      for x in range(len(ta[y])):
+                          before, after = ta[y][x], tb[y][x]
+                          if (isinstance(before, dict) and before.get('kind') == 'PLANT'
+                                  and after is None):
+                              freed.append((i+1, a['day'], (x, y)))
+              same_day = next_day = later = never = 0
+              for index, day, (x, y) in freed:
+                  found = None
+                  for j in range(index, len(observations)):
+                      tile = observations[j]['farms'][0]['tiles'][y][x]
+                      if tile is not None:
+                          found = observations[j]['day']
+                          break
+                  if found is None:
+                      never += 1
+                  elif found == day:
+                      same_day += 1
+                  elif found == day + 1:
+                      next_day += 1
+                  else:
+                      later += 1
+              return {
+                  'freed': len(freed), 'same_day': same_day,
+                  'next_day': next_day, 'later': later, 'never': never,
+              }
+
+          out = {
+              'candidate_cash': C['current_cash'],
+              'base_cash': B['current_cash'],
+              'delta': C['current_cash'] - B['current_cash'],
+              'candidate_statuses': C['statuses'],
+              'base_statuses': B['statuses'],
+              'candidate_turnover': turnover_stats(cdir/'replay.json'),
+              'base_turnover': turnover_stats(bdir/'replay.json'),
+          }
+          print(json.dumps(out, indent=2))
+          (root/'turnover-comparison.json').write_text(json.dumps(out, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: turnover-validation-${{ github.sha }}
+          path: validation
+          if-no-files-found: warn
