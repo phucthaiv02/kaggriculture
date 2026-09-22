@@ -8,7 +8,6 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import lru_cache
-from itertools import zip_longest
 
 from kaggle_environments.envs.kaggriculture import kaggriculture as game
 from agents.schedules import (
@@ -134,8 +133,10 @@ class MarketForecast:
         cash = 0.0
         previous = self.day * 24 + self.hour - 1
         for when in range(self.day, self.end_day + 1):
-            # Forecast delivery by the end of each harvest day. Today's held
-            # shed goods are also priced here, consistently in both scenarios.
+            # Forecast delivery by the end of each harvest day. Shops consume
+            # every 4 turns, so a full default day contributes six separate
+            # demand ticks before end-of-day settlement. Today's held shed
+            # goods are also priced here, consistently in both scenarios.
             step = when * 24 + 23
             shop_ticks = step // 4 - previous // 4
             center_ticks = step // 24 - previous // 24
@@ -149,36 +150,45 @@ class MarketForecast:
         return cash
 
     def _settle_day(self, stocks, flows, when):
-        # Daily flows have no observed order queue. Use PRODUCTS order for
-        # both players, netting harvested feed/fertilizer before trading.
-        queues = []
-        for production_flow in (flows, self.external):
-            sales = production_flow.sales.get(when, {})
-            inputs = production_flow.inputs.get(when, {})
-            queues.append([(p, sales.get(p, 0) - inputs.get(p, 0))
-                           for p in game.PRODUCTS
-                           if sales.get(p, 0) != inputs.get(p, 0)])
+        """Settle daily market pressure independently for each product.
+
+        The planner knows forecast product flows by day, not either player's
+        future market-order queue. Pairing different products by queue index
+        makes unrelated targets change each other's value. Instead, preserve
+        the stock path per product: same-product own/opponent units are quoted
+        simultaneously for that day's pressure, while different products are
+        completely independent.
+        """
+        own_sales = flows.sales.get(when, {})
+        own_inputs = flows.inputs.get(when, {})
+        rival_sales = self.external.sales.get(when, {})
+        rival_inputs = self.external.inputs.get(when, {})
         cash = 0
-        for orders in zip_longest(*queues):
-            if None in orders:
-                player = 0 if orders[0] is not None else 1
-                product, amount = orders[player]
-                delta, stocks[product] = self.trade(product, stocks.get(product, 0), amount)
-                if player == 0:
-                    cash += delta
+
+        for product in game.PRODUCTS:
+            own_amount = own_sales.get(product, 0) - own_inputs.get(product, 0)
+            rival_amount = rival_sales.get(product, 0) - rival_inputs.get(product, 0)
+            if not own_amount and not rival_amount:
                 continue
-            for unit in range(max(abs(order[1]) for order in orders if order)):
+
+            own_units = abs(own_amount)
+            rival_units = abs(rival_amount)
+            for unit in range(max(own_units, rival_units)):
+                stock = stocks.get(product, 0)
                 quoted = []
-                for player, order in enumerate(orders):
-                    if order is None or unit >= abs(order[1]):
-                        continue
-                    product, amount = order
-                    stock = stocks.get(product, 0)
-                    price = self.price(product, stock if amount > 0 else stock - 1)
-                    quoted.append((player, product, amount, price))
-                # Match the engine: quote both units before committing either.
-                for player, product, amount, price in quoted:
-                    stocks[product] = stocks.get(product, 0) + (int(price > 1) if amount > 0 else -1)
+                if unit < own_units:
+                    price = self.price(product, stock if own_amount > 0 else stock - 1)
+                    quoted.append((0, own_amount, price))
+                if unit < rival_units:
+                    price = self.price(product, stock if rival_amount > 0 else stock - 1)
+                    quoted.append((1, rival_amount, price))
+
+                # Same-product units for both players are quoted against the
+                # same pre-round stock, then committed together.
+                for player, amount, price in quoted:
+                    stocks[product] = stocks.get(product, 0) + (
+                        int(price > 1) if amount > 0 else -1
+                    )
                     if player == 0:
                         cash += price if amount > 0 else -price
         return cash
