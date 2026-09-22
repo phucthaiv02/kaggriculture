@@ -32,7 +32,21 @@ jobs:
           python -m py_compile agents/planner.py experiments/play_match.py
           trap 'rm -f agents/__init__.py' EXIT
           touch agents/__init__.py
-          pytest -q tests/test_agents_planner.py tests/test_agents_season_profit.py
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          root = str(Path.cwd())
+          sys.path.insert(0, root)
+          sys.modules.pop('agents', None)
+          import pytest
+          raise SystemExit(pytest.main([
+              '-q',
+              'tests/test_agents_planner.py',
+              'tests/test_agents_season_profit.py',
+          ]))
+          PY
       - name: Remove verification workflow
         run: |
           git rm .github/workflows/verify-target-selector.yml
