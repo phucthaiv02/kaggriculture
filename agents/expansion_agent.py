@@ -81,6 +81,30 @@ def _protect_animal_structures(farm, operations):
 
 BOARD_SIZE = 10
 MARKET_ORDER_CAP = 10
+
+
+def _pop_market_batch(queue, cap=MARKET_ORDER_CAP):
+    batch = list(queue[:cap])
+    del queue[:cap]
+    return batch
+
+
+def _strip_partial_animal_builds(tasks, opening_active=False):
+    """Post-opening, BUILD and PLACE are one atomic investment task."""
+    if opening_active:
+        return tasks
+    cleaned = []
+    for task in tasks:
+        operations = [operation[0] for operation in task.actions]
+        if any(op.startswith("BUILD_") for op in operations) and "PLACE" not in operations:
+            task.actions = [
+                operation for operation in task.actions
+                if not operation[0].startswith("BUILD_")
+            ]
+        if task.actions:
+            cleaned.append(task)
+    return cleaned
+
 # Bound expensive ROI work per morning while a persistent backlog guarantees
 # that every eligible tile is visited before the cycle restarts.
 TARGETS_PER_DAY = 10
@@ -96,37 +120,6 @@ def _open_shed_access(farm):
     half = BOARD_SIZE // 2
     positions = ((half - 1, half - 1), (half, half - 1), (half - 1, half), (half, half))
     return tuple((x, y) for x, y in positions if farm["tiles"][y][x] != "LOCKED")
-
-
-def _pop_market_batch(queue, cap=MARKET_ORDER_CAP):
-    """Remove and return the next planned market batch without dropping its tail."""
-    batch = list(queue[:cap])
-    del queue[:cap]
-    return batch
-
-
-def _strip_partial_animal_builds(tasks, opening_active=False):
-    """Post-opening, never BUILD an animal structure without same-plan PLACE.
-
-    Opening deliberately keeps its historical bootstrap behavior. After the
-    hand-off, a failed/missing animal purchase may remove PLACE when tasks are
-    rebuilt from observed inventory; in that case retain physical work such as
-    HARVEST but remove the standalone BUILD instead of leaving an empty pen.
-    """
-    if opening_active:
-        return tasks
-    cleaned = []
-    for task in tasks:
-        operations = [operation[0] for operation in task.actions]
-        has_build = any(operation.startswith("BUILD_") for operation in operations)
-        if has_build and "PLACE" not in operations:
-            task.actions = [
-                operation for operation in task.actions
-                if not operation[0].startswith("BUILD_")
-            ]
-        if task.actions:
-            cleaned.append(task)
-    return cleaned
 
 
 def _hire_costs(farm, number):
@@ -253,6 +246,9 @@ def _hire_and_buy_orders(
     animals = [order for order in purchase if order[0] == "BUY_ANIMAL"]
     seeds = [order for order in purchase if order[0] == "BUY_SEED"]
     if reserve_hire_budget:
+        # The market processes only ten orders. Required labor must be ahead
+        # of feed/investment orders so SELL traffic cannot silently remove a
+        # hand that the mandatory daily plan depends on.
         orders = (
             hire_orders[:mandatory_hires] + feed + animals + seeds
             + hire_orders[mandatory_hires:]
@@ -285,6 +281,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         "morning_market_queue": [],
     }
     opening_governs = make_opening_controller()
+
 
     def _dispatch_morning_market(farm):
         return {
@@ -392,6 +389,31 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 not isinstance(tile, dict) or tile.get("yield_units", 0) <= 0
             ):
                 return True
+        remaining_turns = max(0, 24 - int(obs.get("hour", 0)))
+        for index, _position in enumerate(positions):
+            queue = state["plans"][index].queue
+            if not queue:
+                continue
+            first = queue[0][0]
+            required = None
+            if first.startswith("BUILD_"):
+                required = "PLACE"
+            elif first == "PLANT":
+                required = "WATER"
+            if required is None:
+                continue
+            # Dependencies inside one tile task are contiguous; any movement,
+            # pickup or drop marks the end of this local bundle.
+            for offset, queued in enumerate(queue):
+                op = queued[0]
+                if offset and (op in MOVES or op in ("PICKUP", "DROP")):
+                    break
+                if op == required:
+                    if offset + 1 > remaining_turns:
+                        return True
+                    break
+            else:
+                return True
         return False
 
     def agent(obs, configuration=None):
@@ -409,7 +431,6 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
         new_positions = [position for position in positions if position not in targets]
         if hour == 0:
             state["deferred_expansion_positions"].clear()
-            state["morning_market_queue"].clear()
         physical_positions = {
             (x, y)
             for y, row in enumerate(farm["tiles"])
@@ -499,9 +520,6 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 assume_animal_inputs=True,
                 prioritize_fertilizer_drop=state["opening_active"],
             )
-            tasks = _strip_partial_animal_builds(
-                tasks, opening_active=state["opening_active"]
-            )
             tasks = [
                 task for task in tasks
                 if task.position not in state["deferred_expansion_positions"]
@@ -573,25 +591,30 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 non_wheat_sales, protected_hires,
             )
             sales = sell_orders(obs, reservations)
+            if not state["opening_active"]:
+                # Reserve market-order slots for every mandatory hire. The
+                # replay regression had 3-5 SELLs consume the ten-order cap,
+                # silently dropping survival hands before hour 1.
+                sales = sales[:max(0, 10 - protected_hires)]
             orders = _hire_and_buy_orders(
                 obs, farm, purchase_targets, hand_target, pending_sales=sales,
                 replant_same_crop=True,
                 reserve_hire_budget=not state["opening_active"],
                 mandatory_hand_target=mandatory_hand_target,
             )
-            if state["opening_active"]:
-                # Preserve the opening book's historical bootstrap semantics.
-                return {
-                    "farmer": ["PASS"], "hands": [["PASS"] for _ in farm["hands"]],
-                    "market": (sales + orders)[:MARKET_ORDER_CAP],
-                }
-            state["morning_market_queue"] = list(sales) + list(orders)
-            return _dispatch_morning_market(farm)
+            full_market = list(sales) + list(orders)
+            if not state["opening_active"]:
+                state["morning_market_queue"] = [
+                    order for order in full_market[MARKET_ORDER_CAP:]
+                    if order[0] in ("BUY_ANIMAL", "BUY_PRODUCT")
+                ]
+            return {
+                "farmer": ["PASS"], "hands": [["PASS"] for _ in farm["hands"]],
+                "market": full_market[:MARKET_ORDER_CAP],
+            }
 
-        # Post-opening market work is itself part of the daily plan. Never
-        # discard orders beyond the ten-order engine cap; workers remain idle
-        # until every planned batch has been observed on a later turn.
-        if not state["opening_active"] and state["day"] == day and state["morning_market_queue"]:
+        if (not state["opening_active"] and state["day"] == day
+                and state["morning_market_queue"]):
             return _dispatch_morning_market(farm)
 
         if state["day"] == day and not state["plan_frozen"]:
@@ -613,45 +636,26 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             ]
             existing_hands = tuple(map(tuple, farm["hands"]))
             shed_access = _open_shed_access(farm)
-            remaining_budget = max(0, 24 - hour)
-            pending_hand_budget = max(0, 23 - hour)
-            scheduling_pending_budget = 22 if state["opening_active"] else pending_hand_budget
             desired_hands, _dropped = hands_needed(
                 tasks,
                 tuple(farm["farmer"]),
                 existing_hands,
                 shed_access,
-                pending_hand_budget=scheduling_pending_budget,
+                pending_hand_budget=22,
                 marginal_hire_costs=(None if state["opening_active"] and day < effective_end else
                     [_hire_costs(farm, n + 1) - _hire_costs(farm, n)
                      for n in range(MAX_HANDS - len(existing_hands))]),
             )
             hand_count = len(existing_hands)
             state["hand_target"] = desired_hands
-
-            # Post-opening waits for every planned worker before freezing a
-            # complete daily schedule. Opening retains its bootstrap behavior.
-            if not state["opening_active"] and desired_hands > hand_count:
-                affordable = _affordable_hires(
-                    farm, desired_hands - hand_count, farm["money"]
-                )
-                if affordable:
-                    state["morning_market_queue"] = [["HIRE"] for _ in range(affordable)]
-                    return _dispatch_morning_market(farm)
-
-            queue_kwargs = {
-                "pending_hand_budget": scheduling_pending_budget,
-                "available_wheat": obs["private"]["shed"].get("WHEAT", 0),
-            }
-            if not state["opening_active"]:
-                queue_kwargs["existing_hand_budget"] = remaining_budget
             plans, unassigned = build_queues(
                 tasks,
                 tuple(farm["farmer"]),
                 hand_count,
                 existing_hands,
                 shed_access,
-                **queue_kwargs,
+                pending_hand_budget=22,
+                available_wheat=obs["private"]["shed"].get("WHEAT", 0),
             )
 
             mandatory_tasks = [task for task in tasks if task.mandatory is not False]
@@ -659,13 +663,18 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 task for task in unassigned if task.mandatory is not False
             ]
             if mandatory_unassigned:
+                # Optional investment/value work must never be the reason a
+                # survival task disappears. Repack the complete mandatory set
+                # alone; if it still cannot fit, keep the plan unfrozen and
+                # hire the missing capacity for a full remaining-day replan.
                 plans, mandatory_unassigned = build_queues(
                     mandatory_tasks,
                     tuple(farm["farmer"]),
                     hand_count,
                     existing_hands,
                     shed_access,
-                    **queue_kwargs,
+                    pending_hand_budget=22,
+                    available_wheat=obs["private"]["shed"].get("WHEAT", 0),
                 )
                 unassigned = mandatory_unassigned + [
                     task for task in tasks if task.mandatory is False
@@ -677,35 +686,9 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                     tuple(farm["farmer"]),
                     existing_hands,
                     shed_access,
-                    pending_hand_budget=scheduling_pending_budget,
+                    pending_hand_budget=22,
                 )
-                needed = max(0, required_hands - hand_count)
-                if state["opening_active"]:
-                    # Historical opening exception: execute the safe partial
-                    # mandatory plan while asking the engine for missing hands,
-                    # then rebuild next observation. This is intentionally not
-                    # the post-opening scheduling contract.
-                    state["emergency_hires"] = needed
-                else:
-                    affordable = _affordable_hires(farm, needed, farm["money"])
-                    if affordable:
-                        state["morning_market_queue"] = [["HIRE"] for _ in range(affordable)]
-                        state["plans"] = []
-                        state["unassigned"] = tasks
-                        state["reserved"] = {}
-                        return _dispatch_morning_market(farm)
-                    # No partial rescue execution post-opening. If the complete
-                    # mandatory schedule is infeasible with observed resources,
-                    # expose the planning failure instead of masking it.
-                    state["plans"] = []
-                    state["unassigned"] = tasks
-                    state["reserved"] = {}
-                    state["plan_frozen"] = False
-                    return {
-                        "farmer": ["PASS"],
-                        "hands": [["PASS"] for _ in farm["hands"]],
-                        "market": [],
-                    }
+                state["emergency_hires"] = max(0, required_hands - hand_count)
             else:
                 state["emergency_hires"] = 0
 
@@ -732,9 +715,10 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 task.position for task in unassigned
                 if task.position in investment_task_positions
             )
-            state["plan_frozen"] = (
-                not mandatory_unassigned if state["opening_active"] else True
-            )
+            # A daily queue is frozen only when every mandatory task has a
+            # worker. A failed morning hire is planning divergence, so execute
+            # the safe partial mandatory plan and rebuild globally next turn.
+            state["plan_frozen"] = not mandatory_unassigned
 
         if _plan_invalid(obs, farm):
             _global_replan(obs, farm, hour)
@@ -807,15 +791,12 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
             sale_reserve["WHEAT"],
             feed_wheat_reserve(obs, committed_feed_targets, _active_positions(farm)),
         )
-        market = (
-            [["HIRE"] for _ in range(state.get("emergency_hires", 0))]
-            if state["opening_active"] else []
-        )
+        market = [["HIRE"] for _ in range(state.get("emergency_hires", 0))]
         market += sell_orders(obs, sale_reserve)
         if day < effective_end:
             market += feed_wheat_order(
                 obs, committed_feed_targets, _active_positions(farm)
             )
-        return {"farmer": farmer_op, "hands": hand_ops, "market": market[:MARKET_ORDER_CAP]}
+        return {"farmer": farmer_op, "hands": hand_ops, "market": market[:10]}
 
     return agent
