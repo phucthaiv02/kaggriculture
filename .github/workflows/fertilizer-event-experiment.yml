@@ -9,6 +9,7 @@ on:
       - agents/forecast.py
       - agents/planner.py
       - agents/schedules.py
+      - agents/expansion_agent.py
       - tests/test_agents_fertilizer_plan.py
       - tests/test_fertilizer_event_experiment.py
       - .github/workflows/fertilizer-event-experiment.yml
@@ -30,11 +31,26 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install kaggle-environments==1.32.7 pytest
-      - name: Run production fertilizer planner regressions
+      - name: Run affected regression suites
         run: |
-          python -m pytest -vv \
+          python -m pytest -q \
             tests/test_agents_fertilizer_plan.py \
-            tests/test_fertilizer_event_experiment.py
+            tests/test_fertilizer_event_experiment.py \
+            tests/test_agents_planner.py \
+            tests/test_agents_forecast.py \
+            tests/test_agents_farm_tasks.py
+      - name: Benchmark decision limit
+        run: |
+          python - <<'PY'
+          from experiments.benchmark_agent import benchmark
+          timeout = 0.75
+          timings = benchmark(seed=1, opponent="self", timeout=timeout)
+          worst = max(timings, key=lambda row: row[1])
+          over = [row for row in timings if row[1] > timeout]
+          print({"actions": len(timings), "max_seconds": worst[1], "max_day": worst[2], "max_hour": worst[3], "over_075_seconds": len(over)})
+          if over:
+              raise SystemExit(f"{len(over)} decisions exceeded {timeout}s")
+          PY
       - name: Show experiment result
         if: always()
         run: |
