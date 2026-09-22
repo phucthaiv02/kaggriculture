@@ -1,0 +1,68 @@
+name: Fast A replay validation
+
+on:
+  push:
+    branches: [agent-v3]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: execution-replay-fast-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  PATCH_BASE_COMMIT: f3c820e50892b1f0715470b9e5e8bb6c03f74937
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Apply candidate in runner only
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path=Path('agents/expansion_agent.py')
+          text=path.read_text()
+          old='''            remaining_budget = max(0, 24 - hour)\n            pending_hand_budget = max(0, 23 - hour)\n            scheduling_pending_budget = 22 if state["opening_active"] else pending_hand_budget\n            desired_hands, _dropped = hands_needed(\n                tasks,\n                tuple(farm["farmer"]),\n                existing_hands,\n                shed_access,\n                pending_hand_budget=scheduling_pending_budget,\n                marginal_hire_costs=(None if state["opening_active"] and day < effective_end else\n                    [_hire_costs(farm, n + 1) - _hire_costs(farm, n)\n                     for n in range(MAX_HANDS - len(existing_hands))]),\n            )\n            hand_count = len(existing_hands)\n            state["hand_target"] = desired_hands\n\n            # Post-opening waits for every planned worker before freezing a\n            # complete daily schedule. Opening retains its bootstrap behavior.\n            if not state["opening_active"] and desired_hands > hand_count:\n                affordable = _affordable_hires(\n                    farm, desired_hands - hand_count, farm["money"]\n                )\n                if affordable:\n                    state["morning_market_queue"] = [["HIRE"] for _ in range(affordable)]\n                    return _dispatch_morning_market(farm)\n\n            queue_kwargs = {\n                "pending_hand_budget": scheduling_pending_budget,\n                "available_wheat": obs["private"]["shed"].get("WHEAT", 0),\n            }\n            if not state["opening_active"]:\n                queue_kwargs["existing_hand_budget"] = remaining_budget\n'''
+          new='''            remaining_budget = max(0, 24 - hour)\n            hand_count = len(existing_hands)\n            if state["opening_active"]:\n                scheduling_pending_budget = 22\n                desired_hands, _dropped = hands_needed(\n                    tasks,\n                    tuple(farm["farmer"]),\n                    existing_hands,\n                    shed_access,\n                    pending_hand_budget=scheduling_pending_budget,\n                    marginal_hire_costs=(None if day < effective_end else\n                        [_hire_costs(farm, n + 1) - _hire_costs(farm, n)\n                         for n in range(MAX_HANDS - len(existing_hands))]),\n                )\n                state["hand_target"] = desired_hands\n                queue_kwargs = {\n                    "pending_hand_budget": scheduling_pending_budget,\n                    "available_wheat": obs["private"]["shed"].get("WHEAT", 0),\n                }\n            else:\n                scheduling_pending_budget = remaining_budget\n                queue_kwargs = {\n                    "pending_hand_budget": remaining_budget,\n                    "existing_hand_budget": remaining_budget,\n                    "available_wheat": obs["private"]["shed"].get("WHEAT", 0),\n                }\n'''
+          assert text.count(old)==1
+          text=text.replace(old,new)
+          old='''            if mandatory_unassigned:\n                required_hands, _ = hands_needed(\n                    mandatory_tasks,\n                    tuple(farm["farmer"]),\n                    existing_hands,\n                    shed_access,\n                    pending_hand_budget=scheduling_pending_budget,\n                )\n                needed = max(0, required_hands - hand_count)\n                if state["opening_active"]:\n                    # Historical opening exception: execute the safe partial\n                    # mandatory plan while asking the engine for missing hands,\n                    # then rebuild next observation. This is intentionally not\n                    # the post-opening scheduling contract.\n                    state["emergency_hires"] = needed\n                else:\n                    affordable = _affordable_hires(farm, needed, farm["money"])\n                    if affordable:\n                        state["morning_market_queue"] = [["HIRE"] for _ in range(affordable)]\n                        state["plans"] = []\n                        state["unassigned"] = tasks\n                        state["reserved"] = {}\n                        return _dispatch_morning_market(farm)\n                    # No partial rescue execution post-opening. If the complete\n                    # mandatory schedule is infeasible with observed resources,\n                    # expose the planning failure instead of masking it.\n                    state["plans"] = []\n                    state["unassigned"] = tasks\n                    state["reserved"] = {}\n                    state["plan_frozen"] = False\n                    return {\n                        "farmer": ["PASS"],\n                        "hands": [["PASS"] for _ in farm["hands"]],\n                        "market": [],\n                    }\n            else:\n                state["emergency_hires"] = 0\n'''
+          new='''            if mandatory_unassigned and state["opening_active"]:\n                required_hands, _ = hands_needed(\n                    mandatory_tasks,\n                    tuple(farm["farmer"]),\n                    existing_hands,\n                    shed_access,\n                    pending_hand_budget=scheduling_pending_budget,\n                )\n                state["emergency_hires"] = max(0, required_hands - hand_count)\n            else:\n                state["emergency_hires"] = 0\n'''
+          assert text.count(old)==1
+          path.write_text(text.replace(old,new))
+          PY
+          python -m py_compile agents/expansion_agent.py
+      - name: Install Kaggriculture runtime
+        run: python -m pip install --upgrade kaggle-environments
+      - name: Run candidate and original against same A.ipynb
+        run: |
+          mkdir -p validation/current validation/original
+          timeout 300s python -m experiments.play_match --opponent public/A.ipynb --seed 1 --output-dir validation/current
+          git worktree add --detach "$RUNNER_TEMP/pre-fix" "$PATCH_BASE_COMMIT"
+          (cd "$RUNNER_TEMP/pre-fix" && timeout 300s python -m experiments.play_match --opponent "$GITHUB_WORKSPACE/public/A.ipynb" --seed 1 --output-dir "$GITHUB_WORKSPACE/validation/original")
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          r=Path('validation')
+          c=sorted((r/'current').glob('current_vs_A_seed1_*'))[-1]
+          o=sorted((r/'original').glob('current_vs_A_seed1_*'))[-1]
+          C=json.loads((c/'result.json').read_text()); O=json.loads((o/'result.json').read_text())
+          out={'candidate':C['current_cash'],'original':O['current_cash'],'delta':C['current_cash']-O['current_cash'],'candidate_margin':C['margin'],'original_margin':O['margin']}
+          (r/'comparison.json').write_text(json.dumps(out,indent=2)); print(json.dumps(out,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fast-a-replay-${{ github.sha }}
+          path: validation
+          if-no-files-found: warn
