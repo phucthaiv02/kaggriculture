@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from agents.fertilizer import plan_ages
+
 
 # (crop, fertilized) -> water ages relative to planted_day. Fertilizing an
 # ongoing crop (TOMATO/STRAWBERRY) needs more frequent watering because each
@@ -46,8 +48,9 @@ CROP_LAST_AGE = {
 }
 ONGOING_CROPS = {"TOMATO", "STRAWBERRY"}
 
-# Fertilize-eligible ages verified against the interpreter. These are only
-# meaningful for a planting that committed to fertilizer in the planner.
+# Fertilize-eligible ages verified against the interpreter. Dynamic planner
+# targets may select any subset of these ages for the current cycle. Opening
+# targets still pass a boolean and therefore retain the old all-or-none rule.
 CROP_FERTILIZE_DAYS = {
     "WHEAT": {2},
     "CARROT": {2},
@@ -87,16 +90,24 @@ ANIMAL_MAX_HELD = {
 }
 
 
+def _cycle_uses_fertilizer(fertilized):
+    ages = plan_ages(fertilized)
+    return bool(fertilized) if ages is None else bool(ages)
+
+
 def water_days(crop, fertilized):
-    return CROP_WATER_DAYS[(crop, fertilized)]
+    return CROP_WATER_DAYS[(crop, _cycle_uses_fertilizer(fertilized))]
 
 
 def is_maintenance_day(crop, age, fertilized):
-    return age in CROP_WATER_DAYS[(crop, fertilized)]
+    return age in water_days(crop, fertilized)
 
 
 def should_fertilize_today(crop, age, fertilized):
-    return fertilized and age in CROP_FERTILIZE_DAYS[crop]
+    ages = plan_ages(fertilized)
+    if ages is None:
+        return age in CROP_FERTILIZE_DAYS[crop]
+    return age in ages and age in CROP_FERTILIZE_DAYS[crop]
 
 
 ANIMAL_PRODUCTION = {"GOOSE": (4, 1), "COW": (8, 2), "SHEEP": (6, 3)}
