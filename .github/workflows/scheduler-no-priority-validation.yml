@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/scheduler-no-priority-validation.yml
       - experiments/_validate_scheduler_no_priority.py
+      - experiments/_validate_scheduler_balance_patch.py
 
 permissions:
   contents: read
@@ -30,6 +31,7 @@ jobs:
         run: |
           git show "$PATCH_BASE_COMMIT:agents/scheduler.py" > agents/scheduler.py
           python experiments/_validate_scheduler_no_priority.py
+          python experiments/_validate_scheduler_balance_patch.py
           python -m py_compile agents/scheduler.py
           git diff --check
           ! grep -q 'def _priority' agents/scheduler.py
@@ -75,6 +77,13 @@ jobs:
           extra = Task((4, 4), [['COLLECT_FERTILIZER']], mandatory=False, value=10)
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[9]) == (1, [])
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[11]) == (0, [extra])
+
+          # Once workers already exist, scheduling minimizes makespan instead
+          # of idling paid capacity merely to save a few travel steps.
+          work = [Task((4, 4), [['WATER']] * 4, mandatory=True) for _ in range(4)]
+          plans, missing = build_queues(work, (4, 4), 3)
+          assert not missing
+          assert all(plan.queue for plan in plans)
           PY
       - name: Replay candidate and animal-fixed base against A
         run: |
