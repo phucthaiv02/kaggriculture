@@ -14,6 +14,7 @@ concurrency:
 
 env:
   BASELINE_COMMIT: 6f8b6bb320a6b1ce9d449f82c8fa66cfb691bd33
+  PATCH_BASE_COMMIT: f3c820e50892b1f0715470b9e5e8bb6c03f74937
   PYTHONUNBUFFERED: "1"
 
 jobs:
@@ -40,6 +41,65 @@ jobs:
 
       - name: Run regression tests
         run: python -m pytest -q
+
+      - name: Compare real A.ipynb replay with pre-fix commit
+        if: always()
+        run: |
+          mkdir -p ci-artifacts/a-match/current ci-artifacts/a-match/original
+
+          python -m experiments.play_match \
+            --opponent public/A.ipynb \
+            --seed 1 \
+            --output-dir ci-artifacts/a-match/current
+
+          git worktree add --detach "$RUNNER_TEMP/kaggriculture-pre-fix" "$PATCH_BASE_COMMIT"
+          (
+            cd "$RUNNER_TEMP/kaggriculture-pre-fix"
+            python -m experiments.play_match \
+              --opponent "$GITHUB_WORKSPACE/public/A.ipynb" \
+              --seed 1 \
+              --output-dir "$GITHUB_WORKSPACE/ci-artifacts/a-match/original"
+          )
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("ci-artifacts/a-match")
+          current_dir = sorted((root / "current").glob("current_vs_A_seed1_*"))[-1]
+          original_dir = sorted((root / "original").glob("current_vs_A_seed1_*"))[-1]
+          current = json.loads((current_dir / "result.json").read_text())
+          original = json.loads((original_dir / "result.json").read_text())
+          summary = {
+              "seed": 1,
+              "opponent": "public/A.ipynb",
+              "opponent_sha256": current.get("opponent_sha256"),
+              "original_commit": "f3c820e50892b1f0715470b9e5e8bb6c03f74937",
+              "candidate_commit": "${{ github.sha }}",
+              "original": {
+                  "cash": original["current_cash"],
+                  "opponent_cash": original["opponent_cash"],
+                  "margin": original["margin"],
+                  "statuses": original["statuses"],
+                  "frames": original["frames"],
+                  "replay": str(original_dir / "replay.json"),
+              },
+              "candidate": {
+                  "cash": current["current_cash"],
+                  "opponent_cash": current["opponent_cash"],
+                  "margin": current["margin"],
+                  "statuses": current["statuses"],
+                  "frames": current["frames"],
+                  "replay": str(current_dir / "replay.json"),
+              },
+              "delta": {
+                  "cash": current["current_cash"] - original["current_cash"],
+                  "margin": current["margin"] - original["margin"],
+              },
+          }
+          (root / "comparison.json").write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary, indent=2))
+          PY
 
       - name: Validate care schedules
         run: |
