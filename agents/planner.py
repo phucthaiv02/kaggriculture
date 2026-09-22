@@ -148,15 +148,14 @@ def evaluate_targets(
         return result
 
     scoped_baseline = scoped(baseline)
-    baseline_value = scoped_market.value(scoped_baseline)
+    baseline_values = {}
     for choice, output, cost in candidates:
         if market.day + _first_yield_age(choice[0]) > end:
             continue
         output = scoped(output)
-        combined = Production()
-        combined.add(scoped_baseline)
-        combined.add(output)
-        market_cash = scoped_market.value(combined) - baseline_value
+        market_cash = scoped_market.marginal_value(
+            scoped_baseline, output, baseline_values
+        )
         results.append(TargetProfit(choice, output, market_cash, cost, 0.0))
     return results
 
