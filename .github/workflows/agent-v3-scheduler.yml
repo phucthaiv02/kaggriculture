@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: agent-v3-scheduler-${{ github.ref }}
+  group: agent-v3-scheduler-${{ github.sha }}
   cancel-in-progress: true
 
 env:
