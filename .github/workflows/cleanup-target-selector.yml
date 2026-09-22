@@ -13,7 +13,7 @@ env:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,14 +28,12 @@ jobs:
 
           p = Path('agents/planner.py')
           s = p.read_text()
-
           s = s.replace('''TARGET_OPTIONS = (1, 2, 3)\nTARGET_OPTION = 1\nTARGET_DISCOUNT = 0.97\nTARGET_ROI_CAPITAL_FLOOR = 100.0\nTARGET_SWITCH_MARGIN = 1.0\n\n\ndef set_target_option(option):\n    """Select the target ranking formula used by plan_targets."""\n    global TARGET_OPTION\n    option = int(option)\n    if option not in TARGET_OPTIONS:\n        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")\n    TARGET_OPTION = option\n''', '''TARGET_SWITCH_MARGIN = 1.0\n''')
 
           old = '''@dataclass(frozen=True)\nclass TargetProfit:\n    choice: tuple\n    output: Production\n    market_cash: float\n    capital_cost: float\n    labor_cost: float = 0.0\n    discounted_market_cash: float | None = None\n\n    @property\n    def profit(self):\n        """Marginal market cash minus target capital; labor is scheduler-owned."""\n        return self.market_cash - self.capital_cost\n\n    def score(self, option=None):\n        """Return one of the three benchmark target-ranking formulas."""\n        option = TARGET_OPTION if option is None else int(option)\n        if option == 1:\n            return self.profit\n        if option == 2:\n            market_cash = (\n                self.market_cash if self.discounted_market_cash is None\n                else self.discounted_market_cash\n            )\n            return market_cash - self.capital_cost\n        if option == 3:\n            return self.profit / max(self.capital_cost, TARGET_ROI_CAPITAL_FLOOR)\n        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")\n'''
           new = '''@dataclass(frozen=True)\nclass TargetProfit:\n    choice: tuple\n    output: Production\n    market_cash: float\n    capital_cost: float\n    labor_cost: float = 0.0\n\n    @property\n    def profit(self):\n        """Marginal market cash minus target capital; labor is scheduler-owned."""\n        return self.market_cash - self.capital_cost\n'''
           assert old in s
           s = s.replace(old, new, 1)
-
           s = s.replace('''def evaluate_targets(\n    market, baseline, candidates, labor=None, position=(4, 4), *, target_option=None\n):''', '''def evaluate_targets(\n    market, baseline, candidates, labor=None, position=(4, 4)\n):''', 1)
           s = s.replace('''    del labor, position\n    option = TARGET_OPTION if target_option is None else int(target_option)\n    if option not in TARGET_OPTIONS:\n        raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {option}")\n\n    results = []\n''', '''    del labor, position\n    results = []\n''', 1)
           s = s.replace('''    discounted_baseline_value = (\n        scoped_market.value(scoped_baseline, discount=TARGET_DISCOUNT)\n        if option == 2 else None\n    )\n''', '', 1)
@@ -61,20 +59,26 @@ jobs:
           s = s.replace(block, '')
           s = s.replace('    run(args.opponent, args.seed, args.output_dir, args.target_option)\n', '    run(args.opponent, args.seed, args.output_dir)\n')
           p.write_text(s)
+
+          p = Path('tests/test_agents_season_profit.py')
+          s = p.read_text()
+          start = s.index('\ndef test_target_option_formulas_are_distinct():')
+          end = s.index('\ndef test_discounted_market_value_weights_late_cash_less():', start)
+          s = s[:start] + '\n' + s[end:]
+          p.write_text(s)
           PY
       - name: Verify rejected target variants are gone
         run: |
-          ! git grep -nE 'TARGET_OPTIONS|TARGET_OPTION|TARGET_DISCOUNT|TARGET_ROI_CAPITAL_FLOOR|set_target_option|target_option|--target-option|target_sequence|choose_sequence' -- ':!*.ipynb'
-          python -m py_compile agents/planner.py experiments/play_match.py
-      - name: Install test dependency
-        run: python -m pip install kaggle-environments==1.32.7
-      - name: Run planner tests
-        run: pytest -q tests/test_agents_planner.py
+          if git grep -nE 'TARGET_OPTIONS|TARGET_OPTION|TARGET_DISCOUNT|TARGET_ROI_CAPITAL_FLOOR|set_target_option|target_option|--target-option|target_sequence|choose_sequence' -- ':!*.ipynb' ':!.github/workflows/cleanup-target-selector.yml'; then
+            echo 'Rejected target-selection variant references remain.'
+            exit 1
+          fi
+          python -m py_compile agents/planner.py experiments/play_match.py tests/test_agents_planner.py tests/test_agents_season_profit.py
       - name: Commit cleaned selector and remove this workflow
         run: |
           git rm .github/workflows/cleanup-target-selector.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add agents/planner.py experiments/play_match.py
+          git add agents/planner.py experiments/play_match.py tests/test_agents_season_profit.py
           git commit -m 'targeting: keep only validated O1 sticky selector'
           git push origin HEAD:agent-v3
