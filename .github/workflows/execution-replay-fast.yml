@@ -28,6 +28,7 @@ jobs:
           python-version: "3.11"
       - name: Apply candidate in runner only
         run: |
+          git show "$PATCH_BASE_COMMIT:agents/expansion_agent.py" > agents/expansion_agent.py
           python experiments/_validate_execution_candidate.py
           python -m py_compile agents/expansion_agent.py
           git diff --check
