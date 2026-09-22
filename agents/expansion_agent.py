@@ -569,12 +569,18 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
 
             # Purchases are narrower than maintenance. A standing future COW
             # target on a still-growing crop is not permission to buy a COW;
-            # only a PLANT/PLACE task actually admitted today may buy input.
+            # only admitted PLANT/PLACE investments and exact fertilizer events
+            # due in today's assigned schedule may create market input demand.
+            assigned_tasks = [task for task in tasks if id(task) not in rejected_ids]
+            fertilizer_purchase_positions = {
+                task.position for task in assigned_tasks
+                if task.needs.get("FERTILIZER", 0) > 0
+            }
             purchase_targets = {
                 p: t for p, t in daily_targets.items()
-                if p in state["purchase_positions"]
+                if (p in state["purchase_positions"]
+                    or p in fertilizer_purchase_positions)
             }
-            assigned_tasks = [task for task in tasks if id(task) not in rejected_ids]
             reservations = reserved_items(assigned_tasks)
             reservations["WHEAT"] = max(
                 reservations.get("WHEAT", 0),
