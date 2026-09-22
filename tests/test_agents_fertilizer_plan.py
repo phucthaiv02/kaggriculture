@@ -1,4 +1,5 @@
 """Regression tests for production per-event fertilizer planning."""
+import pytest
 from kaggle_environments.envs.kaggriculture import kaggriculture as game
 
 from agents.farm_tasks import build_tasks, purchase_orders
@@ -103,6 +104,37 @@ def test_market_score_can_select_late_only_wheat_plan():
         if row.choice[1].cycles == ((2,), (2,), (2,), (2,))
     )
     assert best.profit > max(none.profit, all_events.profit)
+
+
+def test_product_local_marginal_value_matches_full_portfolio_subtraction():
+    day, end_day = 8, 24
+    inventory = {product: game.MARKET_I0 for product in game.PRODUCTS}
+    inventory.update({"WHEAT": 10120, "CARROT": 9970, "FERTILIZER": 10270})
+
+    baseline = Production()
+    baseline.sales[8].update({"CARROT": 3, "FERTILIZER": 2})
+    baseline.sales[12].update({"WHEAT": 5, "MILK": 2})
+    baseline.inputs[14].update({"WHEAT": 1})
+    baseline.inputs[18].update({"FERTILIZER": 1})
+
+    external = Production()
+    external.sales[10].update({"WHEAT": 4, "CARROT": 2})
+    external.sales[18].update({"FERTILIZER": 3})
+    external.inputs[22].update({"WHEAT": 1})
+
+    market = MarketForecast(
+        inventory, ("BAKERY",), day, end_day, external=external
+    )
+    baseline_value = market.value(baseline)
+    cache = {}
+    # Sample every crop/animal family plus several fertilizer-plan variants.
+    candidates = list(_candidates(day, end_day))
+    sampled = candidates[::max(1, len(candidates) // 24)]
+    for _choice, candidate, _cost in sampled:
+        combined = _combined(baseline, candidate)
+        expected = market.value(combined) - baseline_value
+        actual = market.marginal_value(baseline, candidate, cache)
+        assert actual == pytest.approx(expected)
 
 
 def test_due_event_is_scheduled_even_when_shed_has_no_fertilizer():
