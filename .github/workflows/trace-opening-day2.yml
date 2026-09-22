@@ -23,7 +23,7 @@ jobs:
       - run: python -m pip install kaggle-environments==1.32.7
       - name: Trace current and baseline through day 2
         run: |
-          cat > /tmp/trace.py <<'PY'
+          cat > trace.py <<'PY'
           from kaggle_environments import make
           from kaggle_environments.envs.kaggriculture import kaggriculture as game
           from agents.expansion_agent import make_agent
@@ -57,8 +57,8 @@ jobs:
               state[0].observation.step = step + 1
           PY
           echo '=== CURRENT ==='
-          python /tmp/trace.py
+          python trace.py
           git worktree add --detach /tmp/base f3c820e50892b1f0715470b9e5e8bb6c03f74937
-          cp /tmp/trace.py /tmp/base/trace.py
+          cp trace.py /tmp/base/trace.py
           echo '=== BASE ==='
           (cd /tmp/base && python trace.py)
