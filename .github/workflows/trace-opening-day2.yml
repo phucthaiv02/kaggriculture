@@ -1,0 +1,64 @@
+name: Trace opening day2
+
+on:
+  push:
+    branches: [agent-v3]
+    paths:
+      - .github/workflows/trace-opening-day2.yml
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install kaggle-environments==1.32.7
+      - name: Trace current and baseline through day 2
+        run: |
+          cat > /tmp/trace.py <<'PY'
+          from kaggle_environments import make
+          from kaggle_environments.envs.kaggriculture import kaggriculture as game
+          from agents.expansion_agent import make_agent
+          from tests.test_agents_integration import configuration, pass_agent, END_DAY
+
+          env = make('kaggriculture', configuration=configuration(1), debug=False)
+          agent = make_agent(END_DAY, seed=1)
+          state = env.state
+          for step in range(int(env.configuration.episodeSteps)-1):
+              obs = state[0].observation
+              if obs.day > 2:
+                  break
+              action = agent(obs)
+              market = action.get('market', [])
+              workers = [action.get('farmer', ['PASS']), *action.get('hands', [])]
+              interesting = market or any(op and op[0] in {'HARVEST','COLLECT_FERTILIZER','DROP','SELL','BUILD','PLACE'} for op in workers)
+              if obs.day >= 1 and interesting:
+                  farm = obs.farms[0]
+                  shed = obs.private.shed
+                  print({
+                      'day': int(obs.day), 'hour': int(obs.hour),
+                      'money': float(farm.money),
+                      'shed_wheat': int(shed.get('WHEAT',0)),
+                      'shed_fert': int(shed.get('FERTILIZER',0)),
+                      'market': market,
+                      'workers': workers,
+                  })
+              state[0].action = action
+              state[1].action = pass_agent(state[1].observation)
+              state = game.interpreter(state, env)
+              state[0].observation.step = step + 1
+          PY
+          echo '=== CURRENT ==='
+          python /tmp/trace.py
+          git worktree add --detach /tmp/base f3c820e50892b1f0715470b9e5e8bb6c03f74937
+          cp /tmp/trace.py /tmp/base/trace.py
+          echo '=== BASE ==='
+          (cd /tmp/base && python trace.py)
