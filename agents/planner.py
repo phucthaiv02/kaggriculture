@@ -1,7 +1,8 @@
 """Planner: choose production targets from marginal market profit and cost.
 
-This is a merged implementation that keeps the stable behaviors needed by the
-repo's tests while avoiding the stale conflict state from the in-progress rebase.
+This merged implementation preserves the stable planner behaviors exercised by
+unit tests and the game agent, without the stale conflict markers left behind by
+an in-progress rebase.
 """
 from collections import Counter
 from copy import copy
@@ -32,7 +33,7 @@ def set_target_option(option: int):
 
 
 def _crop_cycle_starts(name, day, end_day, tile=None):
-    """Yield every crop start that could still produce within the planning horizon."""
+    """Yield every crop start that can still produce in the planner window."""
     end_day = _cycle_end(day, end_day)
     first = _first_yield_age(name)
     if tile is None:
@@ -82,10 +83,7 @@ def _candidates(day, end_day):
             output, cost = _rotation(name, False, day, end_day)
             yield (name, False), output, cost
             continue
-        # Simple exhaustive crop plan enumeration; the repo's tests only need a
-        # valid profitable candidate list, not the full branch history.
-        options = [False, True]
-        for fertilize in options:
+        for fertilize in (False, True):
             output, cost = _rotation(name, fertilize, day, end_day)
             yield (name, fertilize), output, cost
 
@@ -108,19 +106,19 @@ class TargetProfit:
         if opt == 1:
             return self.profit
         if opt == 2:
-            market_cash = self.market_cash if self.discounted_market_cash is None else self.discounted_market_cash
-            return market_cash - self.capital_cost
+            base = self.market_cash if self.discounted_market_cash is None else self.discounted_market_cash
+            return base - self.capital_cost
         if opt == 3:
             return self.profit / max(self.capital_cost, TARGET_ROI_CAPITAL_FLOOR)
         raise ValueError(f"target option must be one of {TARGET_OPTIONS}, got {opt}")
 
 
 def evaluate_targets(market, baseline, candidates, labor=None, position=(4, 4), *, target_option: Optional[int] = None):
-    results = []
-    end = _cycle_end(market.day, market.end_day) if market is not None else None
     if market is None:
-        return results
+        return []
 
+    results = []
+    end = _cycle_end(market.day, market.end_day)
     scoped_market = copy(market)
     scoped_market.end_day = end
 
@@ -168,7 +166,8 @@ def _choice_current_key(choice):
     if name in ANIMALS:
         return name, ()
     if fertilize in (False, True):
-        return name, tuple(sorted(CROP_FERTILIZE_DAYS.get(name, {}))) if name in CROP_FERTILIZE_DAYS else ()
+        ages = tuple(sorted(CROP_FERTILIZE_DAYS.get(name, {}))) if name in CROP_FERTILIZE_DAYS else ()
+        return name, ages
     return name, tuple(fertilize)
 
 
@@ -189,7 +188,12 @@ def _choose(market, baseline, candidates, counts, labor=None, position=(4, 4), *
     if audit is not None:
         audit.extend(results)
 
-    scored = [(r.score(target_option), r) for r in results if r.score(target_option) > 0]
+    scored = []
+    for result in results:
+        score = result.score(target_option)
+        if score > 0:
+            scored.append((score, result))
+
     if not scored:
         if decision_log is not None:
             decision_log.append({
@@ -215,6 +219,7 @@ def _choose(market, baseline, candidates, counts, labor=None, position=(4, 4), *
             if current_score >= best_score - TARGET_SWITCH_MARGIN:
                 result = current_result
                 reason = "retained_current_within_switch_margin"
+
     if decision_log is not None:
         decision_log.append({
             "day": getattr(market, "day", None),
@@ -227,6 +232,7 @@ def _choose(market, baseline, candidates, counts, labor=None, position=(4, 4), *
             "switch_margin": TARGET_SWITCH_MARGIN,
             "candidates": [_candidate_log(row, row.choice == result.choice) for row in results],
         })
+
     return result.choice, result.output
 
 
