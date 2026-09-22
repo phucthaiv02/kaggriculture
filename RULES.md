@@ -40,7 +40,13 @@ Scheduler được tự do sắp thứ tự task trong ngày để giảm travel
 Các dependency phải được giữ:
 
 - `PLANT → WATER` cho cây mới.
+- `BUILD_COOP/BUILD_PASTURE → PLACE` cho con vật mới. Không thực hiện BUILD
+  riêng lẻ: khi daily plan đã BUILD chuồng/pasture thì phải PLACE con vật vào
+  structure đó trong cùng ngày.
 - `PLACE → FEED/CARE` khi lịch của con vật mới yêu cầu.
+- Với producer kết thúc chu kỳ trong ngày, target thay thế phải được tính từ đầu
+  ngày và task phải giữ chuỗi `HARVEST → PLANT/WATER` hoặc
+  `HARVEST → BUILD/PLACE` trong cùng daily plan.
 - `PICKUP → action` đối với vật tư cần mang theo.
 - `HARVEST → quay về shed → DROP → SELL` khi cần biến hàng thành cash trong
   ngày cuối.
@@ -53,10 +59,12 @@ Các dependency phải được giữ:
    thành công đầu tiên thì chuyển vĩnh viễn từ opening sang planner.
 3. **Hour 0:** cập nhật target, tạo toàn bộ daily task từ observation hiện tại,
    ước lượng hand/vật tư, bán hàng dư và gửi lệnh mua/thuê. Worker trả `PASS`.
-4. Ở observation đầu tiên sau khi purchases/hires đầu ngày đã được xác nhận,
-   xây lại daily task set từ state thật rồi dựng **final daily queues**.
-   Nếu một top-up HIRE vẫn cần thiết thì chỉ chốt queue sau khi số hand thực tế
-   dùng cho plan đã được xác nhận.
+4. Nếu tổng lệnh market vượt `maxMarketOrdersPerTurn`, giữ phần dư trong morning
+   market queue và gửi tiếp ở các step kế tiếp; không cắt bỏ lệnh. Chỉ sau khi
+   toàn bộ purchases/hires đầu ngày đã được observation xác nhận mới xây lại
+   daily task set từ state thật rồi dựng **final daily queues**. Nếu một top-up
+   HIRE vẫn cần thiết thì chỉ chốt queue sau khi số hand thực tế dùng cho plan
+   đã được xác nhận.
 5. **Phần còn lại của ngày:** thực hiện queue đã chốt. Không prepend rescue
    route, không append từng task mới vào worker đang chạy và không opportunistic
    HARVEST chỉ vì worker tình cờ đứng trên tile có sản phẩm.
@@ -113,7 +121,8 @@ chứng minh toàn bộ mandatory work hiện có vẫn hoàn thành được.
 - Cùng một cửa sổ cho mọi ứng viên: từ `day` đến
   `min(day + 16, end_day)`, tính cả thu hoạch ngày cuối.
 - Không bắt đầu cây/con vật có lần cho sản phẩm đầu tiên ngoài cửa sổ.
-- Điểm = dòng tiền thị trường tăng thêm − vốn mua − chi phí nhân công tăng thêm.
+- Điểm = dòng tiền thị trường tăng thêm − vốn mua. Planner không tính chi phí
+  nhân công; chi phí HAND và khả năng thực thi do scheduler quyết định.
   Dòng tiền đã tính thức ăn, phân bón và tác động cung lên giá từng đơn vị.
   **Không chia lợi nhuận cho số ngày**, không áp quota vốn cây/con vật.
 - Chỉ chọn điểm dương. Khi bằng điểm: ưu tiên loại đang có ít hơn,
@@ -142,6 +151,13 @@ chứng minh toàn bộ mandatory work hiện có vẫn hoàn thành được.
 công việc của ngày trước khi scheduler route:
 
 - Cây mới luôn có `PLANT → WATER` trong cùng daily plan.
+- Nếu daily plan HARVEST một producer kết thúc chu kỳ và tile có target mới,
+  phải trồng hoặc nuôi target đó ngay sau HARVEST trong cùng ngày. Target thay
+  thế và vật tư cần thiết phải được tính từ đầu ngày, không chờ tile trống mới
+  chọn target.
+- Không tạo task `BUILD_COOP`/`BUILD_PASTURE` độc lập. BUILD và PLACE là một
+  investment task nguyên khối; thiếu animal hoặc không đủ capacity để PLACE thì
+  hoãn cả BUILD.
 - Cây có `consecutive_unwatered >= 1` và chưa WATER hôm nay phải có WATER
   mandatory trong daily task set, kể cả hôm nay không nằm trong cadence chuẩn.
 - Con vật có `consecutive_unfed >= 1` và chưa FEED hôm nay phải có FEED
@@ -172,8 +188,9 @@ capacity của cả ngày.
 - Optional work chỉ được giữ khi còn capacity hoặc giá trị tăng thêm lớn hơn
   chi phí thuê Fibonacci biên.
 - Giá trị optional task lấy từ cash dự kiến; investment mới dùng remaining
-  forecast output trừ vốn/vật tư tương lai. Planner đã xét labor khi chọn target,
-  không chia lại lợi nhuận cho số ngày chăm sóc.
+  forecast output trừ vốn/vật tư tương lai. Planner không xét labor; scheduler
+  là nơi duy nhất so giá trị công việc với chi phí thuê HAND biên, và không chia
+  lại lợi nhuận cho số ngày chăm sóc.
 - Khi so các route cùng tập task/số hand, ưu tiên tổng travel/pickup thấp hơn và
   khả năng đưa hàng cần bán về shed tốt hơn.
 - Gom các FEED/CARE/COLLECT_FERTILIZER gần nhau khi làm giảm route thực tế;
@@ -222,6 +239,9 @@ Runtime **không**:
   animal/seed cho investment đã được daily plan nhận.
 - Không BUY animal chỉ vì có target; phải có placement trong daily plan hoặc
   một committed future placement policy được planner định giá rõ ràng.
+- Animal investment đã được admit nhưng chưa đủ tiền ở đầu ngày được phép retry
+  BUY sau các lệnh SELL trong ngày; khi animal vào shed phải global-replan phần
+  việc còn lại để hoàn thành BUILD/PLACE trong chính ngày đó.
 - `DROP` giữa ngày chỉ nằm trong route khi giúp cashflow/capacity và không làm
   mất khả năng hoàn thành mandatory work.
 
