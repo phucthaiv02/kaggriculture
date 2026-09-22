@@ -1,0 +1,62 @@
+name: Apply product-local marginal scoring optimization
+
+on:
+  push:
+    branches: [agent-v3]
+    paths:
+      - .github/workflows/apply-marginal-product-optimization.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch exact product-local marginal valuation
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('agents/forecast.py')
+          text = path.read_text()
+          old = '''    def _settle_day(self, stocks, flows, when):\n        """Settle daily market pressure independently for each product.\n'''
+          new = '''    def _value_products(self, flows, products):\n        """Value only the requested independent product markets.\n\n        Product-local settlement means a candidate cannot change cash in a\n        product it neither sells nor consumes.  Restricting valuation to the\n        touched products is therefore exactly equivalent to subtracting two\n        full-portfolio valuations, but much cheaper when many fertilizer event\n        plans are compared against the same baseline.\n        """\n        products = tuple(products)\n        if not products:\n            return 0.0\n        stocks = {product: self.inventory.get(product, 0) for product in products}\n        cash = 0.0\n        previous = self.day * 24 + self.hour - 1\n        for when in range(self.day, self.end_day + 1):\n            step = when * 24 + 23\n            shop_ticks = step // 4 - previous // 4\n            center_ticks = step // 24 - previous // 24\n            for product in products:\n                stocks[product] -= self.shop_demand[product] * shop_ticks\n                if product in self.center_products:\n                    stocks[product] -= center_ticks\n            previous = step\n            cash += self._settle_day(stocks, flows, when, products)\n        return cash\n\n    def marginal_value(self, baseline, candidate, baseline_values=None):\n        """Exact ``value(base + candidate) - value(base)`` on touched markets."""\n        touched = set()\n        for field in (candidate.sales, candidate.inputs):\n            for units in field.values():\n                touched.update(product for product, amount in units.items() if amount)\n        products = tuple(product for product in game.PRODUCTS if product in touched)\n        if not products:\n            return 0.0\n\n        key = products\n        if baseline_values is not None and key in baseline_values:\n            baseline_value = baseline_values[key]\n        else:\n            baseline_value = self._value_products(baseline, products)\n            if baseline_values is not None:\n                baseline_values[key] = baseline_value\n\n        combined = Production()\n        combined.add(baseline)\n        combined.add(candidate)\n        return self._value_products(combined, products) - baseline_value\n\n    def _settle_day(self, stocks, flows, when, products=None):\n        """Settle daily market pressure independently for each product.\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'forecast insertion count={text.count(old)}')
+          text = text.replace(old, new)
+          old = '''        for product in game.PRODUCTS:\n            own_amount = own_sales.get(product, 0) - own_inputs.get(product, 0)\n'''
+          new = '''        for product in (game.PRODUCTS if products is None else products):\n            own_amount = own_sales.get(product, 0) - own_inputs.get(product, 0)\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'settle loop replacement count={text.count(old)}')
+          text = text.replace(old, new)
+          old = '''    def marginal_profit(self, baseline, candidate, fixed_cost, baseline_value=None):\n        combined = Production()\n        combined.add(baseline)\n        combined.add(candidate)\n        if baseline_value is None:\n            baseline_value = self.value(baseline)\n        return self.value(combined) - baseline_value - fixed_cost\n'''
+          new = '''    def marginal_profit(self, baseline, candidate, fixed_cost, baseline_value=None):\n        # baseline_value is retained for call compatibility; product-local\n        # marginal valuation is exact and avoids full-portfolio rescoring.\n        del baseline_value\n        return self.marginal_value(baseline, candidate) - fixed_cost\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'marginal_profit replacement count={text.count(old)}')
+          path.write_text(text.replace(old, new))
+
+          path = Path('agents/planner.py')
+          text = path.read_text()
+          old = '''    scoped_baseline = scoped(baseline)\n    baseline_value = scoped_market.value(scoped_baseline)\n    for choice, output, cost in candidates:\n'''
+          new = '''    scoped_baseline = scoped(baseline)\n    baseline_values = {}\n    for choice, output, cost in candidates:\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'planner baseline replacement count={text.count(old)}')
+          text = text.replace(old, new)
+          old = '''        combined = Production()\n        combined.add(scoped_baseline)\n        combined.add(output)\n        market_cash = scoped_market.value(combined) - baseline_value\n        results.append(TargetProfit(choice, output, market_cash, cost, 0.0))\n'''
+          new = '''        market_cash = scoped_market.marginal_value(\n            scoped_baseline, output, baseline_values\n        )\n        results.append(TargetProfit(choice, output, market_cash, cost, 0.0))\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'planner marginal replacement count={text.count(old)}')
+          path.write_text(text.replace(old, new))
+          PY
+          python -m py_compile agents/forecast.py agents/planner.py
+          git diff --check
+          git diff -- agents/forecast.py agents/planner.py
+      - name: Commit optimization
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agents/forecast.py agents/planner.py
+          git commit -m "planner: score marginal cash by touched product"
+          git push origin HEAD:agent-v3
