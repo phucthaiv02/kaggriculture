@@ -1,4 +1,4 @@
-name: Validate split opening and no-priority scheduler
+name: Validate split opening and order-only scheduler
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/scheduler-no-priority-validation.yml
       - experiments/_validate_scheduler_no_priority.py
+      - experiments/_validate_scheduler_order_only.py
 
 permissions:
   contents: read
@@ -29,21 +30,12 @@ jobs:
 
       - name: Build regime-split candidate in runner only
         run: |
-          # Opening keeps the known-good scheduler exactly.  Post-opening gets
-          # the no-action-priority scheduler.  Nothing in production is changed
-          # unless this candidate clears replay gates.
+          # Opening keeps the exact known-good scheduler. Post-opening removes
+          # execution-order priorities while retaining stable admission/headcount
+          # economics for this surgical ablation.
           git show "$PATCH_BASE_COMMIT:agents/scheduler.py" > agents/scheduler.py
           cp agents/scheduler.py agents/scheduler_post.py
-          python - <<'PY'
-          from pathlib import Path
-
-          source = Path('experiments/_validate_scheduler_no_priority.py').read_text()
-          needle = 'path = Path("agents/scheduler.py")'
-          if source.count(needle) != 1:
-              raise SystemExit(f'no-priority scheduler path replacement count={source.count(needle)}')
-          source = source.replace(needle, 'path = Path("agents/scheduler_post.py")', 1)
-          exec(compile(source, 'experiments/_validate_scheduler_no_priority.py', 'exec'))
-          PY
+          python experiments/_validate_scheduler_order_only.py
 
           git show "$PATCH_BASE_COMMIT:agents/expansion_agent.py" > agents/expansion_agent.py
           python - <<'PY'
@@ -51,7 +43,6 @@ jobs:
 
           path = Path('agents/expansion_agent.py')
           text = path.read_text()
-
           old_import = 'from agents.scheduler import MAX_HANDS, build_queues, hands_needed, nearest_shed, route\n'
           new_import = '''from agents.scheduler import (\n    MAX_HANDS,\n    build_queues as opening_build_queues,\n    hands_needed as opening_hands_needed,\n    nearest_shed,\n    route,\n)\nfrom agents.scheduler_post import (\n    build_queues as post_build_queues,\n    hands_needed as post_hands_needed,\n)\n'''
           if text.count(old_import) != 1:
@@ -59,17 +50,10 @@ jobs:
           text = text.replace(old_import, new_import, 1)
 
           anchor = '    opening_governs = make_opening_controller()\n\n\n'
-          wrappers = '''    opening_governs = make_opening_controller()\n\n    def hands_needed(*args, **kwargs):\n        # Opening is an intentional bootstrap exception.  Generic scheduling\n        # starts only after opening has handed off at a day boundary.\n        scheduler = (\n            opening_hands_needed if state["opening_active"]\n            else post_hands_needed\n        )\n        return scheduler(*args, **kwargs)\n\n    def build_queues(*args, **kwargs):\n        scheduler = (\n            opening_build_queues if state["opening_active"]\n            else post_build_queues\n        )\n        return scheduler(*args, **kwargs)\n\n\n'''
+          wrappers = '''    opening_governs = make_opening_controller()\n\n    def hands_needed(*args, **kwargs):\n        scheduler = (\n            opening_hands_needed if state["opening_active"]\n            else post_hands_needed\n        )\n        return scheduler(*args, **kwargs)\n\n    def build_queues(*args, **kwargs):\n        scheduler = (\n            opening_build_queues if state["opening_active"]\n            else post_build_queues\n        )\n        return scheduler(*args, **kwargs)\n\n\n'''
           if text.count(anchor) != 1:
               raise SystemExit(f'scheduler wrapper anchor count={text.count(anchor)}')
           text = text.replace(anchor, wrappers, 1)
-
-          old_regime = '''        if hour > 0 and new_positions:\n            state["deferred_expansion_positions"].update(new_positions)\n        if hour == 0 or new_positions:\n            state["opening_active"] = opening_governs(obs, targets, positions)\n            if not state["opening_active"]:\n                state["pending_targets"].update(new_positions)\n                if hour == 0 and not state["pending_targets"]:\n                    unrealized_committed = (\n                        state["committed_targets"] - physical_positions\n                    )\n                    state["pending_targets"].update(\n                        active_position_set - unrealized_committed\n                    )\n'''
-          new_regime = '''        if hour > 0 and new_positions:\n            # Expansion discovered during the day belongs to tomorrow's plan.\n            # Do not switch execution regime in the middle of a frozen day.\n            state["deferred_expansion_positions"].update(new_positions)\n        if hour == 0:\n            state["opening_active"] = opening_governs(obs, targets, positions)\n            if not state["opening_active"]:\n                state["pending_targets"].update(new_positions)\n                if not state["pending_targets"]:\n                    unrealized_committed = (\n                        state["committed_targets"] - physical_positions\n                    )\n                    state["pending_targets"].update(\n                        active_position_set - unrealized_committed\n                    )\n'''
-          if text.count(old_regime) != 1:
-              raise SystemExit(f'opening regime replacement count={text.count(old_regime)}')
-          text = text.replace(old_regime, new_regime, 1)
-
           path.write_text(text)
           PY
 
@@ -80,16 +64,13 @@ jobs:
           ! grep -q 'def _rescue_priority' agents/scheduler_post.py
           ! grep -q 'group_animal' agents/scheduler_post.py
           ! grep -q 'planting and harvest are not delayed' agents/scheduler_post.py
-          grep -q 'opening_hands_needed if state\["opening_active"\]' agents/expansion_agent.py
-          grep -q 'post_hands_needed' agents/expansion_agent.py
+          grep -q 'hour == 0 or new_positions' agents/expansion_agent.py
 
       - name: Install test/runtime dependencies
         run: python -m pip install pytest kaggle-environments
 
       - name: Run post-opening scheduler tests
         run: |
-          # Existing tests import agents.scheduler, so point that module at the
-          # candidate only for this unit-test step, then restore opening.
           cp agents/scheduler.py /tmp/opening_scheduler.py
           cp agents/scheduler_post.py agents/scheduler.py
           python -m pytest -q \
@@ -108,28 +89,27 @@ jobs:
           from agents.farm_tasks import Task
           from agents.scheduler_post import build_queues, hands_needed
 
-          # Mandatory is a hard inclusion constraint, not execution priority.
           required = Task((0, 0), [['WATER']] * 14, mandatory=True)
           optional = Task((4, 4), [['HARVEST']] * 9, mandatory=False, value=999)
           plans, missing = build_queues([optional, required], (4, 4), 0)
           assert required not in missing
           assert optional in missing
 
-          # Action labels do not impose ordering; geometry may put FEED first.
-          near_feed = Task((4, 3), [['FEED']], mandatory=True)
-          far_harvest = Task((0, 0), [['HARVEST']], mandatory=True, animal_harvest=True)
-          plans, missing = build_queues([far_harvest, near_feed], (4, 4), 0)
+          # Mandatory/optional controls admission only. It must not force route
+          # order after both tasks fit the complete schedule.
+          near_optional = Task((4, 3), [['FEED']], mandatory=False, value=100)
+          far_required = Task((0, 0), [['HARVEST']], mandatory=True)
+          plans, missing = build_queues([far_required, near_optional], (4, 4), 0)
           assert not missing
-          assert plans[0].queue.index(['FEED']) < plans[0].queue.index(['HARVEST'])
+          assert plans[0].queue.index(['FEED']) < plans[0].queue.index(['HARVEST']), plans[0].queue
 
-          # Extra labor is bought only if admitted optional value pays for it.
           full = Task((4, 4), [['WATER']] * 23, mandatory=True)
           extra = Task((4, 4), [['COLLECT_FERTILIZER']], mandatory=False, value=10)
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[9]) == (1, [])
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[11]) == (0, [extra])
           PY
 
-      - name: Replay split candidate and stable base against A
+      - name: Replay surgical candidate and stable base against A
         run: |
           mkdir -p validation/candidate validation/base
           /usr/bin/time -f '%e' -o validation/candidate_seconds.txt \
@@ -159,22 +139,12 @@ jobs:
                   and not tile.get('animal')
               )
 
-          # A day that began in opening must stay byte-for-byte behaviorally
-          # identical for that whole day, even if BUY_LAND succeeds mid-day.
-          opening_days = set()
-          for step in br['steps']:
-              obs = step[0]['observation']
-              if obs['hour'] != 0:
-                  continue
-              farm = obs['farms'][obs['player']]
-              if len(farm['unlocked_quadrants']) == 1:
-                  opening_days.add(obs['day'])
-
           first_opening_divergence = None
           first_post_divergence = None
           for index, (cs, bs) in enumerate(zip(cr['steps'], br['steps'])):
-              co = cs[0]['observation']
               bo = bs[0]['observation']
+              farm = bo['farms'][bo['player']]
+              base_is_opening = len(farm['unlocked_quadrants']) == 1
               ca = cs[0].get('action') or {}
               ba = bs[0].get('action') or {}
               if ca == ba:
@@ -186,9 +156,9 @@ jobs:
                   'base': ba,
                   'candidate': ca,
               }
-              if bo['day'] in opening_days and first_opening_divergence is None:
+              if base_is_opening and first_opening_divergence is None:
                   first_opening_divergence = entry
-              elif bo['day'] not in opening_days and first_post_divergence is None:
+              elif not base_is_opening and first_post_divergence is None:
                   first_post_divergence = entry
 
           out = {
@@ -201,7 +171,6 @@ jobs:
               'base_seconds': float((root/'base_seconds.txt').read_text()),
               'candidate_empty_structures': empty_structures(cr),
               'base_empty_structures': empty_structures(br),
-              'opening_days': sorted(opening_days),
               'first_opening_divergence': first_opening_divergence,
               'first_post_divergence': first_post_divergence,
           }
@@ -209,7 +178,7 @@ jobs:
           (root/'comparison.json').write_text(json.dumps(out, indent=2))
 
           if first_opening_divergence is not None:
-              raise SystemExit('opening behavior changed; generic scheduler leaked into bootstrap regime')
+              raise SystemExit('opening behavior changed before land handoff')
           if C['statuses'] != ['DONE', 'DONE']:
               raise SystemExit('candidate did not finish cleanly')
           if out['candidate_empty_structures'] > out['base_empty_structures']:
@@ -221,6 +190,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scheduler-regime-split-${{ github.sha }}
+          name: scheduler-order-only-${{ github.sha }}
           path: validation
           if-no-files-found: warn
