@@ -35,20 +35,28 @@ new = '''        if hour == 0 or new_positions:
                         active_position_set - unrealized_committed
                     )
 
-        # A producer that ends its crop cycle today needs its successor chosen
-        # before the daily task graph is built. This is a dependency of the
-        # HARVEST task, not an action priority: every such position is repriced
-        # at hour 0 outside the normal investment batching limit.
+        # When a crop cycle ends, the standing target is already the planned
+        # successor unless it is absent or can no longer start in the horizon.
+        # Resolve that dependency before build_tasks sees _pending_targets;
+        # do not reprice a valid target merely because HARVEST happens today.
         turnover_positions = set()
+        unresolved_turnover = set()
         if hour == 0 and not state["opening_active"]:
             for y, row in enumerate(farm["tiles"]):
                 for x, tile in enumerate(row):
                     if not (isinstance(tile, dict) and tile.get("kind") == "PLANT"):
                         continue
                     crop = tile["crop"]
-                    if cycle_finished(crop, day - tile["planted_day"], tile):
-                        turnover_positions.add((x, y))
-            state["pending_targets"].update(turnover_positions)
+                    if not cycle_finished(crop, day - tile["planted_day"], tile):
+                        continue
+                    position = (x, y)
+                    turnover_positions.add(position)
+                    current = targets.get(position)
+                    if current and can_start_today(current[0], obs):
+                        state["pending_targets"].discard(position)
+                    else:
+                        unresolved_turnover.add(position)
+                        state["pending_targets"].add(position)
 
         pinned_animals = reconcile_animals(obs, targets)
 '''
@@ -66,15 +74,15 @@ old = '''        obs["_committed_targets"] = set(state["committed_targets"])
             ))
 '''
 new = '''        obs["_committed_targets"] = set(state["committed_targets"])
-        if hour == 0 and not state["opening_active"] and turnover_positions:
-            unresolved_turnover = set(plan_targets(
+        if hour == 0 and not state["opening_active"] and unresolved_turnover:
+            still_unresolved = set(plan_targets(
                 obs, targets, positions, effective_end,
-                max_positions=len(turnover_positions),
-                replan_positions=turnover_positions,
+                max_positions=len(unresolved_turnover),
+                replan_positions=unresolved_turnover,
             ))
-            resolved_turnover = turnover_positions - unresolved_turnover
+            resolved_turnover = unresolved_turnover - still_unresolved
             state["pending_targets"].difference_update(resolved_turnover)
-            state["pending_targets"].update(unresolved_turnover)
+            state["pending_targets"].update(still_unresolved)
 
         if hour == 0 and not state["opening_active"] and state["pending_targets"]:
             pending_before = set(state["pending_targets"])
