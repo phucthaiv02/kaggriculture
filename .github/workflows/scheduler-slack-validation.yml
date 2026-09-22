@@ -1,4 +1,4 @@
-name: Validate no-priority scheduler horizon slack
+name: Validate no-priority scheduler
 
 on:
   push:
@@ -6,8 +6,6 @@ on:
     paths:
       - .github/workflows/scheduler-slack-validation.yml
       - experiments/_validate_scheduler_no_priority.py
-      - experiments/_validate_scheduler_balance_patch.py
-      - experiments/_validate_scheduler_slack_patch.py
 
 permissions:
   contents: read
@@ -28,20 +26,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Apply no-priority scheduler in runner only
         run: |
           git show "$PATCH_BASE_COMMIT:agents/scheduler.py" > agents/scheduler.py
           python experiments/_validate_scheduler_no_priority.py
-          python experiments/_validate_scheduler_balance_patch.py
-          python experiments/_validate_scheduler_slack_patch.py
           python -m py_compile agents/scheduler.py
           git diff --check
           ! grep -q 'def _priority' agents/scheduler.py
           ! grep -q 'def _rescue_priority' agents/scheduler.py
           ! grep -q 'group_animal' agents/scheduler.py
           ! grep -q 'planting and harvest are not delayed' agents/scheduler.py
+
       - name: Install test/runtime dependencies
         run: python -m pip install pytest kaggle-environments
+
       - name: Run architecture-focused scheduler tests
         run: |
           python -m pytest -q \
@@ -65,30 +64,20 @@ jobs:
           assert required not in missing
           assert optional in missing
 
-          # No action label is intrinsically earlier than another.
+          # Action names do not impose execution order: geometry does.
           near_feed = Task((4, 3), [['FEED']], mandatory=True)
           far_harvest = Task((0, 0), [['HARVEST']], mandatory=True, animal_harvest=True)
           plans, missing = build_queues([far_harvest, near_feed], (4, 4), 0)
           assert not missing
           assert plans[0].queue.index(['FEED']) < plans[0].queue.index(['HARVEST'])
 
+          # Labor economics still decides whether optional value is worth a hand.
           full = Task((4, 4), [['WATER']] * 23, mandatory=True)
           extra = Task((4, 4), [['COLLECT_FERTILIZER']], mandatory=False, value=10)
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[9]) == (1, [])
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[11]) == (0, [extra])
-
-          # Spare capacity stays local for a short route, but a route consuming
-          # most of the day is split across already-paid workers to create slack.
-          short = [Task((4, 4), [['WATER']] * 4, mandatory=True) for _ in range(2)]
-          short_plans, missing = build_queues(short, (4, 4), 1, hand_starts=((5, 4),))
-          assert not missing
-          assert sum(bool(plan.queue) for plan in short_plans) == 1
-
-          long = [Task((4, 4), [['WATER']] * 5, mandatory=True) for _ in range(4)]
-          long_plans, missing = build_queues(long, (4, 4), 3)
-          assert not missing
-          assert sum(bool(plan.queue) for plan in long_plans) >= 2
           PY
+
       - name: Replay candidate and animal-fixed base against A
         run: |
           mkdir -p validation/candidate validation/base
@@ -116,10 +105,13 @@ jobs:
           }
           print(json.dumps(out, indent=2))
           (root/'comparison.json').write_text(json.dumps(out, indent=2))
+          if C['statuses'] != ['DONE', 'DONE']:
+              raise SystemExit(f"candidate statuses: {C['statuses']}")
           PY
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scheduler-slack-${{ github.sha }}
+          name: scheduler-no-priority-${{ github.sha }}
           path: validation
           if-no-files-found: warn
