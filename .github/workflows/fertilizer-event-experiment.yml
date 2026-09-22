@@ -40,6 +40,7 @@ jobs:
             tests/test_agents_forecast.py \
             tests/test_agents_farm_tasks.py
       - name: Benchmark decision limit
+        # Keep exhaustive fertilizer-event search; optimize evaluation instead.
         run: |
           python - <<'PY'
           from experiments.benchmark_agent import benchmark
