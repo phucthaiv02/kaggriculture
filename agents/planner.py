@@ -4,8 +4,11 @@ from copy import copy
 from dataclasses import dataclass
 
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
+from agents.fertilizer import FertilizerPlan, cycle_plan, plan_ages, plan_json
 from agents.forecast import MarketForecast, Production, production
-from agents.schedules import CROP_LAST_AGE, ONGOING_CROPS, cycle_finished
+from agents.schedules import (
+    CROP_FERTILIZE_DAYS, CROP_LAST_AGE, ONGOING_CROPS, cycle_finished,
+)
 from agents.horizon import (
     SEASON_END_DAY, cycle_end as _cycle_end,
     first_yield_age as _first_yield_age, can_start,
@@ -17,22 +20,74 @@ from agents.products import ANIMALS, ANIMAL_COST, CROPS, SEED_COST
 TARGET_SWITCH_MARGIN = 1.0
 
 
+def _crop_cycle_starts(name, day, end_day, tile=None):
+    """Cycle starts represented by the existing rotation forecast."""
+    end_day = _cycle_end(day, end_day)
+    first_yield = _first_yield_age(name)
+    if tile is None:
+        if day + first_yield > end_day:
+            return []
+        starts = [day]
+        next_start = day + CROP_LAST_AGE[name]
+    else:
+        planted = tile["planted_day"]
+        starts = [planted]
+        next_start = max(day, planted + CROP_LAST_AGE[name])
+
+    # A later rotation only matters when it can produce at least once inside
+    # the same planner horizon. Same-day harvest -> replant remains allowed.
+    while next_start + first_yield <= end_day:
+        starts.append(next_start)
+        next_start += CROP_LAST_AGE[name]
+    return starts
+
+
+def _fertilizer_plans(name, day, end_day):
+    """Enumerate every legal dated fertilizer event combination in horizon."""
+    starts = _crop_cycle_starts(name, day, end_day)
+    events = []
+    for cycle_index, start in enumerate(starts):
+        for age in sorted(CROP_FERTILIZE_DAYS[name]):
+            when = start + age
+            if day <= when <= _cycle_end(day, end_day):
+                events.append((cycle_index, age))
+
+    # Current crops have at most five fertilizer events in a 16-day window, so
+    # exhaustive enumeration is tiny (<= 32 plans) and avoids a heuristic.
+    for mask in range(1 << len(events)):
+        cycles = [[] for _ in starts]
+        for bit, (cycle_index, age) in enumerate(events):
+            if mask & (1 << bit):
+                cycles[cycle_index].append(age)
+        yield FertilizerPlan(tuple(tuple(values) for values in cycles))
+
+
 def _rotation(name, fertilize, day, end_day, tile=None):
-    """Include crop replants only when a scheduled harvest fits the window."""
+    """Include replants only when a scheduled harvest fits the window.
+
+    For crops, ``fertilize`` may be a legacy boolean or a FertilizerPlan whose
+    cycles independently select fertilizer events. Future-cycle events are
+    forecast assumptions only; the real tile is repriced when each cycle ends.
+    """
     end_day = _cycle_end(day, end_day)
     if tile is None and day + _first_yield_age(name) > end_day:
         return Production(), 0
     if name in ANIMALS:
-        return production(name, fertilize, day, end_day, tile), (0 if tile is not None else ANIMAL_COST[name])
-    output = production(name, fertilize, day, end_day, tile)
-    cost = 0 if tile is not None else SEED_COST[name]
-    planted = tile['planted_day'] if tile is not None else day
-    start = max(day, planted + CROP_LAST_AGE[name])
-    first_harvest = _first_yield_age(name) if name in ONGOING_CROPS else CROP_LAST_AGE[name]
-    while start + first_harvest <= end_day:
-        output.add(production(name, fertilize, start, end_day))
+        return production(name, False, day, end_day, tile), (0 if tile is not None else ANIMAL_COST[name])
+
+    starts = _crop_cycle_starts(name, day, end_day, tile)
+    if not starts:
+        return Production(), 0
+
+    output = Production()
+    cost = 0
+    for index, start in enumerate(starts):
+        per_cycle = cycle_plan(fertilize, index)
+        if index == 0 and tile is not None:
+            output.add(production(name, per_cycle, day, end_day, tile))
+            continue
+        output.add(production(name, per_cycle, start, end_day))
         cost += SEED_COST[name]
-        start += CROP_LAST_AGE[name]
     return output, cost
 
 
@@ -42,7 +97,11 @@ def _candidates(day, end_day):
         first = _first_yield_age(name)
         if day + first > end_day:
             continue
-        for fertilize in ((False, True) if name in CROPS else (False,)):
+        if name in ANIMALS:
+            output, cost = _rotation(name, False, day, end_day)
+            yield (name, False), output, cost
+            continue
+        for fertilize in _fertilizer_plans(name, day, end_day):
             output, cost = _rotation(name, fertilize, day, end_day)
             yield (name, fertilize), output, cost
 
@@ -102,11 +161,28 @@ def evaluate_targets(
     return results
 
 
+def _choice_current_key(choice):
+    """Compare standing commitment only; later forecast cycles are revisited."""
+    if choice is None:
+        return None
+    name, fertilize = choice
+    if name in ANIMALS:
+        return name, ()
+    ages = plan_ages(fertilize)
+    if ages is None:  # legacy True means every verified event this cycle
+        ages = tuple(sorted(CROP_FERTILIZE_DAYS[name]))
+    return name, tuple(ages)
+
+
 def _choose(
-    market, baseline, candidates, counts, labor=None, position=(4, 4), *, current=None
+    market, baseline, candidates, counts, labor=None, position=(4, 4), *, current=None,
+    audit=None,
 ):
+    rows = evaluate_targets(market, baseline, candidates, labor, position)
+    if audit is not None:
+        audit.extend(rows)
     scored = []
-    for result in evaluate_targets(market, baseline, candidates, labor, position):
+    for result in rows:
         score = result.profit
         if score > 0:
             scored.append((score, result))
@@ -117,12 +193,24 @@ def _choose(
         key=lambda item: (item[0], -counts[item[1].choice[0]], item[1].choice),
     )
     if current is not None:
-        current_rows = [(score, row) for score, row in scored if row.choice == current]
+        current_key = _choice_current_key(current)
+        current_rows = [
+            (score, row) for score, row in scored
+            if _choice_current_key(row.choice) == current_key
+        ]
         if current_rows:
             current_score, current_result = max(current_rows, key=lambda item: item[0])
             if current_score >= best_score - TARGET_SWITCH_MARGIN:
                 result = current_result
     return result.choice, result.output
+
+
+def _legacy_choice(choice):
+    """Keep analysis helpers' historic ``(name, bool)`` return contract."""
+    if choice is None:
+        return None
+    name, fertilize = choice
+    return (name, bool(fertilize)) if name in CROPS else choice
 
 
 def _score(name, end_day, day, inventory, wheat_price, committed_units, unlocked_shops=()):
@@ -134,7 +222,7 @@ def _score(name, end_day, day, inventory, wheat_price, committed_units, unlocked
     if not results:
         return None, False
     best = max(results, key=lambda r: r.profit)
-    return best.profit, best.choice[1]
+    return best.profit, bool(best.choice[1])
 
 
 def best_target(end_day, day, inventory, wheat_price, committed_units,
@@ -143,18 +231,46 @@ def best_target(end_day, day, inventory, wheat_price, committed_units,
     market = MarketForecast(inventory, unlocked_shops, day, end_day)
     baseline = Production()
     baseline.sales[day].update(committed_units)
-    return _choose(
+    return _legacy_choice(_choose(
         market, baseline, list(_candidates(day, end_day)), Counter()
-    )[0]
+    )[0])
 
 
-def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None, replan_positions=None):
+def _log_decision(decision_log, day, position, rows, selected):
+    if decision_log is None:
+        return
+    decision_log.append({
+        "day": day,
+        "position": list(position),
+        "selected": None if selected is None else [selected[0], plan_json(selected[1])],
+        "candidates": [
+            {
+                "target": [row.choice[0], plan_json(row.choice[1])],
+                "market_cash": row.market_cash,
+                "capital_cost": row.capital_cost,
+                "labor_cost": row.labor_cost,
+                "score": row.profit,
+                "profitable": row.profit > 0,
+                "selected": row.choice == selected,
+            }
+            for row in rows
+        ],
+    })
+
+
+def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
+                 replan_positions=None, decision_log=None):
     """Reprice each new commitment against actual remaining production.
 
     Existing crops are forecast from their real age, held yield and watering
     state, including visible opponent crops. Unsown choices are reconsidered
     each day. No profitable candidate means no planting, with harvest-only
     cleanup handled by build_tasks.
+
+    Crop candidates score every legal fertilizer event combination in the
+    horizon. The selected target stores the current cycle plus later forecast
+    cycles; only the current cycle is operationally committed, because the tile
+    is repriced again when that cycle finishes.
 
     With max_positions, price only that many eligible tiles and return the
     remainder for later turns. replan_positions restricts this pass to pending
@@ -207,13 +323,19 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
                 if not name:
                     continue
                 target = targets.get((x, y)) if player == obs["player"] else None
-                fertilize = bool(target and target[0] == name and target[1])
+                fertilizer = target[1] if target and target[0] == name else False
                 # Opponent future fertilizer decisions are not observable.
                 destination = baseline if player == obs["player"] else external
                 if player == obs["player"] and (x, y) not in replanning_set:
-                    future, _ = _rotation(name, fertilize, day, end_day, tile)
+                    future, _ = _rotation(name, fertilizer, day, end_day, tile)
                 else:
-                    future = production(name, fertilize, day, end_day, tile)
+                    future = production(
+                        name,
+                        cycle_plan(fertilizer, 0) if player == obs["player"] else False,
+                        day,
+                        end_day,
+                        tile,
+                    )
                 destination.add(future, (x, y))
                 if player == obs["player"] and (x, y) not in replanning_set:
                     counts[name] += 1
@@ -245,10 +367,13 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
             allowed = [c for c in candidates if c[0][0] in ANIMALS
                        and official_game.ANIMALS[c[0][0]]["structure"] == tile["kind"]]
         current = targets.get(position)
+        audit = [] if decision_log is not None else None
         choice, output = _choose(
-            market, baseline, allowed, counts, position=position, current=current
+            market, baseline, allowed, counts, position=position, current=current,
+            audit=audit,
         )
         targets[position] = choice
+        _log_decision(decision_log, day, position, audit or (), choice)
         if choice:
             # Include this commitment's supply in the shared window.
             baseline.add(output, position)
