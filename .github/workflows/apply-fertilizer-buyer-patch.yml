@@ -1,0 +1,38 @@
+name: Apply fertilizer buyer integration
+
+on:
+  push:
+    branches: [agent-v3]
+    paths:
+      - .github/workflows/apply-fertilizer-buyer-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Include due fertilizer tasks in morning purchases
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('agents/expansion_agent.py')
+          text = path.read_text()
+          old = '''            # Purchases are narrower than maintenance. A standing future COW\n            # target on a still-growing crop is not permission to buy a COW;\n            # only a PLANT/PLACE task actually admitted today may buy input.\n            purchase_targets = {\n                p: t for p, t in daily_targets.items()\n                if p in state["purchase_positions"]\n            }\n            assigned_tasks = [task for task in tasks if id(task) not in rejected_ids]\n            reservations = reserved_items(assigned_tasks)\n'''
+          new = '''            # Purchases are narrower than maintenance. A standing future COW\n            # target on a still-growing crop is not permission to buy a COW;\n            # only admitted PLANT/PLACE investments and exact fertilizer events\n            # due in today's assigned schedule may create market input demand.\n            assigned_tasks = [task for task in tasks if id(task) not in rejected_ids]\n            fertilizer_purchase_positions = {\n                task.position for task in assigned_tasks\n                if task.needs.get("FERTILIZER", 0) > 0\n            }\n            purchase_targets = {\n                p: t for p, t in daily_targets.items()\n                if (p in state["purchase_positions"]\n                    or p in fertilizer_purchase_positions)\n            }\n            reservations = reserved_items(assigned_tasks)\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'replacement count={text.count(old)}')
+          path.write_text(text.replace(old, new))
+          PY
+          python -m py_compile agents/expansion_agent.py
+          git diff --check
+          git diff -- agents/expansion_agent.py
+      - name: Commit buyer integration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agents/expansion_agent.py
+          git commit -m "planner: fund assigned fertilizer tasks"
+          git push origin HEAD:agent-v3
