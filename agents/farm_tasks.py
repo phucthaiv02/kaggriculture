@@ -4,11 +4,10 @@ Pure function of (obs, targets) -> list[Task]. No side effects, no hidden
 state -- everything a tile needs is derivable from the current observation
 plus the standing "what should live here" decision (targets), produced by the planner.
 
-A target is `(name, fertilize) | None`: `name` is a crop or animal, and
-`fertilize` is a commitment made once at planting time (see agents/
-planner.py) because the correct WATER schedule for an ongoing crop depends
-on whether it will be fertilized -- it is not a fertilize/day decision that
-can be revisited daily (see agents/schedules.py's module docstring).
+A target is `(name, fertilizer_plan) | None`: `name` is a crop or animal.
+Dynamic planner targets carry the exact fertilizer ages selected for the
+current crop cycle (plus forecast-only later cycles); opening targets retain
+the historical boolean flag.  agents/schedules.py normalizes both forms.
 """
 
 from __future__ import annotations
@@ -273,8 +272,13 @@ def build_tasks(
 
         elif isinstance(tile, dict) and tile.get("kind") == "PLANT":
             crop, age = tile["crop"], day - tile["planted_day"]
-            if fertilizer_left and should_fertilize_today(crop, age, fertilize_commit):
-                fertilizer_left -= 1
+            if (should_fertilize_today(crop, age, fertilize_commit)
+                    and tile.get("fertilized_until_day", -1) < day + 2):
+                # A committed fertilizer event is a real scheduled input, not
+                # an opportunistic action conditional on current shed stock.
+                # purchase_orders funds any shortfall before this route runs.
+                if fertilizer_left > 0:
+                    fertilizer_left -= 1
                 needs["FERTILIZER"] += 1
                 actions.append(["FERTILIZE"])
             if (is_maintenance_day(crop, age, fertilize_commit)
@@ -635,6 +639,27 @@ def purchase_orders(
         shed.get("WHEAT", 0) if available_wheat is None else available_wheat
     ) + carried_wheat
 
+    # Exact fertilizer demand for committed events that are due today.  This
+    # mirrors build_tasks so the market plan can fund FERTILIZE even when the
+    # shed starts the morning empty.  Opening targets use False and therefore
+    # preserve their sell-fertilizer bootstrap behavior.
+    fertilizer_demand = 0
+    effective_targets = executable_targets(obs, targets)
+    for position in active_positions:
+        target = effective_targets.get(position)
+        if not target or target[0] not in CROPS:
+            continue
+        x, y = position
+        tile = farm["tiles"][y][x]
+        if not (isinstance(tile, dict) and tile.get("kind") == "PLANT"
+                and tile.get("crop") == target[0]):
+            continue
+        age = obs["day"] - tile["planted_day"]
+        if (should_fertilize_today(tile["crop"], age, target[1])
+                and tile.get("fertilized_until_day", -1) < obs["day"] + 2):
+            fertilizer_demand += 1
+    fertilizer_needed = max(0, fertilizer_demand - shed.get("FERTILIZER", 0))
+
     # Feed reserve remains deliberately conservative (it may cover a verified
     # schedule gap too): spare wheat is cheap insurance against delayed
     # placement/refinance, while build_tasks decides the exact ages on which
@@ -672,6 +697,16 @@ def purchase_orders(
 
     money = farm["money"] if available_money is None else available_money
     money -= wheat_cost(wheat_needed_now)
+
+    fertilizer_inventory = obs["market"]["inventory"].get("FERTILIZER", 0)
+    fertilizer_cost = sum(
+        market_price(
+            "FERTILIZER", fertilizer_inventory - unit - 1,
+            obs["market"].get("params"),
+        )
+        for unit in range(fertilizer_needed)
+    )
+    money -= fertilizer_cost
 
     # Orders are processed strictly in sequence -- one order's quantity is
     # fully exhausted (as far as cash allows) before the next order is even
@@ -765,5 +800,7 @@ def purchase_orders(
     orders = []
     if wheat_needed:
         orders.append(["BUY_PRODUCT", "WHEAT", wheat_needed])
+    if fertilizer_needed:
+        orders.append(["BUY_PRODUCT", "FERTILIZER", fertilizer_needed])
     orders += animal_orders + seed_orders
     return orders

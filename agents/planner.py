@@ -239,13 +239,22 @@ def best_target(end_day, day, inventory, wheat_price, committed_units,
 def _log_decision(decision_log, day, position, rows, selected):
     if decision_log is None:
         return
+    def logged_target(choice):
+        if choice is None:
+            return None
+        name, plan = choice
+        return [name, bool(plan) if name in CROPS else False]
+
     decision_log.append({
         "day": day,
         "position": list(position),
-        "selected": None if selected is None else [selected[0], plan_json(selected[1])],
+        "selected": logged_target(selected),
+        "fertilize_plan": None if selected is None else plan_json(selected[1]),
+        "reason": "no_profitable_candidate" if selected is None else "highest_score",
         "candidates": [
             {
-                "target": [row.choice[0], plan_json(row.choice[1])],
+                "target": logged_target(row.choice),
+                "fertilize_plan": plan_json(row.choice[1]),
                 "market_cash": row.market_cash,
                 "capital_cost": row.capital_cost,
                 "labor_cost": row.labor_cost,
