@@ -30,6 +30,8 @@ jobs:
             exit 1
           fi
           python -m py_compile agents/planner.py experiments/play_match.py
+          trap 'rm -f agents/__init__.py' EXIT
+          touch agents/__init__.py
           pytest -q tests/test_agents_planner.py tests/test_agents_season_profit.py
       - name: Remove verification workflow
         run: |
