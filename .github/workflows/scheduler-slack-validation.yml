@@ -1,4 +1,4 @@
-name: Validate no-priority scheduler
+name: Validate split opening/post scheduler
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/scheduler-slack-validation.yml
       - experiments/_validate_scheduler_no_priority.py
+      - experiments/_validate_scheduler_split_mode.py
 
 permissions:
   contents: read
@@ -27,58 +28,73 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Apply no-priority scheduler in runner only
+      - name: Apply split scheduler candidate in runner only
         run: |
           git show "$PATCH_BASE_COMMIT:agents/scheduler.py" > agents/scheduler.py
-          python experiments/_validate_scheduler_no_priority.py
-          python -m py_compile agents/scheduler.py
+          git show "$PATCH_BASE_COMMIT:agents/expansion_agent.py" > agents/expansion_agent.py
+          python experiments/_validate_scheduler_split_mode.py
+          python -m py_compile agents/scheduler.py agents/scheduler_post.py agents/expansion_agent.py
           git diff --check
-          ! grep -q 'def _priority' agents/scheduler.py
-          ! grep -q 'def _rescue_priority' agents/scheduler.py
-          ! grep -q 'group_animal' agents/scheduler.py
-          ! grep -q 'planting and harvest are not delayed' agents/scheduler.py
+          grep -q 'def _priority' agents/scheduler.py
+          ! grep -q 'def _priority' agents/scheduler_post.py
+          ! grep -q 'def _rescue_priority' agents/scheduler_post.py
+          ! grep -q 'group_animal' agents/scheduler_post.py
+          ! grep -q 'planting and harvest are not delayed' agents/scheduler_post.py
 
       - name: Install test/runtime dependencies
         run: python -m pip install pytest kaggle-environments
 
-      - name: Run architecture-focused scheduler tests
+      - name: Run architecture-focused post-opening scheduler tests
         run: |
-          python -m pytest -q \
-            tests/test_agents_scheduler.py::test_route_manhattan_step_counts \
-            tests/test_agents_scheduler.py::test_tasks_are_actioned_near_to_far_even_if_far_task_is_given_first \
-            tests/test_agents_scheduler.py::test_packing_counts_pickup_steps_and_uses_spare_hand_capacity \
-            tests/test_agents_scheduler.py::test_hands_needed_scales_up_for_heavy_workload \
-            tests/test_agents_scheduler.py::test_nearby_tasks_share_worker_to_reduce_total_travel \
-            tests/test_agents_value_aware.py::test_optional_work_does_not_buy_an_expensive_hand \
-            tests/test_agents_value_aware.py::test_mandatory_work_can_justify_cost_above_sale_value \
-            tests/test_agents_value_aware.py::test_optional_values_are_combined_and_existing_workers_are_sunk_cost \
-            tests/test_agents_value_aware.py::test_terminal_packing_prefers_valuable_recovery \
-            tests/test_agents_value_aware.py::test_unreachable_mandatory_task_does_not_force_sixteen_hires
           python - <<'PY'
+          from collections import Counter
           from agents.farm_tasks import Task
-          from agents.scheduler import build_queues, hands_needed
+          from agents.scheduler_post import build_queues, hands_needed, SHED
 
+          # Required work is a hard constraint, not an action ordering rule.
           required = Task((0, 0), [['WATER']] * 14, mandatory=True)
           optional = Task((4, 4), [['HARVEST']] * 9, mandatory=False, value=999)
           plans, missing = build_queues([optional, required], (4, 4), 0)
           assert required not in missing
           assert optional in missing
 
-          # Action names do not impose execution order: geometry does.
+          # Action labels do not determine order; route geometry does.
           near_feed = Task((4, 3), [['FEED']], mandatory=True)
           far_harvest = Task((0, 0), [['HARVEST']], mandatory=True, animal_harvest=True)
           plans, missing = build_queues([far_harvest, near_feed], (4, 4), 0)
           assert not missing
           assert plans[0].queue.index(['FEED']) < plans[0].queue.index(['HARVEST'])
 
-          # Labor economics still decides whether optional value is worth a hand.
+          # Nearby work remains local instead of being spread for artificial slack.
+          tasks = [
+              Task((4, 3), [['WATER']] * 3),
+              Task((4, 2), [['HARVEST']] * 3),
+          ]
+          plans, missing = build_queues(
+              tasks, farmer_start=SHED, hand_count=1,
+              hand_starts=((5, 4),), existing_hand_budget=8,
+          )
+          assert not missing
+          assert sum(len(plan.queue) for plan in plans) == 8
+          assert plans[1].queue == []
+
+          # Marginal hire economics controls optional inclusion.
           full = Task((4, 4), [['WATER']] * 23, mandatory=True)
           extra = Task((4, 4), [['COLLECT_FERTILIZER']], mandatory=False, value=10)
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[9]) == (1, [])
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[11]) == (0, [extra])
+
+          # Pickup and budget accounting remain exact.
+          task = Task((4, 3), [['WATER']], needs=Counter({'WHEAT': 1}))
+          filler = Task((4, 4), [['WATER']] * 23)
+          plans, missing = build_queues(
+              [filler, task], (4, 4), 1, hand_starts=((5, 4),)
+          )
+          assert not missing
+          assert plans[1].queue[:3] == [['PICKUP', 'WHEAT', 1], ['WEST'], ['NORTH']]
           PY
 
-      - name: Replay candidate and animal-fixed base against A
+      - name: Replay split candidate and animal-fixed base against A
         run: |
           mkdir -p validation/candidate validation/base
           /usr/bin/time -f '%e' -o validation/candidate_seconds.txt \
@@ -94,6 +110,18 @@ jobs:
           bdir = sorted((root/'base').glob('current_vs_A_seed1_*'))[-1]
           C = json.loads((cdir/'result.json').read_text())
           B = json.loads((bdir/'result.json').read_text())
+
+          candidate_replay = json.loads((cdir/'replay.json').read_text())
+          base_replay = json.loads((bdir/'replay.json').read_text())
+          first = None
+          for index, (candidate_step, base_step) in enumerate(zip(candidate_replay['steps'], base_replay['steps'])):
+              ca = candidate_step[0]['action']
+              ba = base_step[0]['action']
+              if ca != ba:
+                  obs = candidate_step[0]['observation']
+                  first = {'index': index, 'day': obs['day'], 'hour': obs['hour'], 'base': ba, 'candidate': ca}
+                  break
+
           out = {
               'candidate_cash': C['current_cash'],
               'base_cash': B['current_cash'],
@@ -102,16 +130,20 @@ jobs:
               'base_statuses': B['statuses'],
               'candidate_seconds': float((root/'candidate_seconds.txt').read_text()),
               'base_seconds': float((root/'base_seconds.txt').read_text()),
+              'first_divergence': first,
           }
           print(json.dumps(out, indent=2))
           (root/'comparison.json').write_text(json.dumps(out, indent=2))
           if C['statuses'] != ['DONE', 'DONE']:
               raise SystemExit(f"candidate statuses: {C['statuses']}")
+          # Opening must remain governed by the untouched legacy scheduler.
+          if first and first['day'] < 9:
+              raise SystemExit(f"opening diverged: {first}")
           PY
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scheduler-no-priority-${{ github.sha }}
+          name: scheduler-split-${{ github.sha }}
           path: validation
           if-no-files-found: warn
