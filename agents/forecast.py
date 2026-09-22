@@ -149,7 +149,7 @@ class MarketForecast:
             cash += (discount ** (when - self.day)) * daily_cash
         return cash
 
-    def _value_products(self, flows, products):
+    def _value_products(self, flows, products, extra=None):
         """Value only the requested independent product markets.
 
         Product-local settlement means a candidate cannot change cash in a
@@ -173,7 +173,7 @@ class MarketForecast:
                 if product in self.center_products:
                     stocks[product] -= center_ticks
             previous = step
-            cash += self._settle_day(stocks, flows, when, products)
+            cash += self._settle_day(stocks, flows, when, products, extra)
         return cash
 
     def marginal_value(self, baseline, candidate, baseline_values=None):
@@ -194,12 +194,9 @@ class MarketForecast:
             if baseline_values is not None:
                 baseline_values[key] = baseline_value
 
-        combined = Production()
-        combined.add(baseline)
-        combined.add(candidate)
-        return self._value_products(combined, products) - baseline_value
+        return self._value_products(baseline, products, candidate) - baseline_value
 
-    def _settle_day(self, stocks, flows, when, products=None):
+    def _settle_day(self, stocks, flows, when, products=None, extra=None):
         """Settle daily market pressure independently for each product.
 
         The planner knows forecast product flows by day, not either player's
@@ -211,12 +208,17 @@ class MarketForecast:
         """
         own_sales = flows.sales.get(when, {})
         own_inputs = flows.inputs.get(when, {})
+        extra_sales = extra.sales.get(when, {}) if extra is not None else {}
+        extra_inputs = extra.inputs.get(when, {}) if extra is not None else {}
         rival_sales = self.external.sales.get(when, {})
         rival_inputs = self.external.inputs.get(when, {})
         cash = 0
 
         for product in (game.PRODUCTS if products is None else products):
-            own_amount = own_sales.get(product, 0) - own_inputs.get(product, 0)
+            own_amount = (
+                own_sales.get(product, 0) - own_inputs.get(product, 0)
+                + extra_sales.get(product, 0) - extra_inputs.get(product, 0)
+            )
             rival_amount = rival_sales.get(product, 0) - rival_inputs.get(product, 0)
             if not own_amount and not rival_amount:
                 continue
