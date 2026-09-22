@@ -265,7 +265,7 @@ def _hire_and_buy_orders(
     return orders
 
 
-def make_agent(end_day=SEASON_END_DAY, seed=0):
+def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
     del seed  # every decision reacts to live prices/shed state; nothing to seed
     targets = {}
     state = {
@@ -480,6 +480,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0):
                 obs, targets, positions, effective_end,
                 max_positions=TARGETS_PER_DAY,
                 replan_positions=state["pending_targets"],
+                decision_log=decision_log,
             ))
             evaluated = pending_before - state["pending_targets"]
             state["investment_backlog"].update(
