@@ -12,6 +12,7 @@ permissions:
 env:
   PATCH_BASE_COMMIT: 9c81e171a80ce495491776649ce8a2f755bfb3ca
   PYTHONUNBUFFERED: "1"
+  TURNOVER_CANDIDATE: "preserve-valid-target-v2"
 
 jobs:
   replay:
@@ -53,6 +54,7 @@ jobs:
               replay = json.loads(Path(replay_path).read_text())
               observations = [step[0]['observation'] for step in replay['steps']]
               freed = []
+              direct_replant = 0
               for i in range(len(observations)-1):
                   a = observations[i]
                   b = observations[i+1]
@@ -61,9 +63,13 @@ jobs:
                   for y in range(len(ta)):
                       for x in range(len(ta[y])):
                           before, after = ta[y][x], tb[y][x]
-                          if (isinstance(before, dict) and before.get('kind') == 'PLANT'
-                                  and after is None):
+                          if not (isinstance(before, dict) and before.get('kind') == 'PLANT'):
+                              continue
+                          if after is None:
                               freed.append((i+1, a['day'], (x, y)))
+                          elif (isinstance(after, dict) and after.get('kind') == 'PLANT'
+                                and after.get('planted_day') != before.get('planted_day')):
+                              direct_replant += 1
               same_day = next_day = later = never = 0
               for index, day, (x, y) in freed:
                   found = None
@@ -81,7 +87,8 @@ jobs:
                   else:
                       later += 1
               return {
-                  'freed': len(freed), 'same_day': same_day,
+                  'freed': len(freed), 'direct_replant': direct_replant,
+                  'same_day_after_empty': same_day,
                   'next_day': next_day, 'later': later, 'never': never,
               }
 
