@@ -143,4 +143,60 @@ if text.count(old) != 1:
     raise SystemExit(f"daily build replacement count={text.count(old)}")
 text = text.replace(old, new, 1)
 
+# The baseline hard-codes 23 turns for already-hired hands when finalizing the
+# day. That is correct at hour 1, but after an overflow purchase at hour 2 it
+# lets an atomic BUILD->PLACE task straddle midnight: BUILD runs at hour 23 and
+# PLACE is discarded by the next day's plan. Keep hand selection unchanged;
+# only give the route builder the number of worker turns that actually remain.
+old = '''            plans, unassigned = build_queues(
+                tasks,
+                tuple(farm["farmer"]),
+                hand_count,
+                existing_hands,
+                shed_access,
+                pending_hand_budget=22,
+                available_wheat=obs["private"]["shed"].get("WHEAT", 0),
+            )
+'''
+new = '''            route_budget = 22 if state["opening_active"] else max(0, 24 - hour)
+            plans, unassigned = build_queues(
+                tasks,
+                tuple(farm["farmer"]),
+                hand_count,
+                existing_hands,
+                shed_access,
+                pending_hand_budget=route_budget,
+                existing_hand_budget=(None if state["opening_active"] else route_budget),
+                available_wheat=obs["private"]["shed"].get("WHEAT", 0),
+            )
+'''
+if text.count(old) != 1:
+    raise SystemExit(f"primary route replacement count={text.count(old)}")
+text = text.replace(old, new, 1)
+
+old = '''                plans, mandatory_unassigned = build_queues(
+                    mandatory_tasks,
+                    tuple(farm["farmer"]),
+                    hand_count,
+                    existing_hands,
+                    shed_access,
+                    pending_hand_budget=22,
+                    available_wheat=obs["private"]["shed"].get("WHEAT", 0),
+                )
+'''
+new = '''                plans, mandatory_unassigned = build_queues(
+                    mandatory_tasks,
+                    tuple(farm["farmer"]),
+                    hand_count,
+                    existing_hands,
+                    shed_access,
+                    pending_hand_budget=route_budget,
+                    existing_hand_budget=(None if state["opening_active"] else route_budget),
+                    available_wheat=obs["private"]["shed"].get("WHEAT", 0),
+                )
+'''
+if text.count(old) != 1:
+    raise SystemExit(f"mandatory route replacement count={text.count(old)}")
+text = text.replace(old, new, 1)
+
 path.write_text(text)
