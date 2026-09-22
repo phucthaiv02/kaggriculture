@@ -1,0 +1,40 @@
+name: Verify final O1 target selector
+
+on:
+  push:
+    branches: [agent-v3]
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install target-test dependencies
+        run: python -m pip install kaggle-environments==1.32.7 pytest
+      - name: Verify source and target tests
+        run: |
+          if git grep -nE 'TARGET_OPTIONS|TARGET_OPTION|TARGET_DISCOUNT|TARGET_ROI_CAPITAL_FLOOR|set_target_option|target_option|--target-option|target_sequence|choose_sequence' -- ':!*.ipynb' ':!.github/workflows/verify-target-selector.yml'; then
+            echo 'Rejected target-selection variant references remain.'
+            exit 1
+          fi
+          python -m py_compile agents/planner.py experiments/play_match.py
+          pytest -q tests/test_agents_planner.py tests/test_agents_season_profit.py
+      - name: Remove verification workflow
+        run: |
+          git rm .github/workflows/verify-target-selector.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: remove target selector verification workflow'
+          git push origin HEAD:agent-v3
