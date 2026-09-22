@@ -13,6 +13,7 @@ permissions:
 env:
   PATCH_BASE_COMMIT: 9c81e171a80ce495491776649ce8a2f755bfb3ca
   PYTHONUNBUFFERED: "1"
+  PYTHONPATH: ${{ github.workspace }}
 
 jobs:
   validate:
@@ -40,7 +41,7 @@ jobs:
         run: python -m pip install pytest kaggle-environments
       - name: Run architecture-focused scheduler tests
         run: |
-          pytest -q \
+          python -m pytest -q \
             tests/test_agents_scheduler.py::test_route_manhattan_step_counts \
             tests/test_agents_scheduler.py::test_tasks_are_actioned_near_to_far_even_if_far_task_is_given_first \
             tests/test_agents_scheduler.py::test_packing_counts_pickup_steps_and_uses_spare_hand_capacity \
@@ -82,7 +83,7 @@ jobs:
             timeout 300s python -m experiments.play_match --opponent public/A.ipynb --seed 1 --output-dir validation/candidate
           git worktree add --detach "$RUNNER_TEMP/animal-base" "$PATCH_BASE_COMMIT"
           /usr/bin/time -f '%e' -o validation/base_seconds.txt \
-            bash -lc 'cd "$0" && timeout 300s python -m experiments.play_match --opponent "$1/public/A.ipynb" --seed 1 --output-dir "$1/validation/base"' "$RUNNER_TEMP/animal-base" "$GITHUB_WORKSPACE"
+            bash -lc 'cd "$0" && PYTHONPATH="$0" timeout 300s python -m experiments.play_match --opponent "$1/public/A.ipynb" --seed 1 --output-dir "$1/validation/base"' "$RUNNER_TEMP/animal-base" "$GITHUB_WORKSPACE"
           python - <<'PY'
           import json
           from pathlib import Path
