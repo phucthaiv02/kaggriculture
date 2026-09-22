@@ -5,6 +5,7 @@ on:
     branches: [agent-v3]
     paths:
       - agents/fertilizer.py
+      - agents/farm_tasks.py
       - agents/forecast.py
       - agents/planner.py
       - agents/schedules.py
