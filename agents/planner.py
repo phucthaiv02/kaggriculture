@@ -298,7 +298,7 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
 
     shed_access = ((4, 4), (5, 4), (4, 5), (5, 5))
     def distance(p):
-        return min(abs(p[0] - s[0]) + abs(p[1] - s[1]) for s in shed_access)
+        return min(abs(p[0] - s[0]) + abs(p[1] - s[1)] for s in shed_access)
 
     turnover.sort(key=lambda p: (distance(p), p[1], p[0]))
     replanning.sort(key=lambda p: (distance(p), p[1], p[0]))
