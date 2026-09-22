@@ -1,0 +1,53 @@
+name: Apply marginal flow allocation optimization
+
+on:
+  push:
+    branches: [agent-v3]
+    paths:
+      - .github/workflows/apply-marginal-flow-optimization.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Avoid materializing combined production per candidate
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('agents/forecast.py')
+          text = path.read_text()
+          old = '''    def _value_products(self, flows, products):\n        """Value only the requested independent product markets.\n'''
+          new = '''    def _value_products(self, flows, products, extra=None):\n        """Value only the requested independent product markets.\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'value signature replacement count={text.count(old)}')
+          text = text.replace(old, new)
+          old = '''            cash += self._settle_day(stocks, flows, when, products)\n        return cash\n'''
+          new = '''            cash += self._settle_day(stocks, flows, when, products, extra)\n        return cash\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'value settle replacement count={text.count(old)}')
+          text = text.replace(old, new)
+          old = '''        combined = Production()\n        combined.add(baseline)\n        combined.add(candidate)\n        return self._value_products(combined, products) - baseline_value\n\n    def _settle_day(self, stocks, flows, when, products=None):\n'''
+          new = '''        return self._value_products(baseline, products, candidate) - baseline_value\n\n    def _settle_day(self, stocks, flows, when, products=None, extra=None):\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'marginal allocation replacement count={text.count(old)}')
+          text = text.replace(old, new)
+          old = '''        own_sales = flows.sales.get(when, {})\n        own_inputs = flows.inputs.get(when, {})\n        rival_sales = self.external.sales.get(when, {})\n        rival_inputs = self.external.inputs.get(when, {})\n        cash = 0\n\n        for product in (game.PRODUCTS if products is None else products):\n            own_amount = own_sales.get(product, 0) - own_inputs.get(product, 0)\n'''
+          new = '''        own_sales = flows.sales.get(when, {})\n        own_inputs = flows.inputs.get(when, {})\n        extra_sales = extra.sales.get(when, {}) if extra is not None else {}\n        extra_inputs = extra.inputs.get(when, {}) if extra is not None else {}\n        rival_sales = self.external.sales.get(when, {})\n        rival_inputs = self.external.inputs.get(when, {})\n        cash = 0\n\n        for product in (game.PRODUCTS if products is None else products):\n            own_amount = (\n                own_sales.get(product, 0) - own_inputs.get(product, 0)\n                + extra_sales.get(product, 0) - extra_inputs.get(product, 0)\n            )\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'settle amount replacement count={text.count(old)}')
+          path.write_text(text.replace(old, new))
+          PY
+          python -m py_compile agents/forecast.py
+          git diff --check
+          git diff -- agents/forecast.py
+      - name: Commit optimization
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agents/forecast.py
+          git commit -m "planner: avoid marginal flow allocations"
+          git push origin HEAD:agent-v3
