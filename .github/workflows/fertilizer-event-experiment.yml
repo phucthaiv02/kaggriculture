@@ -1,0 +1,44 @@
+name: Fertilizer event experiment
+
+on:
+  push:
+    branches: [agent-v3]
+    paths:
+      - tests/test_fertilizer_event_experiment.py
+      - .github/workflows/fertilizer-event-experiment.yml
+      - agents/forecast.py
+      - agents/schedules.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install experiment dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install kaggle-environments==1.32.7 pytest
+      - name: Run fertilizer event experiment only
+        run: |
+          python -m pytest -vv tests/test_fertilizer_event_experiment.py
+      - name: Show experiment result
+        if: always()
+        run: |
+          if [ -f ci-artifacts/fertilizer-event-experiment.json ]; then
+            cat ci-artifacts/fertilizer-event-experiment.json
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fertilizer-event-experiment-${{ github.sha }}
+          path: ci-artifacts/fertilizer-event-experiment.json
+          if-no-files-found: warn
+          retention-days: 7
