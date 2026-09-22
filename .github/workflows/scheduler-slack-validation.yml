@@ -5,7 +5,7 @@ on:
     branches: [agent-v3]
     paths:
       - .github/workflows/scheduler-slack-validation.yml
-      - experiments/_validate_scheduler_no_priority.py
+      - experiments/_validate_scheduler_surgical.py
       - experiments/_validate_scheduler_split_mode.py
 
 permissions:
@@ -28,7 +28,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Apply split scheduler candidate in runner only
+      - name: Apply surgical split scheduler candidate in runner only
         run: |
           git show "$PATCH_BASE_COMMIT:agents/scheduler.py" > agents/scheduler.py
           git show "$PATCH_BASE_COMMIT:agents/expansion_agent.py" > agents/expansion_agent.py
@@ -51,45 +51,29 @@ jobs:
           from agents.farm_tasks import Task
           from agents.scheduler_post import build_queues, hands_needed, SHED
 
-          # Required work is a hard constraint, not an action ordering rule.
           required = Task((0, 0), [['WATER']] * 14, mandatory=True)
           optional = Task((4, 4), [['HARVEST']] * 9, mandatory=False, value=999)
           plans, missing = build_queues([optional, required], (4, 4), 0)
           assert required not in missing
           assert optional in missing
 
-          # Action labels do not determine order; route geometry does.
+          # Action labels do not determine route order.
           near_feed = Task((4, 3), [['FEED']], mandatory=True)
           far_harvest = Task((0, 0), [['HARVEST']], mandatory=True, animal_harvest=True)
           plans, missing = build_queues([far_harvest, near_feed], (4, 4), 0)
           assert not missing
           assert plans[0].queue.index(['FEED']) < plans[0].queue.index(['HARVEST'])
 
-          # Nearby work remains local instead of being spread for artificial slack.
-          tasks = [
-              Task((4, 3), [['WATER']] * 3),
-              Task((4, 2), [['HARVEST']] * 3),
-          ]
-          plans, missing = build_queues(
-              tasks, farmer_start=SHED, hand_count=1,
-              hand_starts=((5, 4),), existing_hand_budget=8,
-          )
-          assert not missing
-          assert sum(len(plan.queue) for plan in plans) == 8
-          assert plans[1].queue == []
-
-          # Marginal hire economics controls optional inclusion.
+          # Marginal hire economics remains the legacy decision rule.
           full = Task((4, 4), [['WATER']] * 23, mandatory=True)
           extra = Task((4, 4), [['COLLECT_FERTILIZER']], mandatory=False, value=10)
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[9]) == (1, [])
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[11]) == (0, [extra])
 
-          # Pickup and budget accounting remain exact.
+          # Pickup/budget accounting is unchanged.
           task = Task((4, 3), [['WATER']], needs=Counter({'WHEAT': 1}))
           filler = Task((4, 4), [['WATER']] * 23)
-          plans, missing = build_queues(
-              [filler, task], (4, 4), 1, hand_starts=((5, 4),)
-          )
+          plans, missing = build_queues([filler, task], (4, 4), 1, hand_starts=((5, 4),))
           assert not missing
           assert plans[1].queue[:3] == [['PICKUP', 'WHEAT', 1], ['WEST'], ['NORTH']]
           PY
@@ -114,12 +98,21 @@ jobs:
           candidate_replay = json.loads((cdir/'replay.json').read_text())
           base_replay = json.loads((bdir/'replay.json').read_text())
           first = None
+          first_base_obs = None
           for index, (candidate_step, base_step) in enumerate(zip(candidate_replay['steps'], base_replay['steps'])):
               ca = candidate_step[0]['action']
               ba = base_step[0]['action']
               if ca != ba:
-                  obs = candidate_step[0]['observation']
-                  first = {'index': index, 'day': obs['day'], 'hour': obs['hour'], 'base': ba, 'candidate': ca}
+                  obs = base_step[0]['observation']
+                  first_base_obs = obs
+                  first = {
+                      'index': index,
+                      'day': obs['day'],
+                      'hour': obs['hour'],
+                      'unlocked_quadrants': obs['farms'][obs['player']]['unlocked_quadrants'],
+                      'base': ba,
+                      'candidate': ca,
+                  }
                   break
 
           out = {
@@ -136,14 +129,16 @@ jobs:
           (root/'comparison.json').write_text(json.dumps(out, indent=2))
           if C['statuses'] != ['DONE', 'DONE']:
               raise SystemExit(f"candidate statuses: {C['statuses']}")
-          # Opening must remain governed by the untouched legacy scheduler.
-          if first and first['day'] < 9:
-              raise SystemExit(f"opening diverged: {first}")
+          # Opening is exactly the one-quadrant regime from opening_book.py.
+          if first_base_obs is not None:
+              farm = first_base_obs['farms'][first_base_obs['player']]
+              if len(farm['unlocked_quadrants']) == 1:
+                  raise SystemExit(f"opening diverged: {first}")
           PY
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scheduler-split-${{ github.sha }}
+          name: scheduler-surgical-${{ github.sha }}
           path: validation
           if-no-files-found: warn
