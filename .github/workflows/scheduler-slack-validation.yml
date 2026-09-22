@@ -1,10 +1,11 @@
-name: Validate generic global packing retry
+name: Validate admission-route separation
 
 on:
   push:
     branches: [agent-v3]
     paths:
       - .github/workflows/scheduler-slack-validation.yml
+      - experiments/_validate_scheduler_fixed_admission_route.py
       - experiments/_validate_scheduler_generic_retry.py
 
 permissions:
@@ -26,25 +27,37 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Apply generic global packing candidate in runner only
+      - name: Apply admission-route split in runner only
         run: |
           git show "$PATCH_BASE_COMMIT:agents/scheduler.py" > agents/scheduler.py
           git show "$PATCH_BASE_COMMIT:agents/expansion_agent.py" > agents/expansion_agent.py
-          python experiments/_validate_scheduler_generic_retry.py
+          python experiments/_validate_scheduler_fixed_admission_route.py
           python -m py_compile agents/scheduler.py agents/scheduler_post.py agents/expansion_agent.py
           git diff --check
       - name: Install runtime
         run: python -m pip install kaggle-environments
+      - name: Check fixed workload routes ignore task class
+        run: |
+          python - <<'PY'
+          from agents.farm_tasks import Task
+          from agents.scheduler_post import build_queues
+
+          near_optional = Task((4, 3), [['FEED']], mandatory=False, value=100)
+          far_required = Task((0, 0), [['HARVEST']], mandatory=True)
+          plans, missing = build_queues([far_required, near_optional], (4, 4), 0)
+          assert not missing
+          assert plans[0].queue.index(['FEED']) < plans[0].queue.index(['HARVEST']), plans[0].queue
+          PY
       - name: Replay against A
         run: |
-          mkdir -p validation/generic_retry
-          /usr/bin/time -f '%e' -o validation/generic_retry/seconds.txt \
+          mkdir -p validation/fixed_admission_route
+          /usr/bin/time -f '%e' -o validation/fixed_admission_route/seconds.txt \
             timeout 300s python -m experiments.play_match \
-              --opponent public/A.ipynb --seed 1 --output-dir validation/generic_retry
+              --opponent public/A.ipynb --seed 1 --output-dir validation/fixed_admission_route
           python - <<'PY'
           import json
           from pathlib import Path
-          root = Path('validation/generic_retry')
+          root = Path('validation/fixed_admission_route')
           out_dir = sorted(root.glob('current_vs_A_seed1_*'))[-1]
           result = json.loads((out_dir / 'result.json').read_text())
           summary = {
@@ -62,6 +75,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scheduler-generic-retry-${{ github.sha }}
-          path: validation/generic_retry
+          name: scheduler-fixed-admission-route-${{ github.sha }}
+          path: validation/fixed_admission_route
           if-no-files-found: warn
