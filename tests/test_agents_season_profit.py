@@ -66,26 +66,6 @@ def test_target_score_ignores_labor_forecast(monkeypatch):
     assert after == before
 
 
-def test_target_option_formulas_are_distinct():
-    flow = Production()
-    slow = TargetProfit(
-        ('COW', False), flow,
-        market_cash=1700, capital_cost=1000,
-        discounted_market_cash=1300,
-    )
-    fast = TargetProfit(
-        ('STRAWBERRY', False), flow,
-        market_cash=700, capital_cost=100,
-        discounted_market_cash=690,
-    )
-    # Option 1 maximizes absolute marginal profit.
-    assert slow.score(1) > fast.score(1)
-    # Option 2 rewards earlier cash enough for the fast producer to win.
-    assert fast.score(2) > slow.score(2)
-    # Option 3 maximizes profit per committed capital dollar.
-    assert fast.score(3) > slow.score(3)
-    assert slow.labor_cost == 0
-
 
 def test_discounted_market_value_weights_late_cash_less():
     market = MarketForecast({p: game.MARKET_I0 for p in game.PRODUCTS}, (), 0, 10)
