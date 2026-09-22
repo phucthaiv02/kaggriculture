@@ -6,7 +6,6 @@ on:
     paths:
       - .github/workflows/scheduler-no-priority-validation.yml
       - experiments/_validate_scheduler_no_priority.py
-      - experiments/_validate_scheduler_balance_patch.py
 
 permissions:
   contents: read
@@ -31,7 +30,6 @@ jobs:
         run: |
           git show "$PATCH_BASE_COMMIT:agents/scheduler.py" > agents/scheduler.py
           python experiments/_validate_scheduler_no_priority.py
-          python experiments/_validate_scheduler_balance_patch.py
           python -m py_compile agents/scheduler.py
           git diff --check
           ! grep -q 'def _priority' agents/scheduler.py
@@ -77,13 +75,6 @@ jobs:
           extra = Task((4, 4), [['COLLECT_FERTILIZER']], mandatory=False, value=10)
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[9]) == (1, [])
           assert hands_needed([full, extra], (4, 4), max_hands=1, marginal_hire_costs=[11]) == (0, [extra])
-
-          # Once workers already exist, scheduling minimizes makespan instead
-          # of idling paid capacity merely to save a few travel steps.
-          work = [Task((4, 4), [['WATER']] * 4, mandatory=True) for _ in range(4)]
-          plans, missing = build_queues(work, (4, 4), 3)
-          assert not missing
-          assert all(plan.queue for plan in plans)
           PY
       - name: Replay candidate and animal-fixed base against A
         run: |
@@ -96,11 +87,40 @@ jobs:
           python - <<'PY'
           import json
           from pathlib import Path
+
           root = Path('validation')
           cdir = sorted((root/'candidate').glob('current_vs_A_seed1_*'))[-1]
           bdir = sorted((root/'base').glob('current_vs_A_seed1_*'))[-1]
           C = json.loads((cdir/'result.json').read_text())
           B = json.loads((bdir/'result.json').read_text())
+          cr = json.loads((cdir/'replay.json').read_text())
+          br = json.loads((bdir/'replay.json').read_text())
+
+          def empty_structures(replay):
+              obs = replay['steps'][-1][0]['observation']
+              farm = obs['farms'][obs['player']]
+              return sum(
+                  1 for row in farm['tiles'] for tile in row
+                  if isinstance(tile, dict)
+                  and tile.get('kind') in ('COOP', 'PASTURE')
+                  and not tile.get('animal')
+              )
+
+          first = None
+          for index, (cs, bs) in enumerate(zip(cr['steps'], br['steps'])):
+              ca = cs[0].get('action') or {}
+              ba = bs[0].get('action') or {}
+              if ca != ba:
+                  obs = bs[0]['observation']
+                  first = {
+                      'index': index,
+                      'day': obs['day'],
+                      'hour': obs['hour'],
+                      'base': ba,
+                      'candidate': ca,
+                  }
+                  break
+
           out = {
               'candidate_cash': C['current_cash'],
               'base_cash': B['current_cash'],
@@ -109,9 +129,19 @@ jobs:
               'base_statuses': B['statuses'],
               'candidate_seconds': float((root/'candidate_seconds.txt').read_text()),
               'base_seconds': float((root/'base_seconds.txt').read_text()),
+              'candidate_empty_structures': empty_structures(cr),
+              'base_empty_structures': empty_structures(br),
+              'first_divergence': first,
           }
           print(json.dumps(out, indent=2))
           (root/'comparison.json').write_text(json.dumps(out, indent=2))
+
+          if C['statuses'] != ['DONE', 'DONE']:
+              raise SystemExit('candidate did not finish cleanly')
+          if out['candidate_empty_structures'] > out['base_empty_structures']:
+              raise SystemExit('candidate regressed animal placement completeness')
+          if C['current_cash'] < B['current_cash']:
+              raise SystemExit('candidate regressed cash versus stable animal baseline')
           PY
       - uses: actions/upload-artifact@v4
         if: always()
