@@ -5,8 +5,9 @@ path = Path("agents/expansion_agent.py")
 text = path.read_text()
 
 # Validation workflow restores the exact f3c820e baseline before this patcher.
-# Keep this candidate deliberately narrow: preserve baseline behavior until an
-# admitted animal purchase is actually truncated by the 10-order market cap.
+# Preserve baseline admission. Only when an already-admitted animal investment
+# overflows the ten-order market cap do we make market latency part of that
+# fixed plan and buy enough labor once for the fixed task set.
 text = text.replace(
     "BOARD_SIZE = 10\n",
     '''BOARD_SIZE = 10
@@ -38,13 +39,11 @@ def _strip_partial_animal_builds(tasks, opening_active=False):
 ''',
     1,
 )
-
 text = text.replace(
     '        "emergency_hires": 0,\n    }',
-    '        "emergency_hires": 0,\n        "morning_market_queue": [],\n    }',
+    '        "emergency_hires": 0,\n        "morning_market_queue": [],\n        "market_delayed_plan": False,\n    }',
     1,
 )
-
 opening_anchor = "    opening_governs = make_opening_controller()\n"
 text = text.replace(
     opening_anchor,
@@ -60,8 +59,6 @@ text = text.replace(
     1,
 )
 
-# A global replan may observe a failed/missing animal purchase. Never leave the
-# BUILD half of an invalidated BUILD->PLACE dependency in the rebuilt plan.
 old = '''        replanned = build_tasks(
             obs, frozen_targets,
             prioritize_fertilizer_drop=state["opening_active"],
@@ -75,9 +72,6 @@ if text.count(old) != 1:
     raise SystemExit(f"global build replacement count={text.count(old)}")
 text = text.replace(old, new, 1)
 
-# Preserve the baseline first market batch exactly. Only animal resources from
-# the already-admitted task set survive truncation into the next morning turn;
-# seed and optional-HIRE overflow retain baseline behavior and are not expanded.
 old = '''            orders = _hire_and_buy_orders(
                 obs, farm, purchase_targets, hand_target, pending_sales=sales,
                 replant_same_crop=True,
@@ -96,11 +90,51 @@ new = '''            orders = _hire_and_buy_orders(
                 mandatory_hand_target=mandatory_hand_target,
             )
             full_market = list(sales) + list(orders)
-            if not state["opening_active"]:
-                state["morning_market_queue"] = [
-                    order for order in full_market[MARKET_ORDER_CAP:]
-                    if order[0] in ("BUY_ANIMAL", "BUY_PRODUCT")
-                ]
+            state["market_delayed_plan"] = False
+            if not state["opening_active"] and any(
+                order[0] in ("BUY_ANIMAL", "BUY_PRODUCT")
+                for order in full_market[MARKET_ORDER_CAP:]
+            ):
+                # The task set is already fixed by baseline admission. Account
+                # for the market turns it requires, but never reopen admission
+                # or add new targets. Increase labor monotonically until that
+                # same fixed task set fits the remaining worker horizon.
+                candidate_hands = hand_target
+                while candidate_hands <= MAX_HANDS:
+                    candidate_orders = _hire_and_buy_orders(
+                        obs, farm, purchase_targets, candidate_hands,
+                        pending_sales=sales, replant_same_crop=True,
+                        reserve_hire_budget=True,
+                        mandatory_hand_target=mandatory_hand_target,
+                    )
+                    candidate_market = list(sales) + list(candidate_orders)
+                    market_turns = max(
+                        1,
+                        (len(candidate_market) + MARKET_ORDER_CAP - 1)
+                        // MARKET_ORDER_CAP,
+                    )
+                    worker_budget = max(0, 24 - market_turns)
+                    _candidate_plans, missing = build_queues(
+                        assigned_tasks,
+                        tuple(farm["farmer"]),
+                        candidate_hands,
+                        tuple(map(tuple, farm["hands"])),
+                        _open_shed_access(farm),
+                        pending_hand_budget=worker_budget,
+                        existing_hand_budget=worker_budget,
+                    )
+                    if not missing:
+                        hand_target = candidate_hands
+                        state["hand_target"] = candidate_hands
+                        orders = candidate_orders
+                        full_market = candidate_market
+                        state["market_delayed_plan"] = market_turns > 1
+                        break
+                    candidate_hands += 1
+
+                # Once an animal investment has made this a multi-turn morning
+                # schedule, retain every order belonging to that fixed plan.
+                state["morning_market_queue"] = list(full_market[MARKET_ORDER_CAP:])
             return {
                 "farmer": ["PASS"], "hands": [["PASS"] for _ in farm["hands"]],
                 "market": full_market[:MARKET_ORDER_CAP],
@@ -110,8 +144,6 @@ if text.count(old) != 1:
     raise SystemExit(f"market replacement count={text.count(old)}")
 text = text.replace(old, new, 1)
 
-# Complete the selected morning market schedule before workers start. This is
-# still a fixed schedule: runtime only pops the stored queue.
 anchor = '''        if state["day"] == day and not state["plan_frozen"]:
 '''
 if text.count(anchor) != 1:
@@ -126,9 +158,6 @@ text = text.replace(
     1,
 )
 
-# After purchases are observed, build the real worker schedule. If an animal
-# still is not present, remove only the invalid BUILD half rather than creating
-# a permanent empty pasture/coop.
 old = '''            tasks = build_tasks(
                 obs,
                 state["daily_targets"],
@@ -143,11 +172,9 @@ if text.count(old) != 1:
     raise SystemExit(f"daily build replacement count={text.count(old)}")
 text = text.replace(old, new, 1)
 
-# The baseline hard-codes 23 turns for already-hired hands when finalizing the
-# day. That is correct at hour 1, but after an overflow purchase at hour 2 it
-# lets an atomic BUILD->PLACE task straddle midnight: BUILD runs at hour 23 and
-# PLACE is discarded by the next day's plan. Keep hand selection unchanged;
-# only give the route builder the number of worker turns that actually remain.
+# A delayed fixed market plan has already paid for enough hands under this
+# exact remaining horizon. Rebuild from observed resources using that horizon;
+# do not call a second labor-sizing loop or create rescue actions.
 old = '''            plans, unassigned = build_queues(
                 tasks,
                 tuple(farm["farmer"]),
@@ -158,7 +185,11 @@ old = '''            plans, unassigned = build_queues(
                 available_wheat=obs["private"]["shed"].get("WHEAT", 0),
             )
 '''
-new = '''            route_budget = 22 if state["opening_active"] else max(0, 24 - hour)
+new = '''            route_budget = (
+                max(0, 24 - hour)
+                if state["market_delayed_plan"] and not state["opening_active"]
+                else 22
+            )
             plans, unassigned = build_queues(
                 tasks,
                 tuple(farm["farmer"]),
@@ -166,7 +197,11 @@ new = '''            route_budget = 22 if state["opening_active"] else max(0, 24
                 existing_hands,
                 shed_access,
                 pending_hand_budget=route_budget,
-                existing_hand_budget=(None if state["opening_active"] else route_budget),
+                existing_hand_budget=(
+                    route_budget
+                    if state["market_delayed_plan"] and not state["opening_active"]
+                    else None
+                ),
                 available_wheat=obs["private"]["shed"].get("WHEAT", 0),
             )
 '''
@@ -191,7 +226,11 @@ new = '''                plans, mandatory_unassigned = build_queues(
                     existing_hands,
                     shed_access,
                     pending_hand_budget=route_budget,
-                    existing_hand_budget=(None if state["opening_active"] else route_budget),
+                    existing_hand_budget=(
+                        route_budget
+                        if state["market_delayed_plan"] and not state["opening_active"]
+                        else None
+                    ),
                     available_wheat=obs["private"]["shed"].get("WHEAT", 0),
                 )
 '''
