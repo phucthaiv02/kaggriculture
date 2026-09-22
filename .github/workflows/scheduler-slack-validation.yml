@@ -1,11 +1,11 @@
-name: Scheduler priority ablation
+name: Validate generic global packing retry
 
 on:
   push:
     branches: [agent-v3]
     paths:
       - .github/workflows/scheduler-slack-validation.yml
-      - experiments/_validate_scheduler_ablation.py
+      - experiments/_validate_scheduler_generic_retry.py
 
 permissions:
   contents: read
@@ -16,16 +16,7 @@ env:
   PYTHONPATH: ${{ github.workspace }}
 
 jobs:
-  ablation:
-    strategy:
-      fail-fast: false
-      matrix:
-        variant:
-          - no_animal_rescue
-          - no_timesensitive_cost
-          - no_route_priority
-          - no_feed_order
-          - all_minimal
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -35,34 +26,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Apply one scheduler ablation in runner only
-        env:
-          SCHEDULER_ABLATION: ${{ matrix.variant }}
+      - name: Apply generic global packing candidate in runner only
         run: |
           git show "$PATCH_BASE_COMMIT:agents/scheduler.py" > agents/scheduler.py
           git show "$PATCH_BASE_COMMIT:agents/expansion_agent.py" > agents/expansion_agent.py
-          python experiments/_validate_scheduler_ablation.py
+          python experiments/_validate_scheduler_generic_retry.py
           python -m py_compile agents/scheduler.py agents/scheduler_post.py agents/expansion_agent.py
           git diff --check
       - name: Install runtime
         run: python -m pip install kaggle-environments
       - name: Replay against A
-        env:
-          VARIANT: ${{ matrix.variant }}
         run: |
-          mkdir -p "validation/$VARIANT"
-          /usr/bin/time -f '%e' -o "validation/$VARIANT/seconds.txt" \
+          mkdir -p validation/generic_retry
+          /usr/bin/time -f '%e' -o validation/generic_retry/seconds.txt \
             timeout 300s python -m experiments.play_match \
-              --opponent public/A.ipynb --seed 1 --output-dir "validation/$VARIANT"
+              --opponent public/A.ipynb --seed 1 --output-dir validation/generic_retry
           python - <<'PY'
-          import json, os
+          import json
           from pathlib import Path
-          variant = os.environ['VARIANT']
-          root = Path('validation') / variant
+          root = Path('validation/generic_retry')
           out_dir = sorted(root.glob('current_vs_A_seed1_*'))[-1]
           result = json.loads((out_dir / 'result.json').read_text())
           summary = {
-              'variant': variant,
               'cash': result['current_cash'],
               'margin': result['margin'],
               'statuses': result['statuses'],
@@ -77,6 +62,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: scheduler-ablation-${{ matrix.variant }}-${{ github.sha }}
-          path: validation/${{ matrix.variant }}
+          name: scheduler-generic-retry-${{ github.sha }}
+          path: validation/generic_retry
           if-no-files-found: warn
