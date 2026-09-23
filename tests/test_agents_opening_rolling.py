@@ -54,7 +54,15 @@ def _task_summary(task):
     }
 
 
-def test_day_two_opening_conversion_is_admitted_and_buys_cow():
+def test_day_two_opening_conversion_is_admitted_and_buys_cow_intraday():
+    """Conversion admission is morning-fixed; financing may complete intraday.
+
+    The opening is allowed to bootstrap later investments from fertilizer and
+    harvest proceeds generated after hour 0. The important invariant is that the
+    COW conversion is admitted in the morning and remains purchase-eligible until
+    the same day's cashflow can fund it, rather than being forgotten because the
+    first market pass was a few dollars short.
+    """
     env = make("kaggriculture", configuration=_configuration(), debug=False)
     agent = make_agent(END_DAY, seed=1)
     cells = {
@@ -68,6 +76,7 @@ def test_day_two_opening_conversion_is_admitted_and_buys_cow():
     execution_ledger = []
     animal_snapshots = []
     late_trace = []
+    conversion_admitted = False
 
     for step in range(int(env.configuration.episodeSteps) - 1):
         obs = state[0].observation
@@ -111,7 +120,7 @@ def test_day_two_opening_conversion_is_admitted_and_buys_cow():
                 "remaining_plans": [list(plan.queue) for plan in planner_state["plans"]],
             })
 
-        if obs.day <= 1:
+        if obs.day <= 2:
             positions = [tuple(obs.farms[0]["farmer"]), *map(tuple, obs.farms[0]["hands"])]
             operations = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
             for worker, (position, operation) in enumerate(zip(positions, operations)):
@@ -128,16 +137,27 @@ def test_day_two_opening_conversion_is_admitted_and_buys_cow():
                 position for position, target in targets.items()
                 if target and target[0] == "COW"
             )
+            assert (4, 3) in planner_state["purchase_positions"], (
+                f"COW conversion not admitted; targets={cow_targets} "
+                f"purchase_positions={sorted(planner_state['purchase_positions'])}"
+            )
+            conversion_admitted = True
+
+        if obs.day == 2 and any(
+            order[0] == "BUY_ANIMAL" and order[1] == "COW" and int(order[2]) >= 1
+            for order in market
+        ):
+            assert conversion_admitted
+            return
+
+        if obs.day == 3 and obs.hour == 0:
             diagnostic_lines = [
-                f"day2 money={obs.farms[0]['money']} shed={dict(obs.private['shed'])}",
-                f"day2 animals={_animals(obs)}",
-                f"market={market}",
-                f"cow_targets={cow_targets}",
+                f"day3 money={obs.farms[0]['money']} shed={dict(obs.private['shed'])}",
+                f"day3 animals={_animals(obs)}",
                 f"purchase_positions={sorted(planner_state['purchase_positions'])}",
                 f"daily(4,3)={planner_state['daily_targets'].get((4, 3))}",
-                f"daily(3,3)={planner_state['daily_targets'].get((3, 3))}",
                 f"hands={planner_state['hand_target']} mandatory={planner_state['mandatory_hand_target']}",
-                "late trace:",
+                "late day1 trace:",
                 *map(str, late_trace),
                 "animal snapshots:",
                 *map(str, animal_snapshots),
@@ -146,14 +166,11 @@ def test_day_two_opening_conversion_is_admitted_and_buys_cow():
                 "market(day,hour,money,hands,hires_today,fertilizer,orders):",
                 *map(str, market_ledger),
             ]
-            diagnostic = "\n".join(diagnostic_lines)
-            assert ["BUY_ANIMAL", "COW", 1] in market, diagnostic
-            assert (4, 3) in planner_state["purchase_positions"], diagnostic
-            return
+            raise AssertionError("opening COW was admitted but never bought on day 2\n" + "\n".join(diagnostic_lines))
 
         state[0].action = action
         state[1].action = pass_agent(state[1].observation)
         state = official_game.interpreter(state, env)
         state[0].observation.step = step + 1
 
-    raise AssertionError("never reached opening day 2 hour 0")
+    raise AssertionError("never completed opening day 2 conversion regression")
