@@ -169,6 +169,34 @@ def _maximum_cash_after_sales(obs, farm, sales, hires):
     )
 
 
+def _opening_retry_orders(obs, farm, purchase_targets, pending_sales=()):
+    """Retry only already-admitted opening inputs when intraday cash arrives.
+
+    The fixed opening intentionally finances later animal conversions from
+    fertilizer/harvest cash generated during the day. A morning-only purchase
+    pass can therefore admit PLACE work but miss its animal by a few dollars.
+    Re-evaluate the same admitted targets after observed sales; this does not
+    select new targets or reopen schedule admission, and normal play keeps its
+    morning-only investment purchases.
+    """
+    if not purchase_targets:
+        return []
+    wheat_sold = sum(
+        int(order[2]) for order in pending_sales
+        if order[0] == "SELL" and order[1] == "WHEAT"
+    )
+    return purchase_orders(
+        obs,
+        purchase_targets,
+        _active_positions(farm),
+        available_money=_maximum_cash_after_sales(obs, farm, pending_sales, 0),
+        available_wheat=max(
+            0, obs["private"]["shed"].get("WHEAT", 0) - wheat_sold
+        ),
+        replant_same_crop=True,
+    )
+
+
 def _reserve_feed_for_affordable_animals(obs, farm, targets, reservations, sales, hires):
     """Keep shed WHEAT for animals the same market pass can actually buy."""
     reserve = dict(reservations)
@@ -703,11 +731,22 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             sale_reserve["WHEAT"],
             feed_wheat_reserve(obs, committed_feed_targets, _active_positions(farm)),
         )
-        market = sell_orders(obs, sale_reserve)
+        sales = sell_orders(obs, sale_reserve)
+        market = list(sales)
         if day < effective_end:
-            market += feed_wheat_order(
-                obs, committed_feed_targets, _active_positions(farm)
-            )
+            if state["opening_active"]:
+                opening_purchase_targets = {
+                    position: target
+                    for position, target in state["daily_targets"].items()
+                    if position in state["purchase_positions"]
+                }
+                market += _opening_retry_orders(
+                    obs, farm, opening_purchase_targets, sales
+                )
+            else:
+                market += feed_wheat_order(
+                    obs, committed_feed_targets, _active_positions(farm)
+                )
         market = market[:10]
 
         # Continue a worker's current route through ordinary movement and
