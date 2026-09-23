@@ -36,33 +36,43 @@ def test_day_two_opening_conversion_is_admitted_and_buys_cow():
     targets = cells["targets"]
     planner_state = cells["state"]
     state = env.state
+    market_ledger = []
 
     for step in range(int(env.configuration.episodeSteps) - 1):
         obs = state[0].observation
         action = agent(obs)
+        market = action.get("market", [])
+        if market:
+            market_ledger.append(
+                (
+                    obs.day,
+                    obs.hour,
+                    obs.farms[0]["money"],
+                    len(obs.farms[0]["hands"]),
+                    obs.farms[0].get("hires_today", 0),
+                    obs.private["shed"].get("FERTILIZER", 0),
+                    market,
+                )
+            )
 
         if obs.day == 2 and obs.hour == 0:
             cow_targets = sorted(
                 position for position, target in targets.items()
                 if target and target[0] == "COW"
             )
-            conversion_tiles = {
-                position: obs.farms[0]["tiles"][position[1]][position[0]]
-                for position in ((4, 3), (3, 3))
-            }
-            diagnostic = {
-                "money": obs.farms[0]["money"],
-                "shed": dict(obs.private["shed"]),
-                "market": action.get("market", []),
-                "cow_targets": cow_targets,
-                "purchase_positions": sorted(planner_state["purchase_positions"]),
-                "daily_target_at_43": planner_state["daily_targets"].get((4, 3)),
-                "daily_target_at_33": planner_state["daily_targets"].get((3, 3)),
-                "hand_target": planner_state["hand_target"],
-                "mandatory_hand_target": planner_state["mandatory_hand_target"],
-                "tiles": conversion_tiles,
-            }
-            assert ["BUY_ANIMAL", "COW", 1] in action.get("market", []), diagnostic
+            diagnostic_lines = [
+                f"day2 money={obs.farms[0]['money']} shed={dict(obs.private['shed'])}",
+                f"market={market}",
+                f"cow_targets={cow_targets}",
+                f"purchase_positions={sorted(planner_state['purchase_positions'])}",
+                f"daily(4,3)={planner_state['daily_targets'].get((4, 3))}",
+                f"daily(3,3)={planner_state['daily_targets'].get((3, 3))}",
+                f"hands={planner_state['hand_target']} mandatory={planner_state['mandatory_hand_target']}",
+                "ledger(day,hour,money,hands,hires_today,fertilizer,market):",
+                *map(str, market_ledger),
+            ]
+            diagnostic = "\n".join(diagnostic_lines)
+            assert ["BUY_ANIMAL", "COW", 1] in market, diagnostic
             assert (4, 3) in planner_state["purchase_positions"], diagnostic
             return
 
