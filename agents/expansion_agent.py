@@ -343,6 +343,14 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         replanned = _strip_partial_animal_builds(
             replanned, opening_active=state["opening_active"]
         )
+        # Every task here comes from a position admitted by the morning
+        # schedule. Rebuilding after HARVEST/PLANT may change the physical
+        # tile enough for build_tasks to classify the successor as an
+        # "optional investment" again, but rolling execution must not reopen
+        # admission or drop the remainder of an already-admitted chain.
+        # This is schedule commitment, not an action-kind runtime priority.
+        for task in replanned:
+            task.mandatory = True
         starts = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
         budget = max(0, 24 - hour)
         plans, unassigned = build_rolling_queues(
