@@ -133,8 +133,12 @@ marker = '''def test_hands_needed_zero_for_no_tasks():
 '''
 assert marker in t
 case = '''def test_hands_needed_respects_reduced_existing_worker_budget():
+    # Farmer can exactly cover the local task while the first pending hand
+    # spawns at (5,4) and can exactly cover the second one. With the historical
+    # 23-turn assumption this distinction is invisible; at a late freeze it is
+    # what decides whether an additional worker is required.
     task_a = Task(SHED, [["WATER"]] * 5, mandatory=True)
-    task_b = Task(SHED, [["WATER"]] * 5, mandatory=True)
+    task_b = Task((5, 4), [["WATER"]] * 5, mandatory=True)
     count, dropped = hands_needed(
         [task_a, task_b],
         farmer_start=SHED,
