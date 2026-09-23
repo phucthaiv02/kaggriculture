@@ -170,22 +170,24 @@ def _maximum_cash_after_sales(obs, farm, sales, hires):
 
 
 def _opening_retry_orders(obs, farm, purchase_targets, pending_sales=()):
-    """Retry only already-admitted opening inputs when intraday cash arrives.
+    """Retry already-admitted opening investments when intraday cash arrives.
 
     The fixed opening intentionally finances later animal conversions from
     fertilizer/harvest cash generated during the day. A morning-only purchase
     pass can therefore admit PLACE work but miss its animal by a few dollars.
     Re-evaluate the same admitted targets after observed sales; this does not
     select new targets or reopen schedule admission, and normal play keeps its
-    morning-only investment purchases. Even with no investment target in this
-    pass, purchase_orders must still cover live-animal WHEAT for the opening's
-    fertilizer refinance loop.
+    morning-only investment purchases.
+
+    purchase_orders still prices the feed needed to make an animal affordable,
+    but intraday WHEAT itself is owned by feed_wheat_order. Filtering PRODUCT
+    orders here prevents the investment retry from duplicating that feed path.
     """
     wheat_sold = sum(
         int(order[2]) for order in pending_sales
         if order[0] == "SELL" and order[1] == "WHEAT"
     )
-    return purchase_orders(
+    purchase = purchase_orders(
         obs,
         purchase_targets,
         _active_positions(farm),
@@ -195,6 +197,10 @@ def _opening_retry_orders(obs, farm, purchase_targets, pending_sales=()):
         ),
         replant_same_crop=True,
     )
+    return [
+        order for order in purchase
+        if order[0] in ("BUY_ANIMAL", "BUY_SEED")
+    ]
 
 
 def _reserve_feed_for_affordable_animals(obs, farm, targets, reservations, sales, hires):
@@ -734,6 +740,9 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         sales = sell_orders(obs, sale_reserve)
         market = list(sales)
         if day < effective_end:
+            market += feed_wheat_order(
+                obs, committed_feed_targets, _active_positions(farm)
+            )
             if state["opening_active"]:
                 opening_purchase_targets = {
                     position: target
@@ -742,10 +751,6 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                 }
                 market += _opening_retry_orders(
                     obs, farm, opening_purchase_targets, sales
-                )
-            else:
-                market += feed_wheat_order(
-                    obs, committed_feed_targets, _active_positions(farm)
                 )
         market = market[:10]
 
