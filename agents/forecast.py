@@ -33,8 +33,8 @@ class Production:
                                        for p, n, inputs, goods in visits)
 
 
-def production(name, fertilize, day, end_day, tile=None):
-    """Remaining output, including held yield, without inventing replants."""
+def _simulate_production(name, fertilize, day, end_day, tile=None):
+    """Uncached interpreter-backed production simulation."""
     animal = name in game.ANIMALS
     initial = (game._new_animal(name, day) if animal else game._new_plant(name, day, 24))
     if tile is not None:
@@ -99,6 +99,68 @@ def production(name, fertilize, day, end_day, tile=None):
         game._daily_refresh_plants(farm, when, 24)
         game._daily_refresh_animals(farm, when)
     return result
+
+
+def _production_snapshot(result):
+    """Compact immutable representation safe to retain in an LRU cache."""
+    return (
+        tuple((day, tuple(sorted(units.items()))) for day, units in sorted(result.sales.items())),
+        tuple((day, tuple(sorted(units.items()))) for day, units in sorted(result.inputs.items())),
+        tuple((day, tuple(visits)) for day, visits in sorted(result.visits.items())),
+    )
+
+
+def _restore_production(snapshot):
+    result = Production()
+    sales, inputs, visits = snapshot
+    for day, units in sales:
+        result.sales[day].update(dict(units))
+    for day, units in inputs:
+        result.inputs[day].update(dict(units))
+    for day, entries in visits:
+        result.visits[day].extend(entries)
+    return result
+
+
+def _fertilize_cache_key(fertilize):
+    # Dynamic plans are frozen dataclasses; legacy callers may still pass lists
+    # or sets. Normalize only mutable containers, preserving plan semantics.
+    if isinstance(fertilize, list):
+        return tuple(_fertilize_cache_key(value) for value in fertilize)
+    if isinstance(fertilize, set):
+        return tuple(sorted(_fertilize_cache_key(value) for value in fertilize))
+    if isinstance(fertilize, tuple):
+        return tuple(_fertilize_cache_key(value) for value in fertilize)
+    return fertilize
+
+
+def _tile_cache_key(tile):
+    if tile is None:
+        return None
+    # Kaggriculture producer tiles are flat dictionaries of primitive values.
+    # Keeping every field in the key is intentionally conservative: a new
+    # engine field automatically invalidates sharing instead of risking a stale
+    # forecast based on an incomplete hand-picked state signature.
+    return tuple(sorted(tile.items()))
+
+
+@lru_cache(maxsize=4096)
+def _cached_production_snapshot(name, fertilize, day, end_day, tile_key):
+    tile = None if tile_key is None else dict(tile_key)
+    return _production_snapshot(
+        _simulate_production(name, fertilize, day, end_day, tile)
+    )
+
+
+def production(name, fertilize, day, end_day, tile=None):
+    """Remaining output with exact state-keyed interpreter forecast caching."""
+    snapshot = _cached_production_snapshot(
+        name, _fertilize_cache_key(fertilize), int(day), int(end_day),
+        _tile_cache_key(tile),
+    )
+    # Return a fresh object to preserve the public function's old ownership
+    # semantics even though the expensive simulation result is shared.
+    return _restore_production(snapshot)
 
 
 class MarketForecast:
