@@ -89,54 +89,31 @@ def _strip_partial_animal_builds(tasks, opening_active=False):
     return cleaned
 
 
-def _restore_scheduled_pickups(obs, farm, plans, shed_access):
-    """Materialize shed inputs needed by a preserved admitted schedule.
-
-    A rolling replacement can become infeasible exactly when a same-turn market
-    purchase has just landed. If the previous feasible schedule is retained and
-    its worker is currently standing on a shed tile, attach the missing PICKUP
-    dependency before that worker leaves. This changes no task order and adds no
-    action-kind priority; it only makes already-scheduled resource consumption
-    executable from the newly observed inventory.
-    """
-    shed_left = Counter(obs["private"]["shed"])
-    inventories = obs["private"]["inventories"]
-    positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
-    shed_positions = set(shed_access)
-
-    for index, plan in enumerate(plans[:len(positions)]):
-        if not plan.queue or positions[index] not in shed_positions:
-            continue
-
-        required = Counter()
-        planned_pickups = Counter()
-        for operation in plan.queue:
-            if not operation:
-                continue
-            op = operation[0]
-            if op == "PICKUP":
-                planned_pickups[operation[1]] += operation[2] if len(operation) > 2 else 1
-            elif op == "FEED":
-                required["WHEAT"] += 1
-            elif op == "FERTILIZE":
-                required["FERTILIZER"] += 1
-            elif op == "PLACE" and len(operation) > 1:
-                required[operation[1]] += 1
-
-        carried = Counter(inventories[index] if index < len(inventories) else {})
-        prefix = []
-        for item, amount in required.items():
-            missing = max(0, amount - carried[item] - planned_pickups[item])
-            take = min(missing, shed_left[item])
-            if take:
-                prefix.append(["PICKUP", item, take])
-                shed_left[item] -= take
-        if prefix:
-            plan.queue[:0] = prefix
+# A rolling rebuild is useful only when the executable dependency graph changes.
+# WATER/FEED/CARE/FERTILIZE are already encoded inside the current Task route and
+# do not unlock a different tile. Repacking every MOVE (or every maintenance op)
+# made workers repeatedly trade destinations and burn the day on WEST/EAST
+# oscillations. These operations change inventory, occupancy, or the set of live
+# tile tasks, so the next observation should rebuild from the new state.
+ROLLING_REPLAN_OPS = {
+    "PICKUP", "DROP", "HARVEST", "DIG", "PLANT", "PLACE",
+    "BUILD_COOP", "BUILD_PASTURE", "COLLECT_FERTILIZER",
+}
 
 
-TARGETS_PER_DAY = 10
-INVESTMENTS_PER_DAY = 20
+def _needs_route_rebuild(operations):
+    return any(operation and operation[0] in ROLLING_REPLAN_OPS for operation in operations)
+
+
+def _plans_have_work(plans):
+    return any(plan.queue for plan in plans)
+
+
+# One land purchase unlocks one 5x5 quadrant. Price and admit up to the whole
+# quadrant in the following morning instead of intentionally carrying 5-15
+# already-selected empty tiles for extra days. Target scoring itself is unchanged.
+TARGETS_PER_DAY = 25
+INVESTMENTS_PER_DAY = 25
 
 
 def _active_positions(farm):
@@ -298,7 +275,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         "frozen_positions": set(), "unassigned": [], "schedule_admitted": False,
         "purchase_positions": set(), "committed_targets": set(),
         "investment_backlog": set(), "daily_targets": {},
-        "morning_market_queue": [],
+        "morning_market_queue": [], "replan_needed": True,
     }
     opening_governs = make_opening_controller()
 
@@ -310,16 +287,24 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         }
 
     def _rebuild_rolling_routes(obs, farm, hour):
-        """Re-optimize admitted work without replacing it by an infeasible route."""
+        """Re-optimize the admitted remainder from the live observation.
+
+        `frozen_positions` is the daily schedule boundary. Rebuilding may change
+        worker assignment and route order inside that set, but it cannot pull in
+        a task the daily admission did not accept. There is deliberately no
+        stale-queue fallback: an exhausted WorkerPlan is not evidence that its
+        old schedule is still feasible.
+        """
         frozen_targets = {
             position: targets.get(position)
             for position in state["frozen_positions"]
-            if position in targets
         }
         task_obs = planning_observation(obs)
         replanned = build_tasks(
-            task_obs, frozen_targets,
+            task_obs,
+            frozen_targets,
             prioritize_fertilizer_drop=state["opening_active"],
+            include_physical=False,
         )
         replanned = _strip_partial_animal_builds(
             replanned, opening_active=state["opening_active"]
@@ -334,26 +319,12 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             _open_shed_access(farm),
             obs["private"]["shed"],
         )
-        mandatory_unassigned = [
-            task for task in unassigned if task.mandatory is not False
-        ]
-        if mandatory_unassigned and state["plans"]:
-            # The previous queue is the admitted schedule tail. A rolling pass
-            # is allowed to improve assignment/order, never to replace that
-            # schedule with one that drops mandatory work. Keep the old tail;
-            # if a just-arrived market input is available at the worker's
-            # current shed tile, materialize that dependency before departure.
-            state["unassigned"] = unassigned
-            _restore_scheduled_pickups(
-                obs, farm, state["plans"], _open_shed_access(farm)
-            )
-            return
-
         state["plans"], state["unassigned"] = plans, unassigned
         assigned = {id(task) for task in replanned} - {id(task) for task in unassigned}
         state["reserved"] = reserved_items(
             [task for task in replanned if id(task) in assigned]
         )
+        state["replan_needed"] = False
 
     def agent(obs, configuration=None):
         effective_end = end_day
@@ -423,8 +394,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             evaluated = pending_before - state["pending_targets"]
             state["investment_backlog"].update(
                 position for position in evaluated
-                if targets.get(position)
-                and not isinstance(farm["tiles"][position[1]][position[0]], dict)
+                if targets.get(position) and position not in physical_positions
             )
             for position in new_positions:
                 targets.setdefault(position, None)
@@ -487,7 +457,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                 mandatory_hand_target=mandatory_hand_target,
                 plans=[], reserved={},
                 frozen_positions=set(), unassigned=[], schedule_admitted=False,
-                morning_market_queue=[],
+                morning_market_queue=[], replan_needed=True,
             )
             # hands_needed already ran the exact feasibility pack at the chosen
             # headcount. Repacking the same tasks here was a duplicate
@@ -654,8 +624,12 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             # reassign/reorder the admitted set but never reopens headcount or
             # task admission later in the day.
             state["schedule_admitted"] = True
+            # The admission pass just produced a route from this exact live
+            # observation. Do not immediately throw it away with a second pack.
+            state["replan_needed"] = False
 
-        _rebuild_rolling_routes(obs, farm, hour)
+        if state["replan_needed"] or not _plans_have_work(state["plans"]):
+            _rebuild_rolling_routes(obs, farm, hour)
 
         positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
         state["reserved"] = queue_commitments(positions, state["plans"])[3]
@@ -675,6 +649,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             hand_ops.append(plan.queue.pop(0) if plan and plan.queue else ["PASS"])
 
         worker_ops = [farmer_op, *hand_ops]
+        planned_worker_ops = [list(operation) for operation in worker_ops]
         seeds_available = dict(obs["private"]["seeds"])
         shed_available = Counter(obs["private"]["shed"])
         inventories = obs["private"]["inventories"]
@@ -713,6 +688,10 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
 
         worker_ops = _valid_harvest_operations(farm, worker_ops)
         worker_ops = _protect_animal_structures(farm, worker_ops)
+        invalidated = any(
+            planned != actual and actual == ["PASS"] and planned != ["PASS"]
+            for planned, actual in zip(planned_worker_ops, worker_ops)
+        )
         farmer_op, hand_ops = worker_ops[0], worker_ops[1:]
 
         committed_feed_targets = {
@@ -729,6 +708,17 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             market += feed_wheat_order(
                 obs, committed_feed_targets, _active_positions(farm)
             )
-        return {"farmer": farmer_op, "hands": hand_ops, "market": market[:10]}
+        market = market[:10]
+
+        # Continue a worker's current route through ordinary movement and
+        # maintenance. Rebuild only after a dependency/topology change, an
+        # invalidated queued op, or a market purchase that changes available
+        # inputs on the next observation.
+        state["replan_needed"] = bool(
+            invalidated
+            or _needs_route_rebuild(worker_ops)
+            or any(order and order[0].startswith("BUY_") for order in market)
+        )
+        return {"farmer": farmer_op, "hands": hand_ops, "market": market}
 
     return agent
