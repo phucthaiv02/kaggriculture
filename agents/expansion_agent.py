@@ -505,22 +505,35 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             # headcount. Repacking the same tasks here was a duplicate
             # superlinear morning pass used only to recover the same rejected set.
             rejected_ids = {id(task) for task in rejected}
+            mandatory_ids = {
+                id(task) for task in tasks if task.mandatory is not False
+            }
+            pre_admitted_ids = (
+                {id(task) for task in tasks} - rejected_ids
+            ) | mandatory_ids
             investment_task_positions = {
                 task.position for task in tasks
                 if any(op[0] in ("PLANT", "PLACE") for op in task.actions)
             }
             state["purchase_positions"] = {
                 task.position for task in tasks
-                if id(task) not in rejected_ids
+                if id(task) in pre_admitted_ids
                 and task.position in investment_task_positions
             }
             rejected_investments = {
                 task.position for task in rejected
-                if task.position in investment_task_positions
+                if id(task) not in mandatory_ids
+                and task.position in investment_task_positions
             }
             state["investment_backlog"].update(rejected_investments)
 
-            assigned_tasks = [task for task in tasks if id(task) not in rejected_ids]
+            # Hour-0 funding must mirror the admission rule used after market
+            # orders land. Otherwise a mandatory HARVEST->PLANT successor can
+            # be frozen into today's schedule at hour 1 without its seed ever
+            # being purchased because preliminary packing happened to reject it.
+            assigned_tasks = [
+                task for task in tasks if id(task) in pre_admitted_ids
+            ]
             fertilizer_purchase_positions = {
                 task.position for task in assigned_tasks
                 if task.needs.get("FERTILIZER", 0) > 0
