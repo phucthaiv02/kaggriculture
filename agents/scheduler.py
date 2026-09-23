@@ -386,6 +386,7 @@ def hands_needed(
     existing_hand_starts=(),
     shed_access=SHED_ACCESS,
     pending_hand_budget=HAND_BUDGET,
+    existing_hand_budget=None,
     max_hands=MAX_HANDS,
     marginal_hire_costs=None,
 ):
@@ -396,11 +397,12 @@ def hands_needed(
     Existing hands are sunk cost. Omitted prices retain capacity-only sizing.
     Return work excluded by capacity or the economic stopping rule."""
     minimum = min(len(existing_hand_starts), max_hands)
+    existing_budget = HAND_BUDGET if existing_hand_budget is None else existing_hand_budget
     # Every action and each distinct positive supply pickup is unavoidable,
     # even with zero travel. Skip headcounts below this admissible bound.
     required = tasks if marginal_hire_costs is None else [
         task for task in tasks if task.mandatory is not False
-        and len(task.actions) <= max(FARMER_BUDGET, HAND_BUDGET, pending_hand_budget)
+        and len(task.actions) <= max(existing_budget, pending_hand_budget)
     ]
     mandatory_steps = sum(len(task.actions) for task in required)
     mandatory_steps += len({item for task in required for item, amount in task.needs.items() if amount > 0})
@@ -409,8 +411,8 @@ def hands_needed(
         starts = [tuple(farmer_start)] + predicted_hand_starts(
             farmer_start, existing_hand_starts, count
         )
-        budgets = [FARMER_BUDGET]
-        budgets += [HAND_BUDGET] * min(count, len(existing_hand_starts))
+        budgets = [existing_budget]
+        budgets += [existing_budget] * min(count, len(existing_hand_starts))
         budgets += [pending_hand_budget] * max(0, count - len(existing_hand_starts))
         if count < max_hands and sum(budgets) < mandatory_steps:
             continue

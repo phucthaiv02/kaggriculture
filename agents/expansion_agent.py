@@ -643,12 +643,21 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             ]
             existing_hands = tuple(map(tuple, farm["hands"]))
             shed_access = _open_shed_access(farm)
+            # Final queues may be built after one or more morning market-only
+            # turns. Existing workers can act from this observation through
+            # hour 23; a HIRE ordered now first acts on the next observation.
+            # Size and pack against those real remaining turns instead of the
+            # day-start 23/22 constants, otherwise each bucket can silently
+            # strand its final mandatory action at rollover.
+            remaining_budget = max(0, 24 - hour)
+            pending_budget = max(0, 23 - hour)
             desired_hands, _dropped = hands_needed(
                 tasks,
                 tuple(farm["farmer"]),
                 existing_hands,
                 shed_access,
-                pending_hand_budget=22,
+                pending_hand_budget=pending_budget,
+                existing_hand_budget=remaining_budget,
                 marginal_hire_costs=(None if state["opening_active"] and day < effective_end else
                     [_hire_costs(farm, n + 1) - _hire_costs(farm, n)
                      for n in range(MAX_HANDS - len(existing_hands))]),
@@ -661,7 +670,8 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                 hand_count,
                 existing_hands,
                 shed_access,
-                pending_hand_budget=22,
+                pending_hand_budget=pending_budget,
+                existing_hand_budget=remaining_budget,
                 available_wheat=obs["private"]["shed"].get("WHEAT", 0),
             )
 
@@ -680,7 +690,8 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                     hand_count,
                     existing_hands,
                     shed_access,
-                    pending_hand_budget=22,
+                    pending_hand_budget=pending_budget,
+                    existing_hand_budget=remaining_budget,
                     available_wheat=obs["private"]["shed"].get("WHEAT", 0),
                 )
                 unassigned = mandatory_unassigned + [
@@ -693,7 +704,8 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                     tuple(farm["farmer"]),
                     existing_hands,
                     shed_access,
-                    pending_hand_budget=22,
+                    pending_hand_budget=pending_budget,
+                    existing_hand_budget=remaining_budget,
                 )
                 state["emergency_hires"] = max(0, required_hands - hand_count)
             else:
