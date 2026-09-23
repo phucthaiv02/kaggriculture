@@ -23,84 +23,38 @@ jobs:
       - name: Patch, test, replay, and push
         run: |
           python -m pip install -q 'kaggle-environments==1.32.7' pytest
+          cp .ci/apply_frozen_daily_plan.py /tmp/apply_frozen_daily_plan.py
           git fetch origin agent-v3
           EXPECTED=$(git rev-parse origin/agent-v3)
           git checkout -B frozen-daily-plan origin/agent-v3
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('agents/expansion_agent.py')
-          text = path.read_text()
-          old = '''        frozen_targets = {
-            position: targets.get(position)
-            for position in state["frozen_positions"]
-            if position in targets
-        }
-        replanned = build_tasks(
-            obs, frozen_targets,
-            prioritize_fertilizer_drop=state["opening_active"],
-        )
-'''
-          new = '''        # Intraday reconciliation may reroute unfinished work, but it must
-        # never retarget a position that was admitted by the morning plan.
-        # Global ``targets`` and ``pending_targets`` continue evolving for
-        # future mornings; the executable commitment for today lives in
-        # ``daily_targets`` until rollover.
-        frozen_targets = {
-            position: state["daily_targets"].get(position)
-            for position in state["frozen_positions"]
-            if position in state["daily_targets"]
-        }
-        replan_obs = dict(obs)
-        replan_obs["_pending_targets"] = (
-            set(obs.get("_pending_targets", ())) - state["frozen_positions"]
-        )
-        replanned = build_tasks(
-            replan_obs, frozen_targets,
-            prioritize_fertilizer_drop=state["opening_active"],
-        )
-'''
-          assert text.count(old) == 1, text.count(old)
-          path.write_text(text.replace(old, new))
-          PY
+          python /tmp/apply_frozen_daily_plan.py
           python -m py_compile agents/expansion_agent.py
           git diff --check
           python -m pytest -q tests/test_agents_farm_tasks.py tests/test_agents_planting_deadline.py tests/test_agents_planner.py
-
           python - <<'PY'
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
           from experiments.crop_schedules import pass_agent
           from experiments.play_match import configuration
-
           env = make('kaggriculture', configuration=configuration(1), debug=False)
           env.run([make_agent(29, seed=1), pass_agent])
-          assert all(state.status == 'DONE' for state in env.state), [state.status for state in env.state]
-
+          assert all(state.status == 'DONE' for state in env.state)
           def producer(tile):
-              if not isinstance(tile, dict):
-                  return None
-              return tile.get('crop') or tile.get('animal')
-
+              return (tile.get('crop') or tile.get('animal')) if isinstance(tile, dict) else None
           history = []
           for step in env.steps:
-              row = step[0]
-              ob = row['observation']
-              farm = ob['farms'][0]
-              history.append((int(ob['day']), int(ob['hour']), farm['tiles']))
-
+              ob = step[0]['observation']
+              history.append((int(ob['day']), int(ob['hour']), ob['farms'][0]['tiles']))
           delayed = []
           for i in range(1, len(history)):
               day, hour, tiles = history[i]
-              pday, phour, prev = history[i-1]
+              prev = history[i-1][2]
               if day >= 28:
                   continue
               for y in range(10):
                   for x in range(10):
-                      before = prev[y][x]
-                      after = tiles[y][x]
-                      if not (isinstance(before, dict) and before.get('kind') == 'PLANT'):
-                          continue
-                      if after is not None:
+                      before, after = prev[y][x], tiles[y][x]
+                      if not (isinstance(before, dict) and before.get('kind') == 'PLANT' and after is None):
                           continue
                       found = None
                       for j in range(i + 1, min(len(history), i + 4)):
@@ -108,14 +62,11 @@ jobs:
                           if name:
                               found = (j - i, name, history[j][0], history[j][1])
                               break
-                      if found is None:
-                          delayed.append((day, hour, (x, y), before.get('crop'), None))
-                      elif found[0] > 2:
+                      if found is None or found[0] > 2:
                           delayed.append((day, hour, (x, y), before.get('crop'), found))
           print('HARVEST_EMPTY_DELAYED_PRE28', delayed)
           assert not delayed, delayed
           PY
-
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+phucthaiv02@users.noreply.github.com'
           git add agents/expansion_agent.py
