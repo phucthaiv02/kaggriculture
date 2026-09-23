@@ -7,7 +7,7 @@ from kaggle_environments.envs.kaggriculture import kaggriculture as official_gam
 from agents.fertilizer import FertilizerPlan, cycle_plan, plan_ages, plan_json
 from agents.forecast import MarketForecast, Production, production
 from agents.schedules import (
-    CROP_FERTILIZE_DAYS, CROP_LAST_AGE, ONGOING_CROPS, cycle_finished,
+    CROP_FERTILIZE_DAYS, CROP_LAST_AGE, ONGOING_CROPS, cycle_turns_over_today,
 )
 from agents.horizon import (
     SEASON_END_DAY, cycle_end as _cycle_end,
@@ -291,6 +291,7 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
     baseline = Production()
     counts = Counter()
     replanning = []
+    deferred = []
     external = Production()
     for position in active_positions:
         if replan_positions is not None and position not in replan_positions:
@@ -301,7 +302,12 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
         if isinstance(tile, dict) and tile.get("animal"):
             continue
         if isinstance(tile, dict) and tile.get("kind") == "PLANT":
-            if not cycle_finished(tile["crop"], day - tile["planted_day"], tile):
+            if not cycle_turns_over_today(tile["crop"], day - tile["planted_day"], tile):
+                # Keep growing crops in the persistent pending set instead of
+                # forgetting them after one batch scan. They are repriced on
+                # the morning their known lifecycle will free the tile today.
+                if replan_positions is not None:
+                    deferred.append(position)
                 continue
             # Preserve a conversion already scheduled by the opening.
             if current and current[0] != tile["crop"] and can_start(current[0], day, end_day):
@@ -312,7 +318,7 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
     def distance(p):
         return min(abs(p[0] - s[0]) + abs(p[1] - s[1]) for s in shed_access)
     replanning.sort(key=lambda p: (distance(p), p[1], p[0]))
-    pending = replanning[max_positions:] if max_positions is not None else []
+    pending = deferred + (replanning[max_positions:] if max_positions is not None else [])
     if max_positions is not None:
         replanning = replanning[:max_positions]
     if not replanning:
