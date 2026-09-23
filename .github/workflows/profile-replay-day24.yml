@@ -1,4 +1,4 @@
-name: Validate scheduler feasibility pruning
+name: Profile full agent runtime
 
 on:
   push:
@@ -6,11 +6,8 @@ on:
     paths:
       - .github/workflows/profile-replay-day24.yml
 
-permissions:
-  contents: write
-
 jobs:
-  validate:
+  profile:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -20,50 +17,42 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Differential test, replay benchmark, and push
+      - name: Run timed full matches
         run: |
-          python -m pip install -q 'kaggle-environments==1.32.7' pytest
-          cp .ci/apply_scheduler_feasibility_bound.py /tmp/apply_scheduler_feasibility_bound.py
-          cp .ci/validate_scheduler_feasibility_bound.py /tmp/validate_scheduler_feasibility_bound.py
+          python -m pip install -q 'kaggle-environments==1.32.7'
           git fetch origin agent-v3
-          EXPECTED=$(git rev-parse origin/agent-v3)
-          git checkout -B scheduler-bound origin/agent-v3
+          git checkout --detach origin/agent-v3
+          python - <<'PY'
+          import statistics
+          import time
+          from kaggle_environments import make
+          from agents.expansion_agent import make_agent
+          from experiments.crop_schedules import pass_agent
+          from experiments.play_match import configuration
 
-          BASELINE_FAILS=(
-            'tests/test_agents_scheduler.py::test_ready_animal_harvest_precedes_other_urgent_animal_work'
-            'tests/test_agents_scheduler.py::test_urgent_tasks_finish_early_even_when_sharing_worker_saves_travel'
-            'tests/test_agents_scheduler.py::test_rescue_avoids_an_extra_hand_without_dropping_work'
-            'tests/test_agents_scheduler.py::test_feed_consolidation_batches_five_delivery_routes_into_two'
-          )
-          for test_id in "${BASELINE_FAILS[@]}"; do
-            if python -m pytest -q "$test_id"; then
-              echo "Expected baseline failure unexpectedly passed: $test_id"
-              exit 1
-            fi
-          done
+          all_morning = []
+          for seed in (1, 2, 3):
+              agent = make_agent(30, seed=seed)
+              records = []
+              def timed(obs):
+                  start = time.perf_counter()
+                  action = agent(obs)
+                  elapsed = time.perf_counter() - start
+                  records.append((int(obs['day']), int(obs['hour']), elapsed))
+                  return action
 
-          cp agents/scheduler.py /tmp/scheduler_old.py
-          python /tmp/apply_scheduler_feasibility_bound.py
-          python -m py_compile agents/scheduler.py
-          git diff --check
-          PYTHONPATH=. python /tmp/validate_scheduler_feasibility_bound.py
+              env = make('kaggriculture', configuration=configuration(seed), debug=False)
+              env.run([timed, pass_agent])
+              morning = [(day, elapsed) for day, hour, elapsed in records if hour == 0]
+              all_morning.extend((seed, day, elapsed) for day, elapsed in morning)
+              top = sorted(morning, key=lambda row: row[1], reverse=True)[:8]
+              p95 = sorted(elapsed for _, elapsed in morning)[max(0, int(len(morning) * 0.95) - 1)]
+              print(f'SEED {seed}: calls={len(records)} morning={len(morning)} max={max(e for _,e in morning):.6f}s p95={p95:.6f}s mean={statistics.mean(e for _,e in morning):.6f}s')
+              print('  top morning:', ', '.join(f'd{day}={elapsed:.6f}s' for day, elapsed in top))
+              slow_all = [(day, hour, elapsed) for day, hour, elapsed in records if elapsed >= 0.5]
+              print(f'  calls>=0.5s: {slow_all}')
 
-          for test_id in "${BASELINE_FAILS[@]}"; do
-            if python -m pytest -q "$test_id"; then
-              echo "Patch changed a known baseline behavior: $test_id"
-              exit 1
-            fi
-          done
-
-          python -m pytest -q \
-            tests/test_agents_scheduler.py tests/test_agents_planner.py tests/test_agents_forecast.py \
-            --deselect='tests/test_agents_scheduler.py::test_ready_animal_harvest_precedes_other_urgent_animal_work' \
-            --deselect='tests/test_agents_scheduler.py::test_urgent_tasks_finish_early_even_when_sharing_worker_saves_travel' \
-            --deselect='tests/test_agents_scheduler.py::test_rescue_avoids_an_extra_hand_without_dropping_work' \
-            --deselect='tests/test_agents_scheduler.py::test_feed_consolidation_batches_five_delivery_routes_into_two'
-
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add agents/scheduler.py
-          git commit -m 'perf: prune provably impossible scheduler variants'
-          git push --force-with-lease=agent-v3:${EXPECTED} origin HEAD:agent-v3
+          top = sorted(all_morning, key=lambda row: row[2], reverse=True)[:15]
+          print('GLOBAL TOP:', ', '.join(f's{seed}/d{day}={elapsed:.6f}s' for seed, day, elapsed in top))
+          print(f'GLOBAL morning >=0.8s: {sum(e >= 0.8 for _,_,e in all_morning)}; >=1.0s: {sum(e >= 1.0 for _,_,e in all_morning)}')
+          PY
