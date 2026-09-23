@@ -1,3 +1,5 @@
+from collections import Counter
+
 from agents.expansion_agent import (
     _needs_route_rebuild,
     _plans_have_work,
@@ -5,6 +7,7 @@ from agents.expansion_agent import (
     _strip_partial_animal_builds,
 )
 from agents.farm_tasks import Task
+from agents.rolling_scheduler import build_rolling_queues
 from agents.scheduler import WorkerPlan
 
 
@@ -66,3 +69,38 @@ def test_empty_worker_plan_container_is_not_treated_as_live_schedule():
     assert _plans_have_work([
         WorkerPlan((4, 4), []), WorkerPlan((5, 4), [["WEST"]])
     ])
+
+
+def test_rolling_keeps_zero_distance_admitted_successor_before_remote_feed():
+    """A worker must finish the admitted chain underfoot before leaving.
+
+    This models the observation immediately after HARVEST: the worker carries
+    WHEAT, the tile now exposes its admitted PLANT->WATER successor, and a
+    remote animal can also consume the carried WHEAT. Route optimization should
+    take the zero-distance successor first instead of creating a needless
+    leave-and-return trip.
+    """
+    local = Task(
+        (1, 1),
+        [["PLANT", "WHEAT"], ["WATER"]],
+        mandatory=True,
+    )
+    remote_feed = Task(
+        (4, 1),
+        [["FEED"]],
+        needs=Counter({"WHEAT": 1}),
+        mandatory=True,
+    )
+
+    plans, unassigned = build_rolling_queues(
+        [local, remote_feed],
+        starts=[(1, 1)],
+        inventories=[{"WHEAT": 1}],
+        budgets=[20],
+        shed_access=((4, 4),),
+        shed={},
+    )
+
+    assert not unassigned
+    assert plans[0].queue[:2] == [["PLANT", "WHEAT"], ["WATER"]]
+    assert ["FEED"] in plans[0].queue[2:]
