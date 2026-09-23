@@ -215,6 +215,16 @@ def build_rolling_queues(
     if not starts:
         return [], list(tasks)
 
+    # A refinance task is not optional fertilizer income. It is the resource
+    # predecessor of a scheduled FEED when the farm cannot buy WHEAT yet:
+    # COLLECT -> DROP -> SELL -> BUY WHEAT -> FEED.  Frozen queues used to
+    # preserve that predecessor implicitly. Rolling execution must encode the
+    # dependency explicitly so route optimization cannot discard it as an
+    # ordinary sellable-output task.
+    for task in tasks:
+        if task.refinance_feed:
+            task.mandatory = True
+
     pinned, remaining, shed_left, stranded = _choose_carried_assignment(
         tasks, starts, inventories, budgets, shed_access, shed
     )
