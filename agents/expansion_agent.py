@@ -172,7 +172,7 @@ def _reserve_feed_for_affordable_animals(obs, farm, targets, reservations, sales
         return reserve
 
     carried = {name: 0 for name in ANIMALS}
-    for inventory in obs["private"]["inventories"]:
+    for inventory in obs["private"].get("inventories", []):
         for name in ANIMALS:
             carried[name] += inventory.get(name, 0)
     missing = {name: 0 for name in ANIMALS}
@@ -615,7 +615,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             if not state["opening_active"]:
                 state["morning_market_queue"] = [
                     order for order in full_market[MARKET_ORDER_CAP:]
-                    if order[0] in ("BUY_ANIMAL", "BUY_PRODUCT")
+                    if order[0] in ("BUY_ANIMAL", "BUY_PRODUCT", "BUY_SEED")
                 ]
             return {
                 "farmer": ["PASS"], "hands": [["PASS"] for _ in farm["hands"]],
