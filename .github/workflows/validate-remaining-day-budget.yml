@@ -1,0 +1,78 @@
+name: Validate remaining-day worker budgets
+
+on:
+  push:
+    branches: [agent-v3-turnover-watering-fix]
+    paths:
+      - .github/workflows/validate-remaining-day-budget.yml
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Apply budget patch
+        run: |
+          python .ci/apply_remaining_budget_patch.py
+          python -m py_compile agents/scheduler.py agents/expansion_agent.py tests/test_agents_scheduler.py
+          git diff --check
+          git diff -- agents/scheduler.py agents/expansion_agent.py tests/test_agents_scheduler.py
+      - name: Install runtime
+        run: python -m pip install --upgrade kaggle-environments pytest
+      - name: Run focused tests
+        run: |
+          python -m pytest -q tests/test_agents_scheduler.py tests/test_agents_turnover_watering.py tests/test_agents_planner.py tests/test_agents_farm_tasks.py
+          python .ci/validate_water_profiles.py
+      - name: Run replay smoke seeds
+        run: |
+          mkdir -p validation/seed1 validation/seed2
+          timeout 300s python -m experiments.play_match --opponent public/A.ipynb --seed 1 --output-dir validation/seed1
+          timeout 300s python -m experiments.play_match --opponent public/A.ipynb --seed 2 --output-dir validation/seed2
+      - name: Count remaining weeds
+        run: |
+          python - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+          for name in ('seed1','seed2'):
+              path = sorted(Path('validation', name).rglob('replay.json'))[-1]
+              data = json.loads(path.read_text())
+              obs = [step[0]['observation'] for step in data['steps']]
+              weeds=[]
+              water=Counter()
+              for step in data['steps']:
+                  a=step[0].get('action') or {}
+                  o=step[0]['observation']
+                  ops=[a.get('farmer',['PASS']), *(a.get('hands') or [])]
+                  water[o['day']] += sum(bool(op) and op[0]=='WATER' for op in ops)
+              for i in range(len(obs)-1):
+                  before=obs[i]['farms'][0]['tiles']; after=obs[i+1]['farms'][0]['tiles']
+                  for y,row in enumerate(before):
+                      for x,tile in enumerate(row):
+                          nxt=after[y][x]
+                          if (isinstance(tile,dict) and tile.get('kind')=='PLANT'
+                                  and isinstance(nxt,dict) and nxt.get('kind')=='WEED'):
+                              weeds.append((obs[i]['day'], (x,y), tile.get('crop'), tile.get('planted_day'), tile.get('yield_units'), tile.get('consecutive_unwatered')))
+              print(name, 'weeds=', len(weeds), 'water_peak=', max(water.values(), default=0), 'examples=', weeds[:20])
+          PY
+      - name: Commit validated source to temp branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/validate-remaining-day-budget.yml .ci/apply_remaining_budget_patch.py
+          git add agents/scheduler.py agents/expansion_agent.py tests/test_agents_scheduler.py
+          git commit -m "fix: size queues to remaining day capacity"
+          git push origin HEAD:agent-v3-turnover-watering-fix
