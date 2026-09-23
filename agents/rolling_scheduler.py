@@ -200,6 +200,41 @@ def _routing_unassigned(tasks):
     return [task for task in tasks if task.mandatory is False]
 
 
+def _pack_remaining(tasks, endpoints, budgets, shed_access, available_wheat):
+    """Pack admitted work without allowing optional work to evict mandatory work.
+
+    This is not an action-kind priority. `mandatory` is the daily schedule's
+    feasibility class. If a mixed pack cannot keep every mandatory task, retry
+    exactly the mandatory subset and defer optional work to a later rolling
+    observation. Worker assignment and order inside that subset remain purely
+    route/cost optimized by the scheduler.
+    """
+    plans, unassigned = build_queues(
+        tasks,
+        endpoints[0],
+        len(endpoints) - 1,
+        endpoints[1:],
+        shed_access,
+        worker_budgets=budgets,
+        available_wheat=available_wheat,
+    )
+    if not any(task.mandatory is not False for task in unassigned):
+        return plans, unassigned
+
+    mandatory = [task for task in tasks if task.mandatory is not False]
+    plans, mandatory_unassigned = build_queues(
+        mandatory,
+        endpoints[0],
+        len(endpoints) - 1,
+        endpoints[1:],
+        shed_access,
+        worker_budgets=budgets,
+        available_wheat=available_wheat,
+    )
+    optional = [task for task in tasks if task.mandatory is False]
+    return plans, mandatory_unassigned + optional
+
+
 def build_rolling_queues(
     tasks,
     starts,
@@ -282,14 +317,12 @@ def build_rolling_queues(
             _routing_unassigned(remaining),
         )
 
-    plans, unassigned = build_queues(
+    plans, unassigned = _pack_remaining(
         remaining,
-        endpoints[0],
-        len(endpoints) - 1,
-        endpoints[1:],
+        endpoints,
+        remaining_budgets,
         shed_access,
-        worker_budgets=remaining_budgets,
-        available_wheat=shed_left.get("WHEAT", 0),
+        shed_left.get("WHEAT", 0),
     )
 
     merged = []
