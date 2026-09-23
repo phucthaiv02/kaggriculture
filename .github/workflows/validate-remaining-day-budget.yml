@@ -1,4 +1,4 @@
-name: Commit remaining-day worker budgets
+name: Commit planner timeout optimization
 
 on:
   push:
@@ -21,15 +21,14 @@ jobs:
           python-version: "3.11"
       - name: Apply source patch and push agent-v3
         run: |
-          cp .ci/apply_remaining_budget_patch_v2.py /tmp/apply_remaining_budget_patch.py
+          cp .ci/optimize_scheduler_timeout.py /tmp/optimize_scheduler_timeout.py
           git fetch origin agent-v3
-          git checkout -B apply-remaining-budget origin/agent-v3
-          python /tmp/apply_remaining_budget_patch.py
-          git checkout -- tests/test_agents_scheduler.py
-          python -m py_compile agents/scheduler.py agents/expansion_agent.py
+          git checkout -B optimize-planner-timeout origin/agent-v3
+          python /tmp/optimize_scheduler_timeout.py
+          python -m py_compile agents/scheduler.py agents/expansion_agent.py agents/forecast.py agents/planner.py
           git diff --check
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add agents/scheduler.py agents/expansion_agent.py
-          git commit -m "fix: size queues to remaining day capacity"
+          git add agents/scheduler.py agents/expansion_agent.py agents/forecast.py agents/planner.py
+          git commit -m "perf: bound daily planner runtime"
           git push origin HEAD:agent-v3
