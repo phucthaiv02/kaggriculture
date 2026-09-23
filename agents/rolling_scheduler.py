@@ -1,8 +1,8 @@
 """Rebuild worker routes from the live observation on every executable turn.
 
-The daily planner still decides which positions/tasks are admitted.  This
+The daily planner still decides which positions/tasks are admitted. This
 module only re-optimizes execution order and worker assignment from the current
-worker positions and inventories.  Routes are intentionally ephemeral: the
+worker positions and inventories. Routes are intentionally ephemeral: the
 agent executes one operation, observes the result, then rebuilds them again.
 """
 
@@ -17,14 +17,14 @@ def planning_observation(obs):
     """Expose carried inputs to task generation without mutating the real obs.
 
     build_tasks historically looked only at the shed when deciding whether an
-    animal/feed/fertilizer continuation could be scheduled.  Under rolling
+    animal/feed/fertilizer continuation could be scheduled. Under rolling
     execution an input may already be on a worker from the previous turn, so
     treating carried stock as planning-available prevents a valid continuation
     from disappearing after a PICKUP or HARVEST.
     """
     private = dict(obs["private"])
     available = Counter(private["shed"])
-    for inventory in private.get("inventories", ()):  # worker-carried inputs
+    for inventory in private.get("inventories", ()):
         available.update(inventory)
     private["shed"] = dict(available)
     return dict(obs, private=private)
@@ -80,8 +80,8 @@ def _bucket_queue(start, bucket, shed_access, initial_inventory):
         current = task.position
         _consume(carried, task.needs)
 
-        # Outputs become real carried stock after the task.  This matters for
-        # WHEAT harvested immediately before an animal/feed continuation.
+        # Outputs become carried stock after the task. This lets a same-route
+        # continuation consume freshly harvested WHEAT without a shed detour.
         for item, amount in task.sells.items():
             if amount > 0:
                 carried[item] += amount
@@ -98,8 +98,6 @@ def _bucket_queue(start, bucket, shed_access, initial_inventory):
             pickup_needed = True
 
     if any(task.cashout for task in bucket):
-        # Mirror scheduler cashout semantics: only a suffix that still carries
-        # task output needs the terminal DROP.
         carries = False
         for task in reversed(bucket):
             if task.immediate_drop:
@@ -124,13 +122,12 @@ def _task_demand(tasks):
 
 
 def _choose_carried_assignment(tasks, starts, inventories, budgets, shed_access, shed):
-    """Pin only work that must/should consume already-carried inputs.
+    """Pin work that can consume stock already carried by a worker.
 
-    A normal scheduler assumes every task input is still in the shed.  Rolling
-    execution breaks that assumption after a previous PICKUP/HARVEST.  We pin
-    such tasks to the carrier until no remaining task can use carried stock;
-    the rest can then safely use the ordinary route packer from the remaining
-    real shed stock.
+    The ordinary scheduler assumes task inputs are in the shed. Rolling
+    execution invalidates that assumption immediately after a PICKUP or a
+    harvest. Pinning such tasks to the carrier keeps input ownership explicit;
+    all other tasks remain free for normal spatial optimization.
     """
     remaining = list(tasks)
     buckets = [[] for _ in starts]
@@ -138,7 +135,6 @@ def _choose_carried_assignment(tasks, starts, inventories, budgets, shed_access,
     shed_left = _positive(Counter(shed))
 
     while remaining:
-        demand = _task_demand(remaining)
         best = None
         for task_index, task in enumerate(remaining):
             if not task.needs:
@@ -163,8 +159,6 @@ def _choose_carried_assignment(tasks, starts, inventories, budgets, shed_access,
 
                 current = starts[worker] if not buckets[worker] else buckets[worker][-1].position
                 distance = abs(current[0] - task.position[0]) + abs(current[1] - task.position[1])
-                # Consume carried stock first; among equal coverage, preserve
-                # locality and then deterministic board order.
                 key = (-covered, distance, len(candidate_queue), task.position[1],
                        task.position[0], worker, task_index)
                 if best is None or key < best[0]:
@@ -182,10 +176,6 @@ def _choose_carried_assignment(tasks, starts, inventories, budgets, shed_access,
             if shed_left[item] <= 0:
                 shed_left.pop(item, None)
 
-    # If carried inputs are still required by remaining work, stock is split
-    # across workers in a way no task can directly consume.  Return those
-    # carriers to the shed first; the next observation will expose a unified
-    # stock pool and rolling planning resumes normally.
     remaining_demand = _task_demand(remaining)
     stranded_workers = []
     for worker, inventory in enumerate(carried):
@@ -208,8 +198,14 @@ def build_rolling_queues(
 ):
     """Return ephemeral routes optimized from the current turn's live state.
 
-    The result has one WorkerPlan per current worker.  Only the first operation
-    is meant to execute; callers must rebuild on the next observation.
+    The result has one WorkerPlan per current worker. Only the first operation
+    is meant to execute; callers rebuild from the next observation.
+
+    Carried inventory is a real dependency, not stale queue state. Work that
+    can consume it stays with that carrier. Any inventory left after those
+    continuations is routed back to the shed before unrelated work. This is
+    what preserves old multi-turn flows such as fertilizer refinancing without
+    preserving the old frozen queue itself.
     """
     starts = [tuple(position) for position in starts]
     budgets = list(budgets)
@@ -224,27 +220,40 @@ def build_rolling_queues(
     )
 
     prefixes, endpoints, remaining_budgets = [], [], []
+    depositing = False
     for worker, (start, bucket, inventory, budget) in enumerate(
         zip(starts, pinned, inventories, budgets)
     ):
-        queue, end, _carried = _bucket_queue(start, bucket, shed_access, inventory)
-        if worker in stranded:
+        queue, end, carried_after = _bucket_queue(start, bucket, shed_access, inventory)
+
+        # Once all directly consumable carried inputs have been assigned, any
+        # leftovers must become shared shed state again. Otherwise a per-turn
+        # rebuild can strand harvested goods or a collected FERTILIZER forever
+        # because the old queue continuation no longer exists.
+        must_deposit = bool(carried_after) or worker in stranded
+        if must_deposit:
             shed_position = nearest_shed(end, shed_access)
             drop = route(end, shed_position) + [["DROP"]]
             if len(queue) + len(drop) <= budget:
                 queue += drop
                 end = shed_position
+                depositing = True
+
         prefixes.append(queue)
         endpoints.append(end)
         remaining_budgets.append(max(0, budget - len(queue)))
 
-    # If fragmented carried inputs still cannot be made available within this
-    # turn's capacity, execute the safe prefixes only and retry from the next
-    # observation rather than emitting a PICKUP that cannot succeed.
-    if stranded and any(
-        _task_demand(remaining)[item] > shed_left.get(item, 0)
-        for item in _task_demand(remaining)
-    ):
+    remaining_demand = _task_demand(remaining)
+    shortage_now = any(
+        remaining_demand[item] > shed_left.get(item, 0)
+        for item in remaining_demand
+    )
+
+    # A planned DROP is not shed stock until the next observation. If remaining
+    # work currently lacks inputs, execute only the dependency-clearing prefixes
+    # instead of issuing speculative PICKUPs against inventory that does not yet
+    # exist in the shed. The next turn will rebuild with the deposited stock.
+    if depositing and shortage_now:
         return [WorkerPlan(start, prefix) for start, prefix in zip(starts, prefixes)], remaining
 
     plans, unassigned = build_queues(
