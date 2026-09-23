@@ -34,8 +34,10 @@ jobs:
         run: python -m pip install --upgrade kaggle-environments pytest
 
       - name: Run focused regression tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          pytest -q tests/test_agents_turnover_watering.py tests/test_agents_planner.py tests/test_agents_farm_tasks.py
+          python -m pytest -q tests/test_agents_turnover_watering.py tests/test_agents_planner.py tests/test_agents_farm_tasks.py
           python .ci/validate_water_profiles.py
 
       - name: Commit validated patch
