@@ -1,0 +1,107 @@
+name: Validate turnover watering full replays
+
+on:
+  push:
+    branches: [agent-v3-turnover-watering-fix]
+    paths:
+      - .github/workflows/validate-turnover-watering-replays.yml
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install runtime
+        run: python -m pip install --upgrade kaggle-environments
+      - name: Run full matches
+        run: |
+          mkdir -p validation/seed1 validation/seed2
+          timeout 300s python -m experiments.play_match --opponent public/A.ipynb --seed 1 --output-dir validation/seed1
+          timeout 300s python -m experiments.play_match --opponent public/A.ipynb --seed 2 --output-dir validation/seed2
+      - name: Analyze lifecycle and water load
+        run: |
+          python - <<'PY'
+          import json
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          def latest_replay(root):
+              files = sorted(Path(root).rglob('replay.json'))
+              if not files:
+                  files = sorted(Path(root).rglob('replay*.json'))
+              assert files, root
+              return files[-1]
+
+          def analyze(path):
+              replay = json.loads(Path(path).read_text())
+              steps = replay['steps']
+              obs = [step[0]['observation'] for step in steps]
+              water_by_day = Counter()
+              weeds = []
+              direct_replant = 0
+              freed = []
+              for step in steps:
+                  action = step[0].get('action') or {}
+                  observation = step[0].get('observation') or {}
+                  day = observation.get('day')
+                  ops = [action.get('farmer', ['PASS']), *(action.get('hands') or [])]
+                  water_by_day[day] += sum(bool(op) and op[0] == 'WATER' for op in ops)
+              for i in range(len(obs)-1):
+                  a, b = obs[i], obs[i+1]
+                  ta = a['farms'][0]['tiles']
+                  tb = b['farms'][0]['tiles']
+                  for y in range(len(ta)):
+                      for x in range(len(ta[y])):
+                          before, after = ta[y][x], tb[y][x]
+                          if isinstance(before, dict) and before.get('kind') == 'PLANT':
+                              if isinstance(after, dict) and after.get('kind') == 'WEED':
+                                  weeds.append((a['day'], (x, y), before.get('crop'), before.get('planted_day'), before.get('yield_units'), before.get('consecutive_unwatered')))
+                              if after is None:
+                                  freed.append((i+1, a['day'], (x, y)))
+                              elif (isinstance(after, dict) and after.get('kind') == 'PLANT'
+                                    and after.get('planted_day') != before.get('planted_day')):
+                                  direct_replant += 1
+              same = nxt = later = never = 0
+              for index, day, (x, y) in freed:
+                  found = None
+                  for j in range(index, len(obs)):
+                      tile = obs[j]['farms'][0]['tiles'][y][x]
+                      if tile is not None:
+                          found = obs[j]['day']
+                          break
+                  if found is None: never += 1
+                  elif found == day: same += 1
+                  elif found == day + 1: nxt += 1
+                  else: later += 1
+              result = {
+                  'replay': str(path),
+                  'weed_transitions': len(weeds),
+                  'weed_examples': weeds[:20],
+                  'direct_replant': direct_replant,
+                  'empty_turnover': {'same_day': same, 'next_day': nxt, 'later': later, 'never': never},
+                  'water_peak': max(water_by_day.values(), default=0),
+                  'water_by_day': dict(sorted(water_by_day.items())),
+                  'final_money': obs[-1]['farms'][0]['money'],
+              }
+              return result
+
+          out = {name: analyze(latest_replay('validation/'+name)) for name in ('seed1','seed2')}
+          print(json.dumps(out, indent=2))
+          Path('validation/summary.json').write_text(json.dumps(out, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: turnover-watering-replays-${{ github.sha }}
+          path: validation
+          if-no-files-found: warn
