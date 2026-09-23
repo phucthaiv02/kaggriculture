@@ -89,6 +89,52 @@ def _strip_partial_animal_builds(tasks, opening_active=False):
     return cleaned
 
 
+def _restore_scheduled_pickups(obs, farm, plans, shed_access):
+    """Materialize shed inputs needed by a preserved admitted schedule.
+
+    A rolling replacement can become infeasible exactly when a same-turn market
+    purchase has just landed. If the previous feasible schedule is retained and
+    its worker is currently standing on a shed tile, attach the missing PICKUP
+    dependency before that worker leaves. This changes no task order and adds no
+    action-kind priority; it only makes already-scheduled resource consumption
+    executable from the newly observed inventory.
+    """
+    shed_left = Counter(obs["private"]["shed"])
+    inventories = obs["private"]["inventories"]
+    positions = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
+    shed_positions = set(shed_access)
+
+    for index, plan in enumerate(plans[:len(positions)]):
+        if not plan.queue or positions[index] not in shed_positions:
+            continue
+
+        required = Counter()
+        planned_pickups = Counter()
+        for operation in plan.queue:
+            if not operation:
+                continue
+            op = operation[0]
+            if op == "PICKUP":
+                planned_pickups[operation[1]] += operation[2] if len(operation) > 2 else 1
+            elif op == "FEED":
+                required["WHEAT"] += 1
+            elif op == "FERTILIZE":
+                required["FERTILIZER"] += 1
+            elif op == "PLACE" and len(operation) > 1:
+                required[operation[1]] += 1
+
+        carried = Counter(inventories[index] if index < len(inventories) else {})
+        prefix = []
+        for item, amount in required.items():
+            missing = max(0, amount - carried[item] - planned_pickups[item])
+            take = min(missing, shed_left[item])
+            if take:
+                prefix.append(["PICKUP", item, take])
+                shed_left[item] -= take
+        if prefix:
+            plan.queue[:0] = prefix
+
+
 TARGETS_PER_DAY = 10
 INVESTMENTS_PER_DAY = 20
 
@@ -252,7 +298,6 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         "frozen_positions": set(), "unassigned": [], "schedule_admitted": False,
         "purchase_positions": set(), "committed_targets": set(),
         "investment_backlog": set(), "daily_targets": {},
-        "emergency_hires": 0,
         "morning_market_queue": [],
     }
     opening_governs = make_opening_controller()
@@ -265,7 +310,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         }
 
     def _rebuild_rolling_routes(obs, farm, hour):
-        """Re-optimize all admitted work from this observation, then execute one op."""
+        """Re-optimize admitted work without replacing it by an infeasible route."""
         frozen_targets = {
             position: targets.get(position)
             for position in state["frozen_positions"]
@@ -289,13 +334,26 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             _open_shed_access(farm),
             obs["private"]["shed"],
         )
+        mandatory_unassigned = [
+            task for task in unassigned if task.mandatory is not False
+        ]
+        if mandatory_unassigned and state["plans"]:
+            # The previous queue is the admitted schedule tail. A rolling pass
+            # is allowed to improve assignment/order, never to replace that
+            # schedule with one that drops mandatory work. Keep the old tail;
+            # if a just-arrived market input is available at the worker's
+            # current shed tile, materialize that dependency before departure.
+            state["unassigned"] = unassigned
+            _restore_scheduled_pickups(
+                obs, farm, state["plans"], _open_shed_access(farm)
+            )
+            return
+
         state["plans"], state["unassigned"] = plans, unassigned
         assigned = {id(task) for task in replanned} - {id(task) for task in unassigned}
         state["reserved"] = reserved_items(
             [task for task in replanned if id(task) in assigned]
         )
-        if any(task.mandatory is not False for task in unassigned):
-            state["schedule_admitted"] = False
 
     def agent(obs, configuration=None):
         effective_end = end_day
@@ -427,7 +485,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             state.update(
                 day=day, hand_target=hand_target,
                 mandatory_hand_target=mandatory_hand_target,
-                plans=[], reserved={}, emergency_hires=0,
+                plans=[], reserved={},
                 frozen_positions=set(), unassigned=[], schedule_admitted=False,
                 morning_market_queue=[],
             )
@@ -560,27 +618,21 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                     task for task in tasks if task.mandatory is False
                 ]
 
-            if mandatory_unassigned:
-                required_hands, _ = hands_needed(
-                    mandatory_tasks,
-                    tuple(farm["farmer"]),
-                    existing_hands,
-                    shed_access,
-                    pending_hand_budget=pending_budget,
-                    existing_hand_budget=remaining_budget,
-                )
-                state["emergency_hires"] = max(0, required_hands - hand_count)
-            else:
-                state["emergency_hires"] = 0
-
             state["plans"] = plans
-            state["unassigned"] = unassigned
             assigned_ids = {id(task) for task in tasks} - {id(task) for task in unassigned}
+            mandatory_ids = {
+                id(task) for task in tasks if task.mandatory is not False
+            }
+            admitted_ids = assigned_ids | mandatory_ids
+            deferred_tasks = [
+                task for task in unassigned if id(task) not in mandatory_ids
+            ]
+            state["unassigned"] = deferred_tasks
             state["reserved"] = reserved_items(
-                [task for task in tasks if id(task) in assigned_ids]
+                [task for task in tasks if id(task) in admitted_ids]
             )
             state["frozen_positions"] = {
-                task.position for task in tasks if id(task) in assigned_ids
+                task.position for task in tasks if id(task) in admitted_ids
             }
             investment_task_positions = {
                 task.position for task in tasks
@@ -588,17 +640,20 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             }
             admitted_investments = {
                 task.position for task in tasks
-                if id(task) in assigned_ids
+                if id(task) in admitted_ids
                 and task.position in investment_task_positions
             }
             state["committed_targets"].difference_update(investment_task_positions)
             state["committed_targets"].update(admitted_investments)
             state["investment_backlog"].difference_update(admitted_investments)
             state["investment_backlog"].update(
-                task.position for task in unassigned
+                task.position for task in deferred_tasks
                 if task.position in investment_task_positions
             )
-            state["schedule_admitted"] = not mandatory_unassigned
+            # Admission is a once-per-day decision. Rolling execution may
+            # reassign/reorder the admitted set but never reopens headcount or
+            # task admission later in the day.
+            state["schedule_admitted"] = True
 
         _rebuild_rolling_routes(obs, farm, hour)
 
@@ -669,8 +724,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             sale_reserve["WHEAT"],
             feed_wheat_reserve(obs, committed_feed_targets, _active_positions(farm)),
         )
-        market = [["HIRE"] for _ in range(state.get("emergency_hires", 0))]
-        market += sell_orders(obs, sale_reserve)
+        market = sell_orders(obs, sale_reserve)
         if day < effective_end:
             market += feed_wheat_order(
                 obs, committed_feed_targets, _active_positions(farm)
