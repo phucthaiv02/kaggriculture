@@ -1,4 +1,4 @@
-"""Queue introspection and inventory reconciliation for daily replanning."""
+"""Queue introspection and inventory reconciliation for rolling execution."""
 
 from collections import Counter
 
@@ -14,7 +14,7 @@ TILE_ACTIONS = {
 
 
 def queue_commitments(positions, plans):
-    """Recover destinations and input reservations from remaining commands."""
+    """Recover destinations and input reservations from the current routes."""
     endpoints, occupied = [], set()
     seeds, supplies = Counter(), Counter()
     positions = [*positions, *(plan.start for plan in plans[len(positions):])]
@@ -34,16 +34,6 @@ def queue_commitments(positions, plans):
                 supplies[operation[1]] += operation[2]
         endpoints.append((x, y))
     return endpoints, occupied, seeds, supplies
-
-
-def schedule_open_tiles(obs, targets, plans, shed_access, hire_costs=()):
-    """Deprecated compatibility hook; daily queues are immutable after hour 1."""
-    return {}, 0
-
-
-def rescue_survival(obs, plans):
-    """Deprecated compatibility hook; survival belongs to the daily task set."""
-    return None
 
 
 def reconcile_animals(obs, targets):
