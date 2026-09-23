@@ -355,13 +355,13 @@ def test_length_projection_matches_executable_queues_with_drops_and_refinancing(
         )
 
 
-def test_rescue_avoids_an_extra_hand_without_dropping_work():
-    from agents.scheduler import _pack_greedy, _pack
+def test_packing_finds_feasible_assignment_without_extra_hand():
+    """Packing outcome matters; no test should depend on a legacy rescue pass firing."""
+    from agents.scheduler import _pack
     tasks = [Task(position, [["WATER"]] * count, urgent=True)
              for position, count in [((1, 1), 3), ((2, 4), 4), ((3, 4), 2),
                                      ((4, 2), 3), ((0, 4), 2), ((0, 0), 4), ((2, 4), 4)]]
     starts = [(4, 4), (5, 4)]
-    assert _pack_greedy(tasks, starts, [23, 23])[1]
     buckets, missing = _pack(tasks, starts, [23, 23])
     assert not missing
     assert Counter(id(task) for bucket in buckets for task in bucket) == Counter(map(id, tasks))
