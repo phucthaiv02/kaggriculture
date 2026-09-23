@@ -1,0 +1,41 @@
+name: Validate agent-v4 rolling execution
+
+on:
+  push:
+    branches: [agent-v4]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-v4-rolling-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile changed execution modules
+        run: |
+          python -m py_compile \
+            agents/expansion_agent.py \
+            agents/intraday.py \
+            agents/rolling_scheduler.py
+          git diff --check HEAD^
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade kaggle-environments pytest numpy
+      - name: Rolling execution regressions
+        run: |
+          python -m pytest -q \
+            tests/test_agents_intraday.py \
+            tests/test_agents_scheduler.py \
+            tests/test_agents_farm_tasks.py \
+            tests/test_agents_execution_pipeline.py \
+            tests/test_agents_integration.py
