@@ -36,6 +36,7 @@ jobs:
       - name: Rolling execution regressions
         run: |
           python -m pytest -q --maxfail=1 \
+            tests/test_agents_opening_rolling.py \
             tests/test_agents_intraday.py \
             tests/test_agents_scheduler.py \
             tests/test_agents_farm_tasks.py \
