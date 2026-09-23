@@ -1,4 +1,4 @@
-name: Apply cached market timeout fix
+name: Apply production forecast cache
 
 on:
   push:
@@ -20,85 +20,89 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Apply, verify exactness, benchmark planner, and push
+      - name: Apply, verify exactness, benchmark forecast, and push
         run: |
           python -m pip install -q 'kaggle-environments==1.32.7' pytest
-          cp .ci/apply_batch_forecast_patch.py /tmp/apply_batch_forecast_patch.py
+          cp .ci/apply_production_forecast_cache.py /tmp/apply_production_forecast_cache.py
           git fetch origin agent-v3
           EXPECTED=$(git rev-parse origin/agent-v3)
           git checkout -B timeout-v2 origin/agent-v3
-          python /tmp/apply_batch_forecast_patch.py
-          python -m py_compile agents/forecast.py
+          python /tmp/apply_production_forecast_cache.py
+          python -m py_compile agents/forecast.py agents/planner.py
           git diff --check
           python - <<'PY'
-          import random, time
-          from agents.forecast import MarketForecast, Production
-          from agents.planner import _candidates, evaluate_targets
+          import time
+          from collections import Counter
+          import agents.planner as planner
+          from agents.forecast import (
+              production, _simulate_production, _cached_production_snapshot,
+          )
           from kaggle_environments.envs.kaggriculture import kaggriculture as game
 
-          rng = random.Random(20260923)
-          market = MarketForecast({p: 10000 for p in game.PRODUCTS}, [], 0, 16)
+          def signature(flow):
+              return (
+                  tuple((d, tuple(sorted(v.items()))) for d, v in sorted(flow.sales.items())),
+                  tuple((d, tuple(sorted(v.items()))) for d, v in sorted(flow.inputs.items())),
+                  tuple((d, tuple(v)) for d, v in sorted(flow.visits.items())),
+              )
 
-          def reference(product, stock, own_amount, rival_amount):
-              cash = 0
-              for unit in range(max(abs(own_amount), abs(rival_amount))):
-                  quoted = []
-                  if unit < abs(own_amount):
-                      price = market.price(product, stock if own_amount > 0 else stock - 1)
-                      quoted.append((0, own_amount, price))
-                  if unit < abs(rival_amount):
-                      price = market.price(product, stock if rival_amount > 0 else stock - 1)
-                      quoted.append((1, rival_amount, price))
-                  for player, amount, price in quoted:
-                      stock += int(price > 1) if amount > 0 else -1
-                      if player == 0:
-                          cash += price if amount > 0 else -price
-              return cash, stock
-
-          cases = [(
-              rng.choice(list(game.PRODUCTS)), rng.randrange(8500, 11500),
-              rng.randrange(-20, 45), rng.randrange(-15, 35),
-          ) for _ in range(5000)]
+          # Public cached function must remain bit-for-bit equivalent and return
+          # independent mutable Production objects.
+          cases = [
+              ('WHEAT', False, 0, 29, None),
+              ('MELON', True, 0, 20, None),
+              ('STRAWBERRY', (9, 13), 0, 20, None),
+              ('GOOSE', False, 0, 29, None),
+          ]
+          tile = game._new_plant('MELON', 10, 24)
+          tile.update(yield_units=4, consecutive_unwatered=1, fertilized_until_day=-1)
+          cases.append(('MELON', False, 20, 29, tile))
+          animal = game._new_animal('SHEEP', 4)
+          animal.update(yield_units=4, fertilizer_available=True, pending_care_bonus=2)
+          cases.append(('SHEEP', False, 20, 29, animal))
           for case in cases:
-              assert market.settle_product(*case) == reference(*case), case
+              expected = _simulate_production(*case)
+              actual = production(*case)
+              assert signature(actual) == signature(expected), case
+              again = production(*case)
+              assert again is not actual
+              before = signature(again)
+              actual.sales[999]['WHEAT'] += 123
+              assert signature(again) == before
 
-          repeated = cases[:300] * 80
+          # Cohorts are the replay hot path: dozens of identical producer states.
+          _cached_production_snapshot.cache_clear()
           t0 = time.perf_counter()
-          for case in repeated:
-              reference(*case)
-          reference_time = time.perf_counter() - t0
-          for case in repeated[:300]:
-              market.settle_product(*case)
+          for _ in range(120):
+              _simulate_production('MELON', False, 20, 29, tile)
+          uncached_tiles = time.perf_counter() - t0
+          _cached_production_snapshot.cache_clear()
           t0 = time.perf_counter()
-          for case in repeated:
-              market.settle_product(*case)
-          cached_time = time.perf_counter() - t0
-          print(f'transition reference={reference_time:.4f}s cached={cached_time:.4f}s speedup={reference_time/max(cached_time,1e-9):.1f}x')
+          for _ in range(120):
+              production('MELON', False, 20, 29, tile)
+          cached_tiles = time.perf_counter() - t0
+          print(f'cohort120 uncached={uncached_tiles:.4f}s cached={cached_tiles:.4f}s speedup={uncached_tiles/max(cached_tiles,1e-9):.1f}x cache={_cached_production_snapshot.cache_info()}')
 
-          day, end = 18, 29
-          candidates = list(_candidates(day, end))
-          inventory = {p: 10000 for p in game.PRODUCTS}
-          def run(clear_between):
-              mf = MarketForecast(inventory, [], day, end)
-              baseline = Production()
-              for when in range(day, end + 1):
-                  baseline.sales[when]['WHEAT'] += 8 + (when % 3)
-                  baseline.sales[when]['MELON'] += 4 + (when % 2)
-              started = time.perf_counter()
-              for _ in range(10):
-                  if clear_between:
-                      mf.settle_product.cache_clear()
-                  rows = evaluate_targets(mf, baseline, candidates, flows_scoped=True)
-                  best = max(rows, key=lambda row: row.profit)
-                  baseline.add(best.output, include_visits=False)
-              return time.perf_counter() - started, mf.settle_product.cache_info()
-          uncached, _ = run(True)
-          cached, info = run(False)
-          print(f'planner10 uncached={uncached:.4f}s cached={cached:.4f}s speedup={uncached/max(cached,1e-9):.2f}x cache={info}')
+          # Candidate generation also repeats identical per-cycle simulations
+          # across fertilizer-plan combinations; benchmark the actual planner path.
+          planner.production = _simulate_production
+          t0 = time.perf_counter()
+          uncached_candidates = list(planner._candidates(12, 28))
+          uncached_candidates_time = time.perf_counter() - t0
+          planner.production = production
+          _cached_production_snapshot.cache_clear()
+          t0 = time.perf_counter()
+          cached_candidates = list(planner._candidates(12, 28))
+          cached_candidates_time = time.perf_counter() - t0
+          assert len(cached_candidates) == len(uncached_candidates)
+          for old, new in zip(uncached_candidates, cached_candidates):
+              assert old[0] == new[0] and old[2] == new[2]
+              assert signature(old[1]) == signature(new[1])
+          print(f'candidates={len(cached_candidates)} uncached={uncached_candidates_time:.4f}s cached={cached_candidates_time:.4f}s speedup={uncached_candidates_time/max(cached_candidates_time,1e-9):.2f}x cache={_cached_production_snapshot.cache_info()}')
           PY
-          python -m pytest -q tests/test_agents_planner.py
+          python -m pytest -q tests/test_agents_forecast.py tests/test_agents_planner.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add agents/forecast.py
-          git commit -m 'perf: cache exact market settlement transitions'
+          git commit -m 'perf: cache interpreter production forecasts'
           git push --force-with-lease=agent-v3:${EXPECTED} origin HEAD:agent-v3
