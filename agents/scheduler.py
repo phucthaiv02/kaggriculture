@@ -163,27 +163,14 @@ def _task_length(start, bucket, shed_for):
     return length + _cashout_length(current, bucket, shed_for)
 
 
-_ANIMAL_SERVICE_OPS = ("FEED", "CARE", "COLLECT_FERTILIZER")
-
-
-def _is_animal_service(task):
-    return task.animal_harvest or bool(
-        task.urgent and task.actions and task.actions[0][0] in _ANIMAL_SERVICE_OPS
-    )
-
-
-def _priority(task):
+def _schedule_class(task):
+    """Admission/dependency class from the daily schedule, never action kind."""
     if task.mandatory is False:
         return (True, not task.immediate_drop)
     return (
         False,
         not task.immediate_drop,
     )
-
-
-def _rescue_priority(task):
-    """Compatibility alias for the single daily priority policy."""
-    return _priority(task)
 
 
 def _bucket_budget(base_budget, bucket, terminal_day):
@@ -204,7 +191,6 @@ def _pack_greedy(
     budgets,
     shed_access=SHED_ACCESS,
     variant=0,
-    group_animal=False,
 ):
     """Greedy bin-pack using exact route length with an O(1) common fast path.
 
@@ -212,7 +198,7 @@ def _pack_greedy(
     buckets, inserting one task only changes two Manhattan edges, action count
     and (at most) the initial shed pickup set, so recomputing the whole route
     for every candidate insertion is unnecessary. Opening refinance/cashout
-    tasks retain the exact legacy projection as a bounded slow path.
+    tasks retain the exact dependency projection as a bounded slow path.
     """
     buckets = [[] for _ in worker_starts]
 
@@ -225,40 +211,26 @@ def _pack_greedy(
     def distance(a, b):
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-    priority_for = _rescue_priority if group_animal else _priority
-    priorities = {id(task): priority_for(task) for task in tasks}
+    schedule_classes = {id(task): _schedule_class(task) for task in tasks}
     terminal_day = any(task.terminal_day or task.cashout for task in tasks)
 
-    if group_animal:
-        ordered = sorted(
-            tasks,
-            key=lambda task: (
-                priorities[id(task)],
-                min(distance(start, task.position) for start in worker_starts),
-                task.position[1],
-                task.position[0],
-                not task.animal_harvest,
-                -len(task.actions),
-            ),
-        )
-    else:
-        ordered = sorted(
-            tasks,
-            key=lambda task: (
-                priorities[id(task)],
-                min(distance(start, task.position) for start in worker_starts),
-                -len(task.actions),
-                task.position[1],
-                task.position[0],
-            ),
-        )
+    ordered = sorted(
+        tasks,
+        key=lambda task: (
+            schedule_classes[id(task)],
+            min(distance(start, task.position) for start in worker_starts),
+            -len(task.actions),
+            task.position[1],
+            task.position[0],
+        ),
+    )
     if variant:
         def alternative(task):
             x, y = task.position
             dist = min(distance((x, y), start) for start in worker_starts)
             geometry = ((-dist - len(task.actions), y, x) if variant == 1
                         else (x, y) if variant == 2 else (y, x))
-            return priorities[id(task)], geometry
+            return schedule_classes[id(task)], geometry
         ordered = sorted(tasks, key=alternative)
 
     def admission_key(task):
@@ -267,7 +239,8 @@ def _pack_greedy(
         if task.cashout:
             shed = shed_for(task.position)
             capacity += distance(task.position, shed) + 1
-        return priorities[id(task)], -task.value / max(1, capacity) if task.mandatory is False else 0
+        return (schedule_classes[id(task)],
+                -task.value / max(1, capacity) if task.mandatory is False else 0)
 
     ordered.sort(key=admission_key)
     unassigned = []
@@ -283,26 +256,14 @@ def _pack_greedy(
     for task in ordered:
         best = None
         best_fast = None
-        priority = priorities[id(task)]
+        schedule_class = schedule_classes[id(task)]
         time_sensitive = task.immediate_drop or task.cashout
-        task_is_service = group_animal and _is_animal_service(task)
         task_need_items = {
             item for item, amount in task.needs.items() if amount > 0
         }
         task_fast = not task.immediate_drop and not task.cashout
 
         for worker, bucket in enumerate(buckets):
-            paired_harvest = None
-            paired_service = None
-            if task_is_service:
-                for index, queued in enumerate(bucket):
-                    if queued.position != task.position:
-                        continue
-                    if queued.animal_harvest:
-                        paired_harvest = index
-                    elif _is_animal_service(queued):
-                        paired_service = index
-
             use_fast = fast_bucket[worker] and task_fast
             if use_fast:
                 old_items = need_items[worker]
@@ -317,15 +278,10 @@ def _pack_greedy(
                 effective_budget = max(0, budgets[worker] - int(terminal_day))
 
             for insertion in range(len(bucket) + 1):
-                if insertion and priorities[id(bucket[insertion - 1])] > priority:
+                if insertion and schedule_classes[id(bucket[insertion - 1])] > schedule_class:
                     continue
-                if insertion < len(bucket) and priority > priorities[id(bucket[insertion])]:
+                if insertion < len(bucket) and schedule_class > schedule_classes[id(bucket[insertion])]:
                     continue
-                if task_is_service:
-                    if task.animal_harvest and paired_service is not None and insertion > paired_service:
-                        continue
-                    if not task.animal_harvest and paired_harvest is not None and insertion <= paired_harvest:
-                        continue
 
                 fast_detail = None
                 if use_fast:
@@ -374,6 +330,7 @@ def _pack_greedy(
             unassigned.append(task)
     return buckets, unassigned
 
+
 def _pack(
     tasks,
     worker_starts,
@@ -391,13 +348,6 @@ def _pack(
     best = _pack_greedy(tasks, worker_starts, budgets, shed_access)
     if not tasks or sum(len(t.actions) for t in tasks) > sum(budgets):
         return best
-
-    if best[1] and any(_is_animal_service(task) for task in tasks):
-        grouped = _pack_greedy(
-            tasks, worker_starts, budgets, shed_access, group_animal=True
-        )
-        if not grouped[1]:
-            return grouped
 
     if not optimize_routes:
         if not best[1]:
@@ -442,6 +392,7 @@ def _pack(
             if best_score[0] == 0:
                 break
     return best
+
 
 def hands_needed(
     tasks,
@@ -535,12 +486,13 @@ def hands_needed(
             chosen_count, chosen_missing, best_net = count, missing, net
     return chosen_count, chosen_missing
 
-def _rebalance_feed(buckets, starts, budgets, shed_access, tasks):
-    """Consolidate stocked feed in two bounded passes without delaying other work.
 
-    Prefer fewer feed carriers (four turns per carrier in the search score),
-    then shorter mandatory routes. A receiving route must also fit its return
-    and one spare turn. Keep the caller's headcount and unassigned work intact.
+def _rebalance_feed(buckets, starts, budgets, shed_access, tasks):
+    """Consolidate stocked feed in two bounded route-cost passes.
+
+    Prefer fewer feed carriers, then shorter executable routes. This optimizer
+    may move feed tasks between workers but does not impose ordering based on
+    unrelated action kinds; insertion is chosen solely by feasibility and cost.
     """
     terminal = any(t.terminal_day or t.cashout for t in tasks)
     def service(t):
@@ -574,9 +526,6 @@ def _rebalance_feed(buckets, starts, budgets, shed_access, tasks):
                     bucket = buckets[target]
                     old_target = metrics(target, bucket)
                     for insertion in range(len(bucket)+1):
-                        # Insert after fixed work so planting and harvest are not delayed.
-                        if any(not service(t) for t in bucket[insertion:]):
-                            continue
                         merged = bucket[:insertion] + [task] + bucket[insertion:]
                         new_target = metrics(target, merged)
                         end = merged[-1].position
