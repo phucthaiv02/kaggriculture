@@ -1,0 +1,78 @@
+name: Apply vectorized planner timeout fix
+
+on:
+  push:
+    branches: [agent-v3-timeout-fix-v2]
+    paths:
+      - .github/workflows/apply-timeout-fix-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply, verify exactness, and push
+        run: |
+          cp .ci/apply_batch_forecast_patch.py /tmp/apply_batch_forecast_patch.py
+          git fetch origin agent-v3
+          EXPECTED=$(git rev-parse origin/agent-v3)
+          git checkout -B timeout-v2 origin/agent-v3
+          python /tmp/apply_batch_forecast_patch.py
+          python -m py_compile agents/forecast.py agents/planner.py
+          git diff --check
+          python - <<'PY'
+          import random, time
+          from agents.forecast import MarketForecast, Production
+          from kaggle_environments.envs.kaggriculture import kaggriculture as game
+
+          rng = random.Random(20260923)
+          products = list(game.PRODUCTS)
+          scalar_time = 0.0
+          batch_time = 0.0
+          for case in range(40):
+              day, end = rng.randrange(0, 20), rng.randrange(20, 29)
+              baseline = Production()
+              external = Production()
+              candidates = [Production() for _ in range(24)]
+              for when in range(day, end + 1):
+                  for product in products:
+                      if rng.random() < 0.35:
+                          baseline.sales[when][product] += rng.randrange(0, 18)
+                      if rng.random() < 0.15:
+                          baseline.inputs[when][product] += rng.randrange(0, 6)
+                      if rng.random() < 0.25:
+                          external.sales[when][product] += rng.randrange(0, 12)
+                      if rng.random() < 0.10:
+                          external.inputs[when][product] += rng.randrange(0, 5)
+                  for candidate in candidates:
+                      for product in rng.sample(products, rng.randrange(1, 4)):
+                          if rng.random() < 0.65:
+                              candidate.sales[when][product] += rng.randrange(0, 5)
+                          else:
+                              candidate.inputs[when][product] += rng.randrange(0, 3)
+              inventory = {product: rng.randrange(9000, 11000) for product in products}
+              market = MarketForecast(inventory, [], day, end, external=external)
+              t0 = time.perf_counter()
+              expected = [market.marginal_value(baseline, c) for c in candidates]
+              scalar_time += time.perf_counter() - t0
+              t0 = time.perf_counter()
+              actual = market.marginal_values(baseline, candidates)
+              batch_time += time.perf_counter() - t0
+              assert actual == expected, (case, actual, expected)
+          print(f'scalar={scalar_time:.4f}s batch={batch_time:.4f}s speedup={scalar_time/max(batch_time,1e-9):.2f}x')
+          PY
+          python -m pytest -q tests/test_agents_planner.py tests/test_agents_target_horizon.py tests/test_agents_season_profit.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add agents/forecast.py agents/planner.py
+          git commit -m 'perf: vectorize target market valuation'
+          git push --force-with-lease=agent-v3:${EXPECTED} origin HEAD:agent-v3
