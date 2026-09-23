@@ -1,4 +1,4 @@
-name: Apply production forecast cache
+name: Debug production forecast cache
 
 on:
   push:
@@ -7,12 +7,11 @@ on:
       - .github/workflows/apply-timeout-fix-v2.yml
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply:
+  debug:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,24 +19,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Apply, verify exactness, benchmark forecast, and push
+      - name: Print mismatch
         run: |
-          python -m pip install -q 'kaggle-environments==1.32.7' pytest
-          cp .ci/apply_production_forecast_cache.py /tmp/apply_production_forecast_cache.py
+          python -m pip install -q 'kaggle-environments==1.32.7'
+          cp .ci/apply_production_forecast_cache.py /tmp/apply.py
           git fetch origin agent-v3
-          EXPECTED=$(git rev-parse origin/agent-v3)
-          git checkout -B timeout-v2 origin/agent-v3
-          python /tmp/apply_production_forecast_cache.py
-          python -m py_compile agents/forecast.py agents/planner.py
-          git diff --check
+          git checkout -B debug origin/agent-v3
+          python /tmp/apply.py
           python - <<'PY'
-          import time
-          from collections import Counter
-          import agents.planner as planner
-          from agents.forecast import (
-              production, _simulate_production, _cached_production_snapshot,
-          )
-          from kaggle_environments.envs.kaggriculture import kaggriculture as game
+          from agents.forecast import production, _simulate_production, _cached_production_snapshot
 
           def signature(flow):
               return (
@@ -46,63 +36,13 @@ jobs:
                   tuple((d, tuple(v)) for d, v in sorted(flow.visits.items())),
               )
 
-          # Public cached function must remain bit-for-bit equivalent and return
-          # independent mutable Production objects.
-          cases = [
-              ('WHEAT', False, 0, 29, None),
-              ('MELON', True, 0, 20, None),
-              ('STRAWBERRY', (9, 13), 0, 20, None),
-              ('GOOSE', False, 0, 29, None),
-          ]
-          tile = game._new_plant('MELON', 10, 24)
-          tile.update(yield_units=4, consecutive_unwatered=1, fertilized_until_day=-1)
-          cases.append(('MELON', False, 20, 29, tile))
-          animal = game._new_animal('SHEEP', 4)
-          animal.update(yield_units=4, fertilizer_available=True, pending_care_bonus=2)
-          cases.append(('SHEEP', False, 20, 29, animal))
-          for case in cases:
-              expected = _simulate_production(*case)
-              actual = production(*case)
-              assert signature(actual) == signature(expected), case
-              again = production(*case)
-              assert again is not actual
-              before = signature(again)
-              actual.sales[999]['WHEAT'] += 123
-              assert signature(again) == before
-
-          # Cohorts are the replay hot path: dozens of identical producer states.
+          case = ('WHEAT', False, 0, 29, None)
           _cached_production_snapshot.cache_clear()
-          t0 = time.perf_counter()
-          for _ in range(120):
-              _simulate_production('MELON', False, 20, 29, tile)
-          uncached_tiles = time.perf_counter() - t0
-          _cached_production_snapshot.cache_clear()
-          t0 = time.perf_counter()
-          for _ in range(120):
-              production('MELON', False, 20, 29, tile)
-          cached_tiles = time.perf_counter() - t0
-          print(f'cohort120 uncached={uncached_tiles:.4f}s cached={cached_tiles:.4f}s speedup={uncached_tiles/max(cached_tiles,1e-9):.1f}x cache={_cached_production_snapshot.cache_info()}')
-
-          # Candidate generation also repeats identical per-cycle simulations
-          # across fertilizer-plan combinations; benchmark the actual planner path.
-          planner.production = _simulate_production
-          t0 = time.perf_counter()
-          uncached_candidates = list(planner._candidates(12, 28))
-          uncached_candidates_time = time.perf_counter() - t0
-          planner.production = production
-          _cached_production_snapshot.cache_clear()
-          t0 = time.perf_counter()
-          cached_candidates = list(planner._candidates(12, 28))
-          cached_candidates_time = time.perf_counter() - t0
-          assert len(cached_candidates) == len(uncached_candidates)
-          for old, new in zip(uncached_candidates, cached_candidates):
-              assert old[0] == new[0] and old[2] == new[2]
-              assert signature(old[1]) == signature(new[1])
-          print(f'candidates={len(cached_candidates)} uncached={uncached_candidates_time:.4f}s cached={cached_candidates_time:.4f}s speedup={uncached_candidates_time/max(cached_candidates_time,1e-9):.2f}x cache={_cached_production_snapshot.cache_info()}')
+          expected = _simulate_production(*case)
+          actual = production(*case)
+          es, ac = signature(expected), signature(actual)
+          print('EXPECTED=', repr(es))
+          print('ACTUAL=', repr(ac))
+          print('EQUAL=', es == ac)
+          print('CACHE=', _cached_production_snapshot.cache_info())
           PY
-          python -m pytest -q tests/test_agents_forecast.py tests/test_agents_planner.py
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add agents/forecast.py
-          git commit -m 'perf: cache interpreter production forecasts'
-          git push --force-with-lease=agent-v3:${EXPECTED} origin HEAD:agent-v3
