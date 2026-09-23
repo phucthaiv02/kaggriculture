@@ -28,7 +28,48 @@ jobs:
           git fetch origin 73d0d2276ce418c8cb68a3ca5c988620dc128a63
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git cherry-pick 73d0d2276ce418c8cb68a3ca5c988620dc128a63
+          if ! git cherry-pick 73d0d2276ce418c8cb68a3ca5c988620dc128a63; then
+            # Current planner has newer decision logging. Keep it, then port only
+            # the semantics-neutral flow-scoping optimization from the perf commit.
+            git checkout --ours agents/planner.py
+            python - <<'PY'
+          from pathlib import Path
+          p = Path('agents/planner.py')
+          s = p.read_text()
+          def once(old, new):
+              global s
+              if s.count(old) != 1:
+                  raise SystemExit(f'expected exactly one match: {old!r}, got {s.count(old)}')
+              s = s.replace(old, new, 1)
+          once(
+              '    market, baseline, candidates, labor=None, position=(4, 4)\n):',
+              '    market, baseline, candidates, labor=None, position=(4, 4), *, flows_scoped=False\n):',
+          )
+          once('    scoped_baseline = scoped(baseline)\n',
+               '    scoped_baseline = baseline if flows_scoped else scoped(baseline)\n')
+          once('        output = scoped(output)\n',
+               '        if not flows_scoped:\n            output = scoped(output)\n')
+          once(
+              '    current=None, audit=None, decision_log=None, decision_step=None,\n):\n    results = evaluate_targets(market, baseline, candidates, labor, position)\n',
+              '    current=None, audit=None, decision_log=None, decision_step=None, flows_scoped=False,\n):\n    results = evaluate_targets(\n        market, baseline, candidates, labor, position, flows_scoped=flows_scoped\n    )\n',
+          )
+          once('                destination.add(future, (x, y))\n',
+               '                destination.add(future, (x, y), include_visits=False)\n')
+          once('            baseline.add(_rotation(name, fertilize, day, end_day)[0], position)\n',
+               '            baseline.add(_rotation(name, fertilize, day, end_day)[0], position, include_visits=False)\n')
+          once(
+              '            market, baseline, allowed, counts, position=position, current=current,\n            decision_log=decision_log, decision_step=obs.get("step"),\n',
+              '            market, baseline, allowed, counts, position=position, current=current,\n            decision_log=decision_log, decision_step=obs.get("step"), flows_scoped=True,\n',
+          )
+          once('            baseline.add(output, position)\n',
+               '            baseline.add(output, position, include_visits=False)\n')
+          p.write_text(s)
+          PY
+            git add agents/planner.py
+            GIT_EDITOR=true git cherry-pick --continue
+          fi
           python -m py_compile agents/scheduler.py agents/expansion_agent.py agents/planner.py agents/forecast.py
           git diff --check HEAD^ HEAD
+          grep -q 'O(1) common fast path' agents/scheduler.py
+          grep -q 'flows_scoped=True' agents/planner.py
           git push --force-with-lease=agent-v3:18afbef9879438ecf5bf475fd25fc49e5d389bb6 origin HEAD:agent-v3
