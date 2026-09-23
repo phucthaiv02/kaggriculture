@@ -32,7 +32,7 @@ jobs:
           python /tmp/apply_scheduler_feasibility_bound.py
           python -m py_compile agents/scheduler.py
           git diff --check
-          python /tmp/validate_scheduler_feasibility_bound.py
+          PYTHONPATH=. python /tmp/validate_scheduler_feasibility_bound.py
           python -m pytest -q tests/test_agents_scheduler.py tests/test_agents_planner.py tests/test_agents_forecast.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
