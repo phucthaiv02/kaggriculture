@@ -17,86 +17,84 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Run current agent-v3 on seeds 1 and 2
+      - name: Run current agent-v3 against A and correlate turnover
         run: |
           python -m pip install -q 'kaggle-environments==1.32.7'
           git fetch origin agent-v3
           git checkout --detach origin/agent-v3
+          rm -rf /tmp/turnover-a && mkdir -p /tmp/turnover-a
+          timeout 300s python -m experiments.play_match --opponent public/A.ipynb --seed 1 --output-dir /tmp/turnover-a
           python - <<'PY'
-          from collections import Counter
-          from kaggle_environments import make
-          from agents.expansion_agent import make_agent
-          from experiments.crop_schedules import pass_agent
-          from experiments.play_match import configuration
+          import json
+          from collections import Counter, defaultdict
+          from pathlib import Path
 
-          def name(tile):
-              if not isinstance(tile, dict):
-                  return None
+          root=Path('/tmp/turnover-a')
+          match=sorted(root.glob('current_vs_A_seed1_*'))[-1]
+          replay=json.loads((match/'replay.json').read_text())
+          decisions=json.loads((match/'planner_decisions.json').read_text())
+          result=json.loads((match/'result.json').read_text())
+          print('RESULT',result)
+
+          obs=[step[0]['observation'] for step in replay['steps']]
+          decision_map=defaultdict(list)
+          for d in decisions:
+              decision_map[(int(d['day']),tuple(d['position']))].append(d)
+
+          def producer(tile):
+              if not isinstance(tile,dict): return None
               return tile.get('crop') or tile.get('animal')
 
-          def analyze(seed):
-              env = make('kaggriculture', configuration=configuration(seed), debug=False)
-              env.run([make_agent(29, seed=seed), pass_agent])
-              print('SEED', seed, 'STATUS', [s.status for s in env.state], 'REWARD', [s.reward for s in env.state])
-              hist=[]
-              for step_idx, replay_step in enumerate(env.steps):
-                  ob=replay_step[0]['observation']
-                  hist.append((step_idx,int(ob['day']),int(ob['hour']),ob['farms'][0]['tiles'],replay_step[0].get('action')))
+          rows=[]
+          for i in range(len(obs)-1):
+              a,b=obs[i],obs[i+1]
+              ta,tb=a['farms'][0]['tiles'],b['farms'][0]['tiles']
+              day=int(b['day']); hour=int(b['hour'])
+              for y in range(10):
+                  for x in range(10):
+                      before,after=ta[y][x],tb[y][x]
+                      if not (isinstance(before,dict) and before.get('kind')=='PLANT' and after is None):
+                          continue
+                      if day < 8 or day >= 28:
+                          continue
+                      first_nonempty=None
+                      first_producer=None
+                      for j in range(i+1,min(len(obs),i+1+72)):
+                          tile=obs[j]['farms'][0]['tiles'][y][x]
+                          if first_nonempty is None and tile is not None:
+                              first_nonempty=(j-(i+1),int(obs[j]['day']),int(obs[j]['hour']),tile.get('kind') if isinstance(tile,dict) else type(tile).__name__)
+                          p=producer(tile)
+                          if p:
+                              first_producer=(j-(i+1),int(obs[j]['day']),int(obs[j]['hour']),p)
+                              break
+                      ds=decision_map.get((day,(x,y)),[])
+                      latest=ds[-1] if ds else None
+                      selected=None if not latest else latest.get('selected')
+                      reason=None if not latest else latest.get('reason')
+                      rows.append({
+                          'day':day,'hour':hour,'pos':(x,y),'crop':before.get('crop'),
+                          'decision_selected':selected,'decision_reason':reason,
+                          'first_nonempty':first_nonempty,'first_producer':first_producer,
+                      })
 
-              turnover=[]
-              weeds=[]
-              water=Counter()
-              plant=Counter()
-              for i in range(1,len(hist)):
-                  step_idx,day,hour,tiles,action=hist[i]
-                  _,_,_,prev,_=hist[i-1]
-                  if isinstance(action, dict):
-                      ops=[]
-                      if action.get('farmer'):
-                          ops.append(action['farmer'])
-                      ops.extend(action.get('hands') or [])
-                      for op in ops:
-                          if op and op[0]=='WATER': water[day]+=1
-                          if op and op[0]=='PLANT': plant[day]+=1
-                  for y in range(10):
-                      for x in range(10):
-                          a,b=prev[y][x],tiles[y][x]
-                          if isinstance(a,dict) and a.get('kind')=='PLANT' and b is None:
-                              successor=None
-                              for j in range(i+1,min(len(hist),i+50)):
-                                  nn=name(hist[j][3][y][x])
-                                  if nn:
-                                      successor=(hist[j][0]-step_idx, nn, hist[j][1], hist[j][2])
-                                      break
-                              turnover.append((day,hour,(x,y),a.get('crop'),successor))
-                          if isinstance(a,dict) and a.get('kind')=='PLANT' and isinstance(b,dict) and b.get('kind')=='WEED':
-                              weeds.append((day,hour,(x,y),a.get('crop'),a.get('planted_day'),a.get('yield_units'),a.get('consecutive_unwatered'),a.get('watered_today')))
+          same=0; delayed=0; never=0
+          for r in rows:
+              fp=r['first_producer']
+              if fp and fp[1]==r['day']:
+                  same+=1
+              elif fp:
+                  delayed+=1
+              else:
+                  never+=1
+          print('SUMMARY','freed',len(rows),'same_day_producer',same,'later_producer',delayed,'no_producer_72',never)
+          print('NON_SAME_DAY')
+          for r in rows:
+              fp=r['first_producer']
+              if not fp or fp[1]!=r['day']:
+                  print(r)
 
-              pre28=[r for r in turnover if r[0] < 28]
-              immediate=[r for r in pre28 if r[4] and r[4][0] <= 2]
-              delayed=[r for r in pre28 if r[4] and r[4][0] > 2]
-              never=[r for r in pre28 if r[4] is None]
-              print('SEED',seed,'TURNOVER pre28',len(pre28),'immediate<=2',len(immediate),'delayed',len(delayed),'never',len(never))
-              print('SEED',seed,'DELAYED',delayed[:80])
-              print('SEED',seed,'NEVER',never[:80])
-              print('SEED',seed,'WEEDS',len(weeds),weeds[:120])
-              print('SEED',seed,'WATER_BY_DAY',sorted(water.items()))
-              print('SEED',seed,'PLANT_BY_DAY',sorted(plant.items()))
-
-              for day in range(8,30):
-                  candidates=[row for row in hist if row[1]==day]
-                  if not candidates: continue
-                  _,_,_,tiles,_=candidates[-1]
-                  c=Counter()
-                  for row in tiles:
-                      for t in row:
-                          if t is None: c['EMPTY']+=1
-                          elif isinstance(t,dict):
-                              if t.get('kind')=='WEED': c['WEED']+=1
-                              elif t.get('kind')=='PLANT': c['PLANT']+=1
-                              elif t.get('animal'): c['ANIMAL']+=1
-                  print('SEED',seed,'EOD',day,dict(c))
-
-          for seed in (1,2):
-              analyze(seed)
+          print('DAY10_DECISIONS')
+          for d in decisions:
+              if int(d['day'])==10:
+                  print({'pos':d['position'],'current':d.get('current'),'selected':d.get('selected'),'reason':d.get('reason')})
           PY
