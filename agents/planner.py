@@ -291,6 +291,7 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
     baseline = Production()
     counts = Counter()
     replanning = []
+    turnover = []
     deferred = []
     external = Production()
     for position in active_positions:
@@ -312,15 +313,22 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
             # Preserve a conversion already scheduled by the opening.
             if current and current[0] != tile["crop"] and can_start(current[0], day, end_day):
                 continue
+            turnover.append(position)
+            continue
         replanning.append(position)
 
     shed_access = ((4, 4), (5, 4), (4, 5), (5, 5))
     def distance(p):
         return min(abs(p[0] - s[0]) + abs(p[1] - s[1]) for s in shed_access)
+    turnover.sort(key=lambda p: (distance(p), p[1], p[0]))
     replanning.sort(key=lambda p: (distance(p), p[1], p[0]))
     pending = deferred + (replanning[max_positions:] if max_positions is not None else [])
     if max_positions is not None:
         replanning = replanning[:max_positions]
+    # Known same-day turnover is lifecycle work, not speculative expansion.
+    # Price every such successor this morning even when a cohort is larger
+    # than TARGETS_PER_DAY; the batch cap applies only to ordinary investments.
+    replanning = turnover + replanning
     if not replanning:
         return pending
     replanning_set = set(replanning)

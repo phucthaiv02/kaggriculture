@@ -135,6 +135,25 @@ def test_plan_targets_does_not_touch_a_tile_mid_growth():
     assert targets[(0, 0)] == ("WHEAT", False)
 
 
+def test_same_day_turnover_is_not_limited_by_target_batch():
+    positions = [(x, y) for y in range(3) for x in range(4)]
+    tiles = {
+        position: {
+            "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+            "yield_units": 4, "watered_today": True,
+        }
+        for position in positions
+    }
+    obs = make_obs(day=4, tiles=tiles)
+    targets = {position: ("WHEAT", False) for position in positions}
+    pending = plan_targets(
+        obs, targets, positions, end_day=20,
+        max_positions=10, replan_positions=set(positions),
+    )
+    assert pending == []
+    assert all(position in targets for position in positions)
+
+
 def test_plan_targets_replans_a_finished_tile():
     tile = {"kind": "PLANT", "crop": "WHEAT", "planted_day": 0, "yield_units": 6, "watered_today": True}
     obs = make_obs(day=4, tiles={(0, 0): tile})
