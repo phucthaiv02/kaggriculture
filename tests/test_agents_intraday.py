@@ -50,6 +50,20 @@ def test_carried_wheat_keeps_feed_task_visible_after_previous_turn_pickup():
     assert tasks[0].needs == {"WHEAT": 1}
 
 
+def test_unconsumable_carried_output_returns_to_shed_before_missing_input_work():
+    feed = Task((5, 4), [["FEED"], ["CARE"]], needs=Counter({"WHEAT": 1}), mandatory=True)
+    plans, unassigned = build_rolling_queues(
+        [feed],
+        starts=[(4, 4)],
+        inventories=[{"FERTILIZER": 1}],
+        budgets=[8],
+        shed_access=SHED_ACCESS,
+        shed={},
+    )
+    assert plans[0].queue == [["DROP"]]
+    assert unassigned == [feed]
+
+
 def test_rolling_route_prefers_new_same_tile_work_after_state_change():
     local = Task((4, 4), [["PLANT", "WHEAT"], ["WATER"]], mandatory=True)
     remote = Task((0, 0), [["WATER"]], mandatory=True)
