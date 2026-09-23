@@ -374,6 +374,59 @@ def _pack_greedy(
             unassigned.append(task)
     return buckets, unassigned
 
+def _full_assignment_step_lower_bound(tasks, worker_starts):
+    """Necessary total-step bound for assigning every task.
+
+    Any complete schedule must execute every task action and at least one
+    PICKUP for each distinct required item.  Its worker routes must also
+    connect every distinct task position to at least one worker start.  The
+    multi-source Manhattan MST is a lower bound on that route length: treating
+    every worker start as connected to a virtual root for free can only make
+    the network cheaper than real worker routes.
+
+    If this bound already exceeds aggregate worker budgets, no packing variant
+    can possibly assign every task.  In that case _pack historically returns
+    the default greedy result after spending time on variants that all fail,
+    so callers may skip those variants without changing the result.
+    """
+    if not tasks:
+        return 0
+    actions = sum(len(task.actions) for task in tasks)
+    pickups = len({
+        item for task in tasks for item, amount in task.needs.items()
+        if amount > 0
+    })
+    remaining = set(task.position for task in tasks)
+    if not remaining:
+        return actions + pickups
+
+    starts = tuple(worker_starts)
+    # _pack always has at least the farmer, but keep the helper total for
+    # isolated callers/tests.  With no starts, no non-empty assignment exists.
+    if not starts:
+        return float('inf')
+
+    def distance(a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    best = {
+        position: min(distance(position, start) for start in starts)
+        for position in remaining
+    }
+    travel = 0
+    while best:
+        position, edge = min(
+            best.items(), key=lambda item: (item[1], item[0][1], item[0][0])
+        )
+        travel += edge
+        del best[position]
+        for other in tuple(best):
+            step = distance(position, other)
+            if step < best[other]:
+                best[other] = step
+    return actions + pickups + travel
+
+
 def _pack(
     tasks,
     worker_starts,
@@ -389,7 +442,7 @@ def _pack(
     route polishing, but stops as soon as no sellable output is stranded.
     """
     best = _pack_greedy(tasks, worker_starts, budgets, shed_access)
-    if not tasks or sum(len(t.actions) for t in tasks) > sum(budgets):
+    if not tasks or _full_assignment_step_lower_bound(tasks, worker_starts) > sum(budgets):
         return best
 
     if best[1] and any(_is_animal_service(task) for task in tasks):
