@@ -177,10 +177,10 @@ def _opening_retry_orders(obs, farm, purchase_targets, pending_sales=()):
     pass can therefore admit PLACE work but miss its animal by a few dollars.
     Re-evaluate the same admitted targets after observed sales; this does not
     select new targets or reopen schedule admission, and normal play keeps its
-    morning-only investment purchases.
+    morning-only investment purchases. Even with no investment target in this
+    pass, purchase_orders must still cover live-animal WHEAT for the opening's
+    fertilizer refinance loop.
     """
-    if not purchase_targets:
-        return []
     wheat_sold = sum(
         int(order[2]) for order in pending_sales
         if order[0] == "SELL" and order[1] == "WHEAT"
