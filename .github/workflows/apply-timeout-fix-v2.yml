@@ -1,4 +1,4 @@
-name: Apply vectorized planner timeout fix
+name: Apply cached market timeout fix
 
 on:
   push:
@@ -27,52 +27,60 @@ jobs:
           EXPECTED=$(git rev-parse origin/agent-v3)
           git checkout -B timeout-v2 origin/agent-v3
           python /tmp/apply_batch_forecast_patch.py
-          python -m py_compile agents/forecast.py agents/planner.py
+          python -m py_compile agents/forecast.py
           git diff --check
           python - <<'PY'
           import random, time
-          from agents.forecast import MarketForecast, Production
+          from agents.forecast import MarketForecast
           from kaggle_environments.envs.kaggriculture import kaggriculture as game
 
           rng = random.Random(20260923)
+          market = MarketForecast({p: 10000 for p in game.PRODUCTS}, [], 0, 16)
+
+          def reference(product, stock, own_amount, rival_amount):
+              cash = 0
+              for unit in range(max(abs(own_amount), abs(rival_amount))):
+                  quoted = []
+                  if unit < abs(own_amount):
+                      price = market.price(product, stock if own_amount > 0 else stock - 1)
+                      quoted.append((0, own_amount, price))
+                  if unit < abs(rival_amount):
+                      price = market.price(product, stock if rival_amount > 0 else stock - 1)
+                      quoted.append((1, rival_amount, price))
+                  for player, amount, price in quoted:
+                      stock += int(price > 1) if amount > 0 else -1
+                      if player == 0:
+                          cash += price if amount > 0 else -price
+              return cash, stock
+
+          cases = []
           products = list(game.PRODUCTS)
-          scalar_time = 0.0
-          batch_time = 0.0
-          for case in range(40):
-              day, end = rng.randrange(0, 20), rng.randrange(20, 29)
-              baseline = Production()
-              external = Production()
-              candidates = [Production() for _ in range(24)]
-              for when in range(day, end + 1):
-                  for product in products:
-                      if rng.random() < 0.35:
-                          baseline.sales[when][product] += rng.randrange(0, 18)
-                      if rng.random() < 0.15:
-                          baseline.inputs[when][product] += rng.randrange(0, 6)
-                      if rng.random() < 0.25:
-                          external.sales[when][product] += rng.randrange(0, 12)
-                      if rng.random() < 0.10:
-                          external.inputs[when][product] += rng.randrange(0, 5)
-                  for candidate in candidates:
-                      for product in rng.sample(products, rng.randrange(1, 4)):
-                          if rng.random() < 0.65:
-                              candidate.sales[when][product] += rng.randrange(0, 5)
-                          else:
-                              candidate.inputs[when][product] += rng.randrange(0, 3)
-              inventory = {product: rng.randrange(9000, 11000) for product in products}
-              market = MarketForecast(inventory, [], day, end, external=external)
-              t0 = time.perf_counter()
-              expected = [market.marginal_value(baseline, c) for c in candidates]
-              scalar_time += time.perf_counter() - t0
-              t0 = time.perf_counter()
-              actual = market.marginal_values(baseline, candidates)
-              batch_time += time.perf_counter() - t0
-              assert actual == expected, (case, actual, expected)
-          print(f'scalar={scalar_time:.4f}s batch={batch_time:.4f}s speedup={scalar_time/max(batch_time,1e-9):.2f}x')
+          for _ in range(5000):
+              cases.append((
+                  rng.choice(products), rng.randrange(8500, 11500),
+                  rng.randrange(-20, 45), rng.randrange(-15, 35),
+              ))
+          for case in cases:
+              assert market.settle_product(*case) == reference(*case), case
+
+          # Repeated finite market states are exactly what fertilizer/crop
+          # candidates generate. Demonstrate the cache removes repeated unit loops.
+          repeated = cases[:300] * 80
+          t0 = time.perf_counter()
+          for case in repeated:
+              reference(*case)
+          reference_time = time.perf_counter() - t0
+          for case in repeated[:300]:
+              market.settle_product(*case)
+          t0 = time.perf_counter()
+          for case in repeated:
+              market.settle_product(*case)
+          cached_time = time.perf_counter() - t0
+          print(f'reference={reference_time:.4f}s cached={cached_time:.4f}s speedup={reference_time/max(cached_time,1e-9):.1f}x')
           PY
           python -m pytest -q tests/test_agents_planner.py tests/test_agents_target_horizon.py tests/test_agents_season_profit.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add agents/forecast.py agents/planner.py
-          git commit -m 'perf: vectorize target market valuation'
+          git add agents/forecast.py
+          git commit -m 'perf: cache exact market settlement transitions'
           git push --force-with-lease=agent-v3:${EXPECTED} origin HEAD:agent-v3
