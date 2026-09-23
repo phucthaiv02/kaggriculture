@@ -189,13 +189,12 @@ def _choose_carried_assignment(tasks, starts, inventories, budgets, shed_access,
 
 
 def _routing_unassigned(tasks):
-    """Only optional work may fall out of an intraday routing pass.
+    """Only optional work may fall out while a resource dependency is in flight.
 
-    Mandatory work was already admitted by the daily schedule. A rolling pass
-    can temporarily be unable to route it while inventory is being deposited,
-    a market order is landing, or another admitted dependency is clearing.
-    That is a state wait, not a reason to reopen labor admission mid-day.
-    The next observation rebuilds the mandatory task from live state again.
+    A DROP or same-turn market purchase is not usable until the next
+    observation. During that transient wait mandatory work remains part of the
+    admitted daily schedule, so the caller should not treat it as a routing
+    failure yet.
     """
     return [task for task in tasks if task.mandatory is False]
 
@@ -309,8 +308,8 @@ def build_rolling_queues(
     # A planned DROP is not shed stock until the next observation. If remaining
     # work currently lacks inputs, execute only the dependency-clearing prefixes.
     # Mandatory remaining work is still part of the admitted daily schedule; it
-    # must not be reported as a fresh admission failure just because its input
-    # is in transit. The next turn rebuilds it from the new shed/market state.
+    # must not be reported as a fresh routing failure just because its input is
+    # in transit. The next turn rebuilds it from the new shed/market state.
     if depositing and shortage_now:
         return (
             [WorkerPlan(start, prefix) for start, prefix in zip(starts, prefixes)],
@@ -328,7 +327,11 @@ def build_rolling_queues(
     merged = []
     for start, prefix, plan in zip(starts, prefixes, plans):
         merged.append(WorkerPlan(start, prefix + plan.queue))
-    # Intraday route feasibility never reopens daily labor admission. Mandatory
-    # tasks omitted from this ephemeral pass are regenerated on the next live
-    # observation; only optional work is allowed to remain genuinely unassigned.
-    return merged, _routing_unassigned(unassigned)
+
+    # At this point resources are available and the route builder has had both
+    # its mixed and mandatory-only packing passes. A mandatory task still left
+    # unassigned therefore means this *new* rolling route is not a valid
+    # replacement for the already-admitted schedule. Expose that fact to the
+    # caller so it can retain the previous feasible schedule instead of silently
+    # dropping the mandatory task.
+    return merged, unassigned
