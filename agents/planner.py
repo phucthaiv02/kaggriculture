@@ -174,23 +174,36 @@ def _choice_current_key(choice):
 
 
 def _choose(
-    market, baseline, candidates, counts, labor=None, position=(4, 4), *, current=None,
-    audit=None,
+    market, baseline, candidates, counts, labor=None, position=(4, 4), *,
+    current=None, audit=None, decision_log=None, decision_step=None,
 ):
-    rows = evaluate_targets(market, baseline, candidates, labor, position)
+    results = evaluate_targets(market, baseline, candidates, labor, position)
     if audit is not None:
-        audit.extend(rows)
+        audit.extend(results)
     scored = []
-    for result in rows:
+    for result in results:
         score = result.profit
         if score > 0:
             scored.append((score, result))
     if not scored:
+        if decision_log is not None:
+            decision_log.append({
+                "day": market.day,
+                "hour": market.hour,
+                "step": decision_step,
+                "position": list(position),
+                "current": list(current) if current is not None else None,
+                "selected": None,
+                "reason": "no_profitable_candidate",
+                "switch_margin": TARGET_SWITCH_MARGIN,
+                "candidates": [_candidate_log(row, False) for row in results],
+            })
         return None, None
     best_score, result = max(
         scored,
         key=lambda item: (item[0], -counts[item[1].choice[0]], item[1].choice),
     )
+    reason = "highest_score"
     if current is not None:
         current_key = _choice_current_key(current)
         current_rows = [
@@ -201,7 +214,35 @@ def _choose(
             current_score, current_result = max(current_rows, key=lambda item: item[0])
             if current_score >= best_score - TARGET_SWITCH_MARGIN:
                 result = current_result
+                reason = "retained_current_within_switch_margin"
+    if decision_log is not None:
+        decision_log.append({
+            "day": market.day,
+            "hour": market.hour,
+            "step": decision_step,
+            "position": list(position),
+            "current": list(current) if current is not None else None,
+            "selected": list(result.choice),
+            "reason": reason,
+            "switch_margin": TARGET_SWITCH_MARGIN,
+            "candidates": [
+                _candidate_log(row, row.choice == result.choice) for row in results
+            ],
+        })
     return result.choice, result.output
+
+
+def _candidate_log(result, selected):
+    """Return the score inputs used by target selection as JSON-safe data."""
+    return {
+        "target": list(result.choice),
+        "market_cash": result.market_cash,
+        "capital_cost": result.capital_cost,
+        "labor_cost": result.labor_cost,
+        "score": result.profit,
+        "profitable": result.profit > 0,
+        "selected": selected,
+    }
 
 
 def _legacy_choice(choice):
@@ -233,37 +274,6 @@ def best_target(end_day, day, inventory, wheat_price, committed_units,
     return _legacy_choice(_choose(
         market, baseline, list(_candidates(day, end_day)), Counter()
     )[0])
-
-
-def _log_decision(decision_log, day, position, rows, selected):
-    if decision_log is None:
-        return
-    def logged_target(choice):
-        if choice is None:
-            return None
-        name, plan = choice
-        return [name, bool(plan) if name in CROPS else False]
-
-    decision_log.append({
-        "day": day,
-        "position": list(position),
-        "selected": logged_target(selected),
-        "fertilize_plan": None if selected is None else plan_json(selected[1]),
-        "reason": "no_profitable_candidate" if selected is None else "highest_score",
-        "candidates": [
-            {
-                "target": logged_target(row.choice),
-                "fertilize_plan": plan_json(row.choice[1]),
-                "market_cash": row.market_cash,
-                "capital_cost": row.capital_cost,
-                "labor_cost": row.labor_cost,
-                "score": row.profit,
-                "profitable": row.profit > 0,
-                "selected": row.choice == selected,
-            }
-            for row in rows
-        ],
-    })
 
 
 def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
@@ -374,7 +384,8 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
         actual = tile.get("animal") or tile.get("crop") if isinstance(tile, dict) else None
         if (actual != target[0] and not actual
                 and (committed_positions is None or position in committed_positions)):
-            baseline.add(_rotation(*target, day, end_day)[0], position)
+            name, fertilize = target
+            baseline.add(_rotation(name, fertilize, day, end_day)[0], position)
             counts[target[0]] += 1
 
     market = MarketForecast(obs["market"]["inventory"], obs["town"]["unlocked_shops"],
@@ -389,13 +400,11 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
             allowed = [c for c in candidates if c[0][0] in ANIMALS
                        and official_game.ANIMALS[c[0][0]]["structure"] == tile["kind"]]
         current = targets.get(position)
-        audit = [] if decision_log is not None else None
         choice, output = _choose(
             market, baseline, allowed, counts, position=position, current=current,
-            audit=audit,
+            decision_log=decision_log, decision_step=obs.get("step"),
         )
         targets[position] = choice
-        _log_decision(decision_log, day, position, audit or (), choice)
         if choice:
             # Include this commitment's supply in the shared window.
             baseline.add(output, position)

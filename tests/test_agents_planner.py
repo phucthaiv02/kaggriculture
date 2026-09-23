@@ -107,6 +107,28 @@ def test_choose_without_current_preserves_o1_best_choice(monkeypatch):
     assert choice == best.choice
 
 
+def test_choose_logs_candidate_scores_and_switch_reason(monkeypatch):
+    import agents.planner as planner
+    from agents.forecast import Production
+
+    best = planner.TargetProfit(("WHEAT", False), Production(), 110.0, 10.0)
+    current = planner.TargetProfit(("CORN", False), Production(), 109.5, 10.0)
+    monkeypatch.setattr(planner, "evaluate_targets", lambda *args, **kwargs: [best, current])
+    market = type("Market", (), {"day": 3, "hour": 0})()
+    decisions = []
+
+    choice, _ = planner._choose(
+        market, None, None, Counter(), position=(2, 4),
+        current=current.choice, decision_log=decisions,
+    )
+
+    assert choice == current.choice
+    assert decisions[0]["position"] == [2, 4]
+    assert decisions[0]["reason"] == "retained_current_within_switch_margin"
+    assert [row["score"] for row in decisions[0]["candidates"]] == [100.0, 99.5]
+    assert [row["selected"] for row in decisions[0]["candidates"]] == [False, True]
+
+
 def test_plan_targets_diversifies_across_many_tiles_in_one_pass():
     """Regression test for the concentration bug found via full-pipeline
     testing: a whole freshly-claimed quadrant (or a fresh 25-tile board)
