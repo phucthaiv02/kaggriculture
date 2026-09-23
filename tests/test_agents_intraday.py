@@ -61,7 +61,10 @@ def test_unconsumable_carried_output_returns_to_shed_before_missing_input_work()
         shed={},
     )
     assert plans[0].queue == [["DROP"]]
-    assert unassigned == [feed]
+    # The missing WHEAT is a dependency in flight, not a fresh admission
+    # failure. Mandatory FEED stays in the admitted daily schedule and is
+    # regenerated from the next observation after DROP/market settlement.
+    assert unassigned == []
 
 
 def test_rolling_route_prefers_new_same_tile_work_after_state_change():
