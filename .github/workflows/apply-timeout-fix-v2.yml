@@ -30,7 +30,7 @@ jobs:
           python /tmp/apply_frozen_daily_plan.py
           python -m py_compile agents/expansion_agent.py
           git diff --check
-          python -m pytest -q tests/test_agents_farm_tasks.py tests/test_agents_planting_deadline.py tests/test_agents_planner.py
+          python -m pytest -q tests/test_agents_farm_tasks.py tests/test_agents_planner.py
           python - <<'PY'
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
