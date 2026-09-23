@@ -17,6 +17,7 @@ from pathlib import Path
 from kaggle_environments import make
 
 from agents.expansion_agent import make_agent
+from agents.fertilizer import FertilizerPlan, plan_json
 from experiments.crop_schedules import pass_agent
 
 
@@ -166,9 +167,20 @@ def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def _planner_json_default(value):
+    """Serialize planner-only value objects without weakening JSON errors."""
+    if isinstance(value, FertilizerPlan):
+        return plan_json(value)
+    raise TypeError(
+        f"Object of type {value.__class__.__name__} is not JSON serializable"
+    )
+
+
 def _planner_report(decisions):
     """Build a self-contained, interactive target-decision report."""
-    payload = json.dumps(decisions, ensure_ascii=False).replace("</", "<\\/")
+    payload = json.dumps(
+        decisions, ensure_ascii=False, default=_planner_json_default
+    ).replace("</", "<\\/")
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -288,7 +300,9 @@ def run(opponent="pass", seed=1, output_dir=None):
     )
     replay_path.write_text(json.dumps(env.toJSON()), encoding="utf-8")
     planner_log_path.write_text(
-        json.dumps(planner_decisions, indent=2), encoding="utf-8",
+        json.dumps(
+            planner_decisions, indent=2, default=_planner_json_default
+        ), encoding="utf-8",
     )
     planner_report_path.write_text(
         _planner_report(planner_decisions), encoding="utf-8",
