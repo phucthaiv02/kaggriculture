@@ -28,6 +28,7 @@ jobs:
           from experiments.crop_schedules import pass_agent
           from experiments.play_match import configuration
 
+          trace=[]
           original = ea.build_tasks
           def traced(obs, targets, *args, **kwargs):
               tasks = original(obs, targets, *args, **kwargs)
@@ -35,13 +36,20 @@ jobs:
                   pos=(5,0)
                   tile=obs['farms'][obs['player']]['tiles'][0][5]
                   matches=[t for t in tasks if t.position==pos]
-                  print('TRACE', 'hour',obs['hour'], 'seed',obs['private']['seeds'].get('CARROT'),
-                        'target',targets.get(pos), 'pending',pos in obs.get('_pending_targets',()),
-                        'tile', tile, 'tasks',[(t.actions,dict(t.needs),t.mandatory,t.ends_cycle) for t in matches])
+                  trace.append({
+                      'hour':int(obs['hour']),
+                      'seed':obs['private']['seeds'].get('CARROT'),
+                      'target':repr(targets.get(pos)),
+                      'pending':pos in obs.get('_pending_targets',()),
+                      'tile':repr(tile),
+                      'tasks':repr([(t.actions,dict(t.needs),t.mandatory,t.ends_cycle) for t in matches]),
+                  })
               return tasks
           ea.build_tasks = traced
           agent=ea.make_agent(29, seed=1)
           env=make('kaggriculture', configuration=configuration(1), debug=False)
           env.run([agent, pass_agent])
           print('STATUS', [s.status for s in env.state])
+          for row in trace:
+              print('TRACE',row)
           PY
