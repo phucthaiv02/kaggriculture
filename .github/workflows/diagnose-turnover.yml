@@ -1,4 +1,4 @@
-name: Diagnose turnover on agent-v3 head
+name: Apply committed successor continuation fix
 
 on:
   push:
@@ -6,8 +6,11 @@ on:
     paths:
       - .github/workflows/diagnose-turnover.yml
 
+permissions:
+  contents: write
+
 jobs:
-  diagnose:
+  apply:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
@@ -17,69 +20,100 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Trace day26 delayed successor against A
+      - name: Patch, test, replay, and push
         run: |
-          python -m pip install -q 'kaggle-environments==1.32.7'
+          python -m pip install -q 'kaggle-environments==1.32.7' pytest
           git fetch origin agent-v3
-          git checkout --detach origin/agent-v3
+          EXPECTED=$(git rev-parse origin/agent-v3)
+          git checkout -B successor-continuation origin/agent-v3
           python - <<'PY'
-          import agents.expansion_agent as module
-          from kaggle_environments import make
-          from experiments.play_match import configuration, resolve_opponent
+          from pathlib import Path
 
-          POS=(5,0)
-          trace=[]
-          original_build_tasks=module.build_tasks
-          def traced_build_tasks(obs, targets, *args, **kwargs):
-              tasks=original_build_tasks(obs, targets, *args, **kwargs)
-              if int(obs.get('day',-1))==26:
-                  matches=[t for t in tasks if t.position==POS]
-                  tile=obs['farms'][obs['player']]['tiles'][POS[1]][POS[0]]
-                  trace.append(('BUILD_TASKS',{
-                      'hour':int(obs.get('hour',-1)),
-                      'target':repr(targets.get(POS)),
-                      'pending':POS in obs.get('_pending_targets',()),
-                      'seed_carrot':obs['private']['seeds'].get('CARROT',0),
-                      'tile':repr(tile),
-                      'tasks':[(t.actions,dict(t.needs),t.mandatory,t.ends_cycle) for t in matches],
-                  }))
-              return tasks
-          module.build_tasks=traced_build_tasks
+          path=Path('agents/expansion_agent.py')
+          text=path.read_text()
 
-          agent=module.make_agent(29,seed=1)
-          cells=dict(zip(agent.__code__.co_freevars,(c.cell_contents for c in agent.__closure__)))
-          state=cells['state']; targets=cells['targets']
-          opponent,_,_=resolve_opponent('public/A.ipynb')
+          old='''        "investment_backlog": set(), "daily_targets": {},\n        "emergency_hires": 0,\n'''
+          new='''        "investment_backlog": set(), "daily_targets": {},\n        "daily_successor_positions": set(),\n        "emergency_hires": 0,\n'''
+          assert text.count(old)==1, text.count(old)
+          text=text.replace(old,new)
 
-          def snapshot(obs,label,action=None):
-              farm=obs['farms'][obs['player']]
-              trace.append((label,{
-                  'hour':int(obs['hour']),
-                  'tile':repr(farm['tiles'][0][5]),
-                  'seed_carrot':obs['private']['seeds'].get('CARROT',0),
-                  'target':repr(targets.get(POS)),
-                  'daily_target':repr(state.get('daily_targets',{}).get(POS)),
-                  'frozen':POS in state.get('frozen_positions',set()),
-                  'pending':POS in state.get('pending_targets',set()),
-                  'plan_frozen':state.get('plan_frozen'),
-                  'emergency_hires':state.get('emergency_hires'),
-                  'unassigned':[(t.position,t.actions,t.mandatory) for t in state.get('unassigned',[]) if getattr(t,'position',None)==POS],
-                  'workers':[tuple(farm['farmer']),*map(tuple,farm['hands'])],
-                  'queues':[p.queue[:] for p in state.get('plans',[])],
-                  'action':action,
-              }))
+          old='''        replanned = _strip_partial_animal_builds(\n            replanned, opening_active=state["opening_active"]\n        )\n        starts = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]\n'''
+          new='''        replanned = _strip_partial_animal_builds(\n            replanned, opening_active=state["opening_active"]\n        )\n        # A successor admitted as part of a morning turnover task remains\n        # mandatory after HARVEST/DIG have changed the tile to EMPTY.  It is\n        # completion of the frozen daily lifecycle, not a fresh investment.\n        for task in replanned:\n            if task.position in state["daily_successor_positions"]:\n                task.mandatory = True\n        local_successors = {\n            task.position for task in replanned\n            if task.position in state["daily_successor_positions"]\n        }\n        starts = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]\n'''
+          assert text.count(old)==1, text.count(old)
+          text=text.replace(old,new)
 
-          def traced_agent(obs, config=None):
-              day=int(obs['day']); hour=int(obs['hour'])
-              watched=day==26 and (hour==0 or hour>=17)
-              if watched: snapshot(obs,'BEFORE')
-              action=agent(obs,config)
-              if watched: snapshot(obs,'AFTER',action)
-              return action
+          old='''            if any(inventory.values()):\n                planning_start = nearest_shed(start, shed_access)\n                prefix = route(start, planning_start) + [["DROP"]]\n'''
+          new='''            if any(inventory.values()) and start not in local_successors:\n                planning_start = nearest_shed(start, shed_access)\n                prefix = route(start, planning_start) + [["DROP"]]\n'''
+          assert text.count(old)==1, text.count(old)
+          text=text.replace(old,new)
 
-          env=make('kaggriculture',configuration=configuration(1),debug=False)
-          env.run([traced_agent,opponent])
-          print('STATUS',[s.status for s in env.state],'REWARD',[s.reward for s in env.state])
-          for label,row in trace:
-              print(label,row)
+          old='''                plans=[], reserved={}, emergency_hires=0,\n                frozen_positions=set(), unassigned=[], plan_frozen=False,\n            )\n'''
+          new='''                plans=[], reserved={}, emergency_hires=0,\n                frozen_positions=set(), unassigned=[], plan_frozen=False,\n                daily_successor_positions=set(),\n            )\n'''
+          assert text.count(old)==1, text.count(old)
+          text=text.replace(old,new)
+
+          old='''            assigned_tasks = [task for task in tasks if id(task) not in rejected_ids]\n            fertilizer_purchase_positions = {\n'''
+          new='''            assigned_tasks = [task for task in tasks if id(task) not in rejected_ids]\n            state["daily_successor_positions"] = {\n                task.position for task in assigned_tasks\n                if task.ends_cycle\n                and any(op[0] in ("PLANT", "PLACE") for op in task.actions)\n            }\n            fertilizer_purchase_positions = {\n'''
+          assert text.count(old)==1, text.count(old)
+          text=text.replace(old,new)
+          path.write_text(text)
+
+          test=Path('tests/test_agents_execution_pipeline.py')
+          t=test.read_text()
+          t=t.replace(
+              'from agents.expansion_agent import _pop_market_batch, _strip_partial_animal_builds\n',
+              'import agents.expansion_agent as expansion_module\nfrom agents.expansion_agent import _pop_market_batch, _strip_partial_animal_builds, make_agent\n'
+          )
+          t += '''\n\ndef test_intraday_replan_finishes_frozen_successor_before_cashout(monkeypatch):\n    position = (5, 0)\n    agent = make_agent(29)\n    cells = dict(zip(\n        agent.__code__.co_freevars,\n        (cell.cell_contents for cell in agent.__closure__),\n    ))\n    state = cells["state"]\n    state.update(\n        daily_targets={position: ("CARROT", False)},\n        frozen_positions={position},\n        daily_successor_positions={position},\n        opening_active=False,\n    )\n    task = Task(position, [["PLANT", "CARROT"], ["WATER"]], mandatory=False)\n    monkeypatch.setattr(expansion_module, "build_tasks", lambda *args, **kwargs: [task])\n    monkeypatch.setattr(\n        expansion_module, "_open_shed_access",\n        lambda farm: ((4, 4), (5, 4), (4, 5), (5, 5)),\n    )\n    farm = {\n        "farmer": [5, 0], "hands": [],\n        "tiles": [[None for _ in range(10)] for _ in range(10)],\n    }\n    obs = {\n        "player": 0, "day": 26, "hour": 21, "_planning_end_day": 29,\n        "_pending_targets": set(), "farms": [farm, farm],\n        "private": {\n            "inventories": [{"STRAWBERRY": 2}],\n            "shed": {"WHEAT": 0}, "seeds": {"CARROT": 1},\n        },\n    }\n\n    cells["_global_replan"](obs, farm, 21)\n\n    assert task.mandatory is True\n    assert state["unassigned"] == []\n    assert state["plans"][0].queue == [["PLANT", "CARROT"], ["WATER"]]\n'''
+          test.write_text(t)
           PY
+
+          python -m py_compile agents/expansion_agent.py
+          git diff --check
+          python -m pytest -q tests/test_agents_execution_pipeline.py tests/test_agents_farm_tasks.py tests/test_agents_scheduler.py tests/test_agents_planner.py
+
+          rm -rf /tmp/successor-check && mkdir -p /tmp/successor-check
+          timeout 300s python -m experiments.play_match --opponent public/A.ipynb --seed 1 --output-dir /tmp/successor-check
+          python - <<'PY'
+          import json
+          from collections import defaultdict
+          from pathlib import Path
+
+          match=sorted(Path('/tmp/successor-check').glob('current_vs_A_seed1_*'))[-1]
+          replay=json.loads((match/'replay.json').read_text())
+          decisions=json.loads((match/'planner_decisions.json').read_text())
+          result=json.loads((match/'result.json').read_text())
+          observations=[step[0]['observation'] for step in replay['steps']]
+          decision_map=defaultdict(list)
+          for d in decisions:
+              decision_map[(int(d['day']),tuple(d['position']))].append(d)
+
+          delayed=[]
+          checked=0
+          for i in range(len(observations)-1):
+              a,b=observations[i],observations[i+1]
+              day=int(b['day'])
+              if day < 8 or day >= 28:
+                  continue
+              ta,tb=a['farms'][0]['tiles'],b['farms'][0]['tiles']
+              for y in range(10):
+                  for x in range(10):
+                      before,after=ta[y][x],tb[y][x]
+                      if not (isinstance(before,dict) and before.get('kind')=='PLANT' and after is None):
+                          continue
+                      ds=decision_map.get((day,(x,y)),[])
+                      selected=ds[-1].get('selected') if ds else None
+                      if not selected:
+                          continue
+                      checked += 1
+                      found=None
+                      for j in range(i+1,min(len(observations),i+25)):
+                          tile=observations[j]['farms'][0]['tiles'][y][x]
+                          producer=(tile.get('crop') or tile.get('animal')) if isinstance(tile,dict) else None
+                          if producer:\n                              found=(int(observations[j]['day']),int(observations[j]['hour']),producer)\n                              break\n                      if not found or found[0] != day:\n                          delayed.append((day,(x,y),before.get('crop'),selected,found))\n          print('RESULT',result)\n          print('CHECKED_FROZEN_SUCCESSORS',checked,'DELAYED',delayed)\n          assert not delayed, delayed\n          PY
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+phucthaiv02@users.noreply.github.com'
+          git add agents/expansion_agent.py tests/test_agents_execution_pipeline.py
+          git commit -m 'fix: finish committed turnover successors before reroute cashout'
+          git push --force-with-lease=agent-v3:${EXPECTED} origin HEAD:agent-v3
