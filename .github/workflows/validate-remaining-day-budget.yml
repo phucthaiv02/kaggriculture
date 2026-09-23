@@ -26,7 +26,7 @@ jobs:
           python-version: "3.11"
       - name: Apply budget patch
         run: |
-          python .ci/apply_remaining_budget_patch.py
+          python .ci/apply_remaining_budget_patch_v2.py
           python -m py_compile agents/scheduler.py agents/expansion_agent.py tests/test_agents_scheduler.py
           git diff --check
           git diff -- agents/scheduler.py agents/expansion_agent.py tests/test_agents_scheduler.py
@@ -72,7 +72,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm .github/workflows/validate-remaining-day-budget.yml .ci/apply_remaining_budget_patch.py
+          git rm .github/workflows/validate-remaining-day-budget.yml .ci/apply_remaining_budget_patch.py .ci/apply_remaining_budget_patch_v2.py
           git add agents/scheduler.py agents/expansion_agent.py tests/test_agents_scheduler.py
           git commit -m "fix: size queues to remaining day capacity"
           git push origin HEAD:agent-v3-turnover-watering-fix
