@@ -220,23 +220,36 @@ def test_conversion_batch_harvests_two_wheat_and_buys_cow_without_market_feed():
     )
 
 
-def test_day_five_buys_seven_wheat_seeds_and_replants_all_harvested_tiles():
+def test_day_five_has_enough_wheat_seeds_and_replants_all_harvested_tiles():
     """UI Day 5 is engine index 4: all 7 opening WHEAT tiles must complete
     WATER -> HARVEST -> PLANT -> WATER on that exact day, with no spill into
-    index 5."""
+    index 5. Existing seed stock counts; the market must not buy a redundant
+    eighth seed merely to satisfy an implementation-detail assertion."""
     env = make("kaggriculture", configuration=configuration(1), debug=False)
     env.run([make_agent(END_DAY, seed=1), pass_agent])
 
+    day_four_start = next(
+        step[0].observation
+        for step in env.steps
+        if step[0].observation.day == 4 and step[0].observation.hour == 0
+    )
+    starting_wheat_seeds = day_four_start["private"]["seeds"].get("WHEAT", 0)
     actions = [
         step[0].action or {} for step in env.steps
         if step[0].observation.day == 4
     ]
     market = [order for action in actions for order in action.get("market", [])]
-    assert sum(
+    bought_wheat_seeds = sum(
         int(order[2])
         for order in market
         if order[:2] == ["BUY_SEED", "WHEAT"]
-    ) == 7
+    )
+    assert starting_wheat_seeds + bought_wheat_seeds >= 7, (
+        starting_wheat_seeds,
+        bought_wheat_seeds,
+        day_four_start.farms[0]["money"],
+        market,
+    )
     day_five_end = next(
         step[0].observation
         for step in env.steps
