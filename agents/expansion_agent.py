@@ -526,7 +526,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                 if task.position not in state["deferred_expansion_positions"]
                 or isinstance(farm["tiles"][task.position[1]][task.position[0]], dict)
             ]
-            hand_target, _dropped = hands_needed(
+            hand_target, rejected = hands_needed(
                 tasks,
                 tuple(farm["farmer"]),
                 tuple(map(tuple, farm["hands"])),
@@ -536,21 +536,23 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                      for n in range(MAX_HANDS - len(farm["hands"]))]),
             )
             mandatory_tasks = [task for task in tasks if task.mandatory is not False]
-            mandatory_hand_target, _mandatory_missing = hands_needed(
-                mandatory_tasks,
-                tuple(farm["farmer"]), tuple(map(tuple, farm["hands"])),
-                _open_shed_access(farm),
-            )
+            if len(mandatory_tasks) == len(tasks):
+                mandatory_hand_target = hand_target
+            else:
+                mandatory_hand_target, _mandatory_missing = hands_needed(
+                    mandatory_tasks,
+                    tuple(farm["farmer"]), tuple(map(tuple, farm["hands"])),
+                    _open_shed_access(farm),
+                )
             state.update(
                 day=day, hand_target=hand_target,
                 mandatory_hand_target=mandatory_hand_target,
                 plans=[], reserved={}, emergency_hires=0,
                 frozen_positions=set(), unassigned=[], plan_frozen=False,
             )
-            preliminary, rejected = build_queues(
-                tasks, tuple(farm["farmer"]), hand_target,
-                tuple(map(tuple, farm["hands"])), _open_shed_access(farm),
-            )
+            # hands_needed already ran the exact feasibility pack at the chosen
+            # headcount. Repacking the same tasks here was a duplicate
+            # superlinear morning pass used only to recover the same rejected set.
             rejected_ids = {id(task) for task in rejected}
             investment_task_positions = {
                 task.position for task in tasks
@@ -651,19 +653,14 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             # strand its final mandatory action at rollover.
             remaining_budget = max(0, 24 - hour)
             pending_budget = max(0, 23 - hour)
-            desired_hands, _dropped = hands_needed(
-                tasks,
-                tuple(farm["farmer"]),
-                existing_hands,
-                shed_access,
-                pending_hand_budget=pending_budget,
-                existing_hand_budget=remaining_budget,
-                marginal_hire_costs=(None if state["opening_active"] and day < effective_end else
-                    [_hire_costs(farm, n + 1) - _hire_costs(farm, n)
-                     for n in range(MAX_HANDS - len(existing_hands))]),
-            )
+            # Optional labor was already economically sized and ordered at
+            # hour 0. Re-running the full economic hand search after the
+            # morning market queue cannot add an optional worker here; this
+            # phase only schedules workers that actually arrived. If mandatory
+            # work still does not fit, the emergency path below sizes the exact
+            # missing survival capacity.
             hand_count = len(existing_hands)
-            state["hand_target"] = desired_hands
+            state["hand_target"] = hand_count
             plans, unassigned = build_queues(
                 tasks,
                 tuple(farm["farmer"]),

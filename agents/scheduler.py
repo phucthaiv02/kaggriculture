@@ -206,14 +206,13 @@ def _pack_greedy(
     variant=0,
     group_animal=False,
 ):
-    """Greedy bin-pack using each candidate worker's exact queue length.
+    """Greedy bin-pack using exact route length with an O(1) common fast path.
 
-    The projection includes travel from the real spawn, one operation for
-    every distinct PICKUP, travel between tasks, and all tile actions. The
-    optional DROP trip is added later only when it fits.
-
-    group_animal is an emergency packing mode used only after the strict route
-    fails at a candidate headcount. Normal callers retain the original ordering.
+    Normal production buckets have no forced mid-route DROP/cashout. For those
+    buckets, inserting one task only changes two Manhattan edges, action count
+    and (at most) the initial shed pickup set, so recomputing the whole route
+    for every candidate insertion is unnecessary. Opening refinance/cashout
+    tasks retain the exact legacy projection as a bounded slow path.
     """
     buckets = [[] for _ in worker_starts]
 
@@ -223,22 +222,19 @@ def _pack_greedy(
             sheds[position] = nearest_shed(position, shed_access)
         return sheds[position]
 
+    def distance(a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
     priority_for = _rescue_priority if group_animal else _priority
     priorities = {id(task): priority_for(task) for task in tasks}
     terminal_day = any(task.terminal_day or task.cashout for task in tasks)
 
-    # Keep the production greedy ordering exactly unchanged unless this is the
-    # explicit hand-count rescue. Opening and already-valid schedules therefore
-    # cannot move because of the relaxed animal grouping.
     if group_animal:
         ordered = sorted(
             tasks,
             key=lambda task: (
                 priorities[id(task)],
-                min(
-                    abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
-                    for start in worker_starts
-                ),
+                min(distance(start, task.position) for start in worker_starts),
                 task.position[1],
                 task.position[0],
                 not task.animal_harvest,
@@ -250,41 +246,51 @@ def _pack_greedy(
             tasks,
             key=lambda task: (
                 priorities[id(task)],
-                min(
-                    abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
-                    for start in worker_starts
-                ),
+                min(distance(start, task.position) for start in worker_starts),
                 -len(task.actions),
                 task.position[1],
                 task.position[0],
             ),
         )
     if variant:
-        # Keep the safety classes, but try difficult / spatially grouped work
-        # first so easy nearby jobs do not strand capacity at the farm edges.
         def alternative(task):
             x, y = task.position
-            distance = min(abs(x-s[0]) + abs(y-s[1]) for s in worker_starts)
-            geometry = ((-distance - len(task.actions), y, x) if variant == 1
+            dist = min(distance((x, y), start) for start in worker_starts)
+            geometry = ((-dist - len(task.actions), y, x) if variant == 1
                         else (x, y) if variant == 2 else (y, x))
             return priorities[id(task)], geometry
         ordered = sorted(tasks, key=alternative)
+
     def admission_key(task):
-        distance = min(abs(start[0] - task.position[0]) + abs(start[1] - task.position[1])
-                       for start in worker_starts)
-        capacity = distance + len(task.actions) + len(task.needs)
+        dist = min(distance(start, task.position) for start in worker_starts)
+        capacity = dist + len(task.actions) + len(task.needs)
         if task.cashout:
             shed = shed_for(task.position)
-            capacity += abs(task.position[0] - shed[0]) + abs(task.position[1] - shed[1]) + 1
+            capacity += distance(task.position, shed) + 1
         return priorities[id(task)], -task.value / max(1, capacity) if task.mandatory is False else 0
+
     ordered.sort(key=admission_key)
     unassigned = []
     lengths = [0] * len(worker_starts)
+
+    # Metadata for the common no-mid-route-DROP case.
+    # path_lengths excludes the initial worker->shed leg and PICKUP ops.
+    fast_bucket = [True] * len(worker_starts)
+    path_lengths = [0] * len(worker_starts)
+    action_steps = [0] * len(worker_starts)
+    need_items = [set() for _ in worker_starts]
+
     for task in ordered:
         best = None
+        best_fast = None
         priority = priorities[id(task)]
         time_sensitive = task.immediate_drop or task.cashout
         task_is_service = group_animal and _is_animal_service(task)
+        task_need_items = {
+            item for item, amount in task.needs.items() if amount > 0
+        }
+        task_fast = not task.immediate_drop and not task.cashout
+
         for worker, bucket in enumerate(buckets):
             paired_harvest = None
             paired_service = None
@@ -296,60 +302,113 @@ def _pack_greedy(
                         paired_harvest = index
                     elif _is_animal_service(queued):
                         paired_service = index
+
+            use_fast = fast_bucket[worker] and task_fast
+            if use_fast:
+                old_items = need_items[worker]
+                new_pickups = len(old_items | task_need_items)
+                old_origin = shed_for(worker_starts[worker]) if old_items else worker_starts[worker]
+                new_origin = shed_for(worker_starts[worker]) if new_pickups else worker_starts[worker]
+                base_path = path_lengths[worker]
+                if bucket and old_origin != new_origin:
+                    first = bucket[0].position
+                    base_path += distance(new_origin, first) - distance(old_origin, first)
+                prefix = distance(worker_starts[worker], new_origin) if new_pickups else 0
+                effective_budget = max(0, budgets[worker] - int(terminal_day))
+
             for insertion in range(len(bucket) + 1):
-                # Buckets are already priority-sorted; only the two new
-                # neighbours can violate the invariant after insertion.
                 if insertion and priorities[id(bucket[insertion - 1])] > priority:
                     continue
                 if insertion < len(bucket) and priority > priorities[id(bucket[insertion])]:
                     continue
-                # In rescue mode, tasks at the same pen may share a visit but
-                # explicit HARVEST stays before that pen's FEED/CARE work.
                 if task_is_service:
                     if task.animal_harvest and paired_service is not None and insertion > paired_service:
                         continue
                     if not task.animal_harvest and paired_harvest is not None and insertion <= paired_harvest:
                         continue
-                candidate = bucket[:insertion] + [task] + bucket[insertion:]
-                projected = _task_length(worker_starts[worker], candidate, shed_for)
-                if projected <= _bucket_budget(budgets[worker], candidate, terminal_day):
-                    # Time-sensitive work must finish early for survival,
-                    # crop expiry and same-day sales. For ordinary work,
-                    # minimize extra travel and pickups instead.
+
+                fast_detail = None
+                if use_fast:
+                    previous = new_origin if insertion == 0 else bucket[insertion - 1].position
+                    candidate_path = base_path
+                    if insertion < len(bucket):
+                        following = bucket[insertion].position
+                        candidate_path += (
+                            distance(previous, task.position)
+                            + distance(task.position, following)
+                            - distance(previous, following)
+                        )
+                    else:
+                        candidate_path += distance(previous, task.position)
+                    projected = (
+                        prefix + new_pickups + candidate_path
+                        + action_steps[worker] + len(task.actions)
+                    )
+                    fits = projected <= effective_budget
+                    fast_detail = candidate_path
+                else:
+                    candidate_bucket = bucket[:insertion] + [task] + bucket[insertion:]
+                    projected = _task_length(worker_starts[worker], candidate_bucket, shed_for)
+                    fits = projected <= _bucket_budget(
+                        budgets[worker], candidate_bucket, terminal_day
+                    )
+
+                if fits:
                     cost = projected if time_sensitive and not variant else projected - lengths[worker]
-                    candidate = (cost, projected, worker, insertion)
-                    if best is None or candidate < best:
-                        best = candidate
+                    rank = (cost, projected, worker, insertion)
+                    if best is None or rank < best:
+                        best = rank
+                        best_fast = fast_detail if use_fast else None
+
         if best is not None:
             _, projected, worker, insertion = best
             buckets[worker].insert(insertion, task)
             lengths[worker] = projected
+            if best_fast is not None:
+                path_lengths[worker] = best_fast
+                action_steps[worker] += len(task.actions)
+                need_items[worker].update(task_need_items)
+            else:
+                fast_bucket[worker] = False
         else:
             unassigned.append(task)
     return buckets, unassigned
 
+def _pack(
+    tasks,
+    worker_starts,
+    budgets,
+    shed_access=SHED_ACCESS,
+    optimize_routes=True,
+):
+    """Pack tasks, separating feasibility search from route polishing.
 
-def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
-    """Try bounded deterministic alternatives before paying for another hand.
-
-    Preserve the original early-completion routes whenever they fit. A rescue
-    uses identical tasks and priority constraints, only changing assignment and
-    visit order. No search over targets, care dates or opening actions occurs.
+    hands_needed only needs a feasible assignment; spending three extra full
+    packing passes to improve an already-feasible route made morning planning
+    scale badly with farm size. Final queue construction may still request
+    route polishing, but stops as soon as no sellable output is stranded.
     """
     best = _pack_greedy(tasks, worker_starts, budgets, shed_access)
     if not tasks or sum(len(t.actions) for t in tasks) > sum(budgets):
         return best
 
-    # The strict route remains authoritative whenever it fits. Only when it
-    # leaves work behind may we relax harvest-vs-maintenance grouping, and then
-    # only if the relaxed candidate completes the whole workload. This makes
-    # the optimization capable of saving a hand without changing valid routes.
     if best[1] and any(_is_animal_service(task) for task in tasks):
         grouped = _pack_greedy(
             tasks, worker_starts, budgets, shed_access, group_animal=True
         )
         if not grouped[1]:
             return grouped
+
+    if not optimize_routes:
+        if not best[1]:
+            return best
+        for variant in (1, 2, 3):
+            candidate = _pack_greedy(
+                tasks, worker_starts, budgets, shed_access, variant
+            )
+            if not candidate[1]:
+                return candidate
+        return best
 
     terminal_day = any(task.terminal_day or task.cashout for task in tasks)
     def score(result):
@@ -370,15 +429,19 @@ def _pack(tasks, worker_starts, budgets, shed_access=SHED_ACCESS):
         return stranded, travel
 
     best_score = score(best)
+    # Once all assigned workers can return sellable output, extra full repacks
+    # only optimize travel distance and are not worth risking the 1s act budget.
+    if not best[1] and best_score[0] == 0:
+        return best
+
     for variant in (1, 2, 3):
         candidate = _pack_greedy(tasks, worker_starts, budgets, shed_access, variant)
         candidate_score = score(candidate)
-        # Do not trade away tasks. Among complete schedules prefer routes
-        # that can return more goods before the shed's end-of-day capacity cap.
         if candidate_score < best_score:
             best, best_score = candidate, candidate_score
+            if best_score[0] == 0:
+                break
     return best
-
 
 def hands_needed(
     tasks,
@@ -390,24 +453,37 @@ def hands_needed(
     max_hands=MAX_HANDS,
     marginal_hire_costs=None,
 ):
-    """Find the fewest hands that fit today's tasks, up to max_hands.
+    """Find the fewest/economically useful hands without polishing each route.
 
-    With marginal_hire_costs, cover mandatory work first, then buy capacity
-    when total additional optional cash exceeds cumulative extra hire prices.
-    Existing hands are sunk cost. Omitted prices retain capacity-only sizing.
-    Return work excluded by capacity or the economic stopping rule."""
+    Feasibility sizing is cheaper than final route construction. With economic
+    sizing, larger Fibonacci-priced headcounts stop being evaluated once their
+    cumulative extra hire cost exceeds all optional value that could possibly
+    be recovered from the first fully-mandatory schedule.
+    """
     minimum = min(len(existing_hand_starts), max_hands)
     existing_budget = HAND_BUDGET if existing_hand_budget is None else existing_hand_budget
-    # Every action and each distinct positive supply pickup is unavoidable,
-    # even with zero travel. Skip headcounts below this admissible bound.
     required = tasks if marginal_hire_costs is None else [
         task for task in tasks if task.mandatory is not False
         and len(task.actions) <= max(existing_budget, pending_hand_budget)
     ]
     mandatory_steps = sum(len(task.actions) for task in required)
-    mandatory_steps += len({item for task in required for item, amount in task.needs.items() if amount > 0})
+    mandatory_steps += len({
+        item for task in required for item, amount in task.needs.items() if amount > 0
+    })
     candidates = []
+    first_required_count = None
+    max_optional_recovery = 0.0
+
     for count in range(minimum, max_hands + 1):
+        if marginal_hire_costs is not None and first_required_count is not None:
+            extra_cost = sum(
+                marginal_hire_costs[
+                    first_required_count - minimum:count - minimum
+                ]
+            )
+            if extra_cost > max_optional_recovery:
+                break
+
         starts = [tuple(farmer_start)] + predicted_hand_starts(
             farmer_start, existing_hand_starts, count
         )
@@ -416,16 +492,28 @@ def hands_needed(
         budgets += [pending_hand_budget] * max(0, count - len(existing_hand_starts))
         if count < max_hands and sum(budgets) < mandatory_steps:
             continue
-        _, unassigned = _pack(tasks, starts, budgets, shed_access)
+
+        _, unassigned = _pack(
+            tasks, starts, budgets, shed_access, optimize_routes=False
+        )
         if marginal_hire_costs is None and not unassigned:
             return count, []
+
         candidates.append((count, unassigned))
+        if marginal_hire_costs is not None and first_required_count is None:
+            missing_required = sum(
+                task.mandatory is not False for task in unassigned
+            )
+            if missing_required == 0:
+                first_required_count = count
+                max_optional_recovery = sum(
+                    max(0.0, task.value)
+                    for task in unassigned if task.mandatory is False
+                )
+
     if marginal_hire_costs is None:
         return max_hands, unassigned
 
-    # A single added hand can leave the same number of required tasks behind
-    # while unlocking a better packing at the following headcount. Inspect the
-    # bounded search as a whole instead of stopping on that local plateau.
     required_missing = [
         sum(task.mandatory is not False for task in missing)
         for _, missing in candidates
@@ -434,9 +522,6 @@ def hands_needed(
     base_index = required_missing.index(best_required)
     chosen_count, chosen_missing = candidates[base_index]
 
-    # Required capacity is paid for regardless of price. Compare total optional
-    # recovery against cumulative extra hire cost, including across plateaus.
-    # Existing hands remain sunk cost.
     base_count = chosen_count
     best_net = -sum(task.value for task in chosen_missing if task.mandatory is False)
     for index in range(base_index + 1, len(candidates)):
@@ -449,7 +534,6 @@ def hands_needed(
         if net > best_net:
             chosen_count, chosen_missing, best_net = count, missing, net
     return chosen_count, chosen_missing
-
 
 def _rebalance_feed(buckets, starts, budgets, shed_access, tasks):
     """Consolidate stocked feed in two bounded passes without delaying other work.

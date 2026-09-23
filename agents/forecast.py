@@ -22,14 +22,15 @@ class Production:
     inputs: dict = field(default_factory=lambda: defaultdict(Counter))
     visits: dict = field(default_factory=lambda: defaultdict(list))
 
-    def add(self, other, position=None):
+    def add(self, other, position=None, include_visits=True):
         for day, units in other.sales.items():
             self.sales[day].update(units)
         for day, units in other.inputs.items():
             self.inputs[day].update(units)
-        for day, visits in other.visits.items():
-            self.visits[day].extend((position if p is None else p, n, inputs, goods)
-                                   for p, n, inputs, goods in visits)
+        if include_visits:
+            for day, visits in other.visits.items():
+                self.visits[day].extend((position if p is None else p, n, inputs, goods)
+                                       for p, n, inputs, goods in visits)
 
 
 def production(name, fertilize, day, end_day, tile=None):
@@ -114,6 +115,10 @@ class MarketForecast:
         self.center_products = set(game.TOWN_CENTER_PRODUCTS)
         self.price = lru_cache(maxsize=None)(lambda product, stock: game.market_price(product, stock, params))
         self.trade = lru_cache(maxsize=None)(self._trade)
+        # Candidate Production objects are reused across every tile repriced in
+        # one morning. Cache their touched markets once instead of rescanning
+        # up to sixteen days of sales/inputs for every tile.
+        self._candidate_products = {}
 
     def _trade(self, product, stock, amount):
         cash = 0
@@ -178,11 +183,15 @@ class MarketForecast:
 
     def marginal_value(self, baseline, candidate, baseline_values=None):
         """Exact ``value(base + candidate) - value(base)`` on touched markets."""
-        touched = set()
-        for field in (candidate.sales, candidate.inputs):
-            for units in field.values():
-                touched.update(product for product, amount in units.items() if amount)
-        products = tuple(product for product in game.PRODUCTS if product in touched)
+        candidate_id = id(candidate)
+        products = self._candidate_products.get(candidate_id)
+        if products is None:
+            touched = set()
+            for field in (candidate.sales, candidate.inputs):
+                for units in field.values():
+                    touched.update(product for product, amount in units.items() if amount)
+            products = tuple(product for product in game.PRODUCTS if product in touched)
+            self._candidate_products[candidate_id] = products
         if not products:
             return 0.0
 

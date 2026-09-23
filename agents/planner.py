@@ -121,7 +121,7 @@ class TargetProfit:
 
 
 def evaluate_targets(
-    market, baseline, candidates, labor=None, position=(4, 4)
+    market, baseline, candidates, labor=None, position=(4, 4), *, flows_scoped=False
 ):
     """Compare targets over the same min(16, remaining days) horizon.
 
@@ -147,12 +147,13 @@ def evaluate_targets(
                 if market.day <= d <= end)
         return result
 
-    scoped_baseline = scoped(baseline)
+    scoped_baseline = baseline if flows_scoped else scoped(baseline)
     baseline_values = {}
     for choice, output, cost in candidates:
         if market.day + _first_yield_age(choice[0]) > end:
             continue
-        output = scoped(output)
+        if not flows_scoped:
+            output = scoped(output)
         market_cash = scoped_market.marginal_value(
             scoped_baseline, output, baseline_values
         )
@@ -175,9 +176,11 @@ def _choice_current_key(choice):
 
 def _choose(
     market, baseline, candidates, counts, labor=None, position=(4, 4), *,
-    current=None, audit=None, decision_log=None, decision_step=None,
+    current=None, audit=None, decision_log=None, decision_step=None, flows_scoped=False,
 ):
-    results = evaluate_targets(market, baseline, candidates, labor, position)
+    results = evaluate_targets(
+        market, baseline, candidates, labor, position, flows_scoped=flows_scoped
+    )
     if audit is not None:
         audit.extend(results)
     scored = []
@@ -368,7 +371,7 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
                         end_day,
                         tile,
                     )
-                destination.add(future, (x, y))
+                destination.add(future, (x, y), include_visits=False)
                 if player == obs["player"] and (x, y) not in replanning_set:
                     counts[name] += 1
 
@@ -385,7 +388,7 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
         if (actual != target[0] and not actual
                 and (committed_positions is None or position in committed_positions)):
             name, fertilize = target
-            baseline.add(_rotation(name, fertilize, day, end_day)[0], position)
+            baseline.add(_rotation(name, fertilize, day, end_day)[0], position, include_visits=False)
             counts[target[0]] += 1
 
     market = MarketForecast(obs["market"]["inventory"], obs["town"]["unlocked_shops"],
@@ -402,11 +405,11 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
         current = targets.get(position)
         choice, output = _choose(
             market, baseline, allowed, counts, position=position, current=current,
-            decision_log=decision_log, decision_step=obs.get("step"),
+            decision_log=decision_log, decision_step=obs.get("step"), flows_scoped=True,
         )
         targets[position] = choice
         if choice:
             # Include this commitment's supply in the shared window.
-            baseline.add(output, position)
+            baseline.add(output, position, include_visits=False)
             counts[choice[0]] += 1
     return pending
