@@ -785,12 +785,16 @@ def purchase_orders(
     # Day 0 is the one exception: filling the fixed 25-tile opening requires
     # nearly all starting capital, and every newly placed animal produces
     # fertilizer that the now-safe refinance route can turn into day-1 feed.
-    # From day 1 onward keep cash feed coverage instead of relying entirely
-    # on that just-in-time loop.
+    # From day 1 onward keep cash feed coverage, but credit WHEAT that is
+    # guaranteed to arrive from today's admitted harvest before reserving
+    # more market cash for that same coverage.
     next_day_feed_reserve = (
         0
         if obs["day"] == 0
-        else wheat_cost(live_animals + pending_feed + new_animal_feed)
+        else wheat_cost(max(
+            0,
+            live_animals + pending_feed + new_animal_feed - wheat_incoming,
+        ))
     )
 
     # Same affordability-capping as animals, and for the same reason: with
