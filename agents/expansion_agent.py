@@ -579,7 +579,9 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             state["reserved"] = reserved_items(
                 [task for task in tasks if id(task) in assigned_ids]
             )
-            state["frozen_positions"] = {task.position for task in tasks}
+            state["frozen_positions"] = {
+                task.position for task in tasks if id(task) in assigned_ids
+            }
             investment_task_positions = {
                 task.position for task in tasks
                 if any(op[0] in ("PLANT", "PLACE") for op in task.actions)
