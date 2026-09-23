@@ -122,12 +122,19 @@ def _task_demand(tasks):
 
 
 def _choose_carried_assignment(tasks, starts, inventories, budgets, shed_access, shed):
-    """Pin work that can consume stock already carried by a worker.
+    """Pin carried-input work and zero-distance admitted continuations.
 
     The ordinary scheduler assumes task inputs are in the shed. Rolling
     execution invalidates that assumption immediately after a PICKUP or a
-    harvest. Pinning such tasks to the carrier keeps input ownership explicit;
-    all other tasks remain free for normal spatial optimization.
+    harvest. Work that can consume carried stock stays with that carrier.
+
+    There is one equally important locality case: after a state-changing op
+    such as HARVEST, an admitted successor may be regenerated on the worker's
+    current tile with no item dependency at all (for example PLANT -> WATER).
+    Sending that worker to DROP its freshly harvested output before doing the
+    zero-distance continuation creates a needless shed round trip and can make
+    the already-admitted chain miss the day. Pin that ready local continuation
+    first. This is route-cost optimization, not an action-kind priority.
     """
     remaining = list(tasks)
     buckets = [[] for _ in starts]
@@ -137,16 +144,28 @@ def _choose_carried_assignment(tasks, starts, inventories, budgets, shed_access,
     while remaining:
         best = None
         for task_index, task in enumerate(remaining):
-            if not task.needs:
-                continue
             for worker, inventory in enumerate(carried):
+                current = (
+                    starts[worker]
+                    if not buckets[worker]
+                    else buckets[worker][-1].position
+                )
+                distance = (
+                    abs(current[0] - task.position[0])
+                    + abs(current[1] - task.position[1])
+                )
+                missing = _missing(task.needs, inventory)
+                local_ready = bool(
+                    task.mandatory is not False
+                    and distance == 0
+                    and not missing
+                )
                 covered = sum(
                     min(inventory.get(item, 0), amount)
                     for item, amount in task.needs.items()
                 )
-                if covered <= 0:
+                if not local_ready and covered <= 0:
                     continue
-                missing = _missing(task.needs, inventory)
                 if any(missing[item] > shed_left.get(item, 0) for item in missing):
                     continue
 
@@ -157,10 +176,20 @@ def _choose_carried_assignment(tasks, starts, inventories, budgets, shed_access,
                 if len(candidate_queue) > budgets[worker]:
                     continue
 
-                current = starts[worker] if not buckets[worker] else buckets[worker][-1].position
-                distance = abs(current[0] - task.position[0]) + abs(current[1] - task.position[1])
-                key = (-covered, distance, len(candidate_queue), task.position[1],
-                       task.position[0], worker, task_index)
+                # A ready task on the current tile has zero route cost and must
+                # stay ahead of a remote use/deposit of carried inventory. The
+                # remaining tie-breaks keep the existing carried-resource and
+                # spatial optimization intact.
+                key = (
+                    0 if local_ready else 1,
+                    -covered,
+                    distance,
+                    len(candidate_queue),
+                    task.position[1],
+                    task.position[0],
+                    worker,
+                    task_index,
+                )
                 if best is None or key < best[0]:
                     best = (key, task_index, worker, missing)
 
