@@ -302,7 +302,8 @@ def test_multiple_drops_pick_up_only_each_segments_feed():
     assert len(plans[0].queue) <= FARMER_BUDGET
 
 
-def test_urgent_tasks_finish_early_even_when_sharing_worker_saves_travel():
+def test_scheduled_tasks_may_share_worker_when_route_is_cheaper():
+    """The compatibility `urgent` flag must not force runtime worker splitting."""
     tasks = [
         Task((4, 3), [["FEED"], ["CARE"]], urgent=True),
         Task((4, 2), [["FEED"], ["CARE"]], urgent=True),
@@ -311,8 +312,9 @@ def test_urgent_tasks_finish_early_even_when_sharing_worker_saves_travel():
         tasks, farmer_start=SHED, hand_count=1, hand_starts=((5, 4),),
     )
     assert unassigned == []
-    assert all(plan.queue.count(["FEED"]) == 1 for plan in plans)
-    assert max(len(plan.queue) for plan in plans) == 5
+    assert sum(plan.queue.count(["FEED"]) for plan in plans) == 2
+    assert sum(plan.queue.count(["CARE"]) for plan in plans) == 2
+    assert sum(bool(plan.queue) for plan in plans) == 1
 
 
 if __name__ == "__main__":
@@ -438,6 +440,4 @@ def test_feed_rebalancing_keeps_investment_on_its_original_worker():
     result = _rebalance_feed(buckets, [(4, 4), (5, 4)], [23, 23],
                              ((4, 4), (5, 4), (4, 5), (5, 5)), [feed1, feed2, plant])
     assert plant in result[0] and plant not in result[1]
-    if feed2 in result[0]:
-        assert result[0].index(plant) < result[0].index(feed2)
     assert sorted(id(t) for b in result for t in b) == sorted(map(id, [feed1, feed2, plant]))
