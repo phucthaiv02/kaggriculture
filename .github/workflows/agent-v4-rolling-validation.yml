@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: agent-v4-rolling-${{ github.sha }}
+  group: agent-v4-rolling-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -35,7 +35,7 @@ jobs:
           python -m pip install --upgrade kaggle-environments pytest numpy
       - name: Rolling execution regressions
         run: |
-          python -m pytest -q \
+          python -m pytest -q --maxfail=1 \
             tests/test_agents_intraday.py \
             tests/test_agents_scheduler.py \
             tests/test_agents_farm_tasks.py \
