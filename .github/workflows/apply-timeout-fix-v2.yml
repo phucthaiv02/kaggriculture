@@ -1,4 +1,4 @@
-name: Trace delayed turnover task rebuild
+name: Reproduce day26 turnover task
 
 on:
   push:
@@ -9,47 +9,28 @@ on:
 jobs:
   trace:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Trace build_tasks for delayed successor
+      - name: Reproduce pure task build
         run: |
           python -m pip install -q 'kaggle-environments==1.32.7'
           git fetch origin agent-v3
           git checkout --detach origin/agent-v3
           python - <<'PY'
-          import agents.expansion_agent as ea
-          from kaggle_environments import make
-          from experiments.crop_schedules import pass_agent
-          from experiments.play_match import configuration
-
-          trace=[]
-          original = ea.build_tasks
-          def traced(obs, targets, *args, **kwargs):
-              tasks = original(obs, targets, *args, **kwargs)
-              if obs['day'] == 26:
-                  pos=(5,0)
-                  tile=obs['farms'][obs['player']]['tiles'][0][5]
-                  matches=[t for t in tasks if t.position==pos]
-                  trace.append({
-                      'hour':int(obs['hour']),
-                      'seed':obs['private']['seeds'].get('CARROT'),
-                      'target':repr(targets.get(pos)),
-                      'pending':pos in obs.get('_pending_targets',()),
-                      'tile':repr(tile),
-                      'tasks':repr([(t.actions,dict(t.needs),t.mandatory,t.ends_cycle) for t in matches]),
-                  })
-              return tasks
-          ea.build_tasks = traced
-          agent=ea.make_agent(29, seed=1)
-          env=make('kaggriculture', configuration=configuration(1), debug=False)
-          env.run([agent, pass_agent])
-          print('STATUS', [s.status for s in env.state])
-          for row in trace:
-              print('TRACE',row)
+          import base64,gzip,json
+          from agents.farm_tasks import build_tasks
+          from agents.fertilizer import FertilizerPlan
+          PAYLOAD='H4sIACais2oC/+1cbY+iOhT+L/3s3lBeBPzmuOyMGUcm6sbc2UwIq3WHDIKL6O5c43+/bdVREVwQXSzTxBAoL33O09NzetpTFyBAY9vxHO+HOUeB/QP1nDECtapQAdMQTfCZWK2AiWu/oQDUcOnIDsZTUPu2AGPfQ2+gJmu6JP6D74SOi8gdfOvV8YagBvqG8RksK6mvH+vd3teOEVdUAbbnjG0XFzXMPqCQBmhoDW0MQcS1vznIHVozzwmnFOfA96ZoMAudOcKlIzRcocevhD59aWS7U4Sfs4ODshEKsDDOfyiw7LntuPZ3F3MSBjN8b4K8IWbLIu9Z331vhquTdwG36u0exjcIfMwe6PY69f6N0en8u8LshRvQEMP5ZYfosPp96OtnKPw9IcUKGNu/LdcZoenE9qx1e8najgDkYXy2pkk5wn3DNB/xtTdzXXp4riS3Y0TG/p1R70XFE8WM4sGIeFJm8aplUyXWAFMd2kF7a5pdI4JXO9TivwkXntRVpZy6LMTq8ieYqMqZ1QAqxfIqMmEe/mjYYqxGGmGUnKYcxgqjikKSMJ8gh3hmiGwbr3hG5YswWtWrqRhN7l3RfphKGJjTYsjxwhCSUoyXeCc7C8RDX9a9M4zHSD+Tix3TiFm9r3TonIrCy5gZ41b33FY3/ahWvkgAemRUq5xo+a/OZh1aAKFYC1AyvHE+oeA4V2IaMfcK3CuUAqKUE2LCtIEqJjotdZnZXxUB8pQBgPi3BwAc5seECVpm4974DNKc4N5GFyEuO50YlUrJt9rAyEwy1+WidTnVkg5MNXCEzM7lF9X5igh4S6zV+6r9x8X9q9Wkk2VPZiHTJ59XWRUkweKbXJHx5YvtDWkqhUIucaGCjwo90gcOyvE7M8/1B69Yup8zexhgUskHQJsYlzYxON0+IF92AjTdcEuN7jqNQ1cEVYhP44i0XKPe6Zj5gweYLnhIHvSWMr4RLxM6JHeAUrLIwDqMdJnsn3N2Fw6xdBCPjDpgTpyZIxMx+8TKhXzMaaaHXT/IgHnkfvCDsMgARJ7VUZiTyT39VWXcyTA77OE+5hxpBQpjiVD6FeHl3od7n8InVksZ4ih8Bugsaa48penyiNWr9qBxiLXDvPWrTmwqxIceTRG4JhegMOICTlinlhgbnPIc3cviVRnTB5UHVx89uCoC4hF/cF0zZxUO82yLXdXMG7ohY9bpCgBnTOTh6s1hcpi5YJawx4lskM9hFt/jGEjULYB8eEYducx/x4jnDCzY7218s8ele9sVreIzM3GqljApopAZkRx7EaSkvQjyzl6E6npHQnR3wrbktN0JUFjiokngzDEdoLYA0xfCyWLNbU2SK5sFSkJUz3yo90x6uqPG5PLBaJltembc3q5Kmq17etI3zRZdYflidHrNVvPJ6Kz2Ca12nBOLTCJdkoexWqqpCZjQKUKEknckUN8igYlIyGfXUEis6nhz5IV+4NDdFgusSjG/5yVp8eAVhaS6zStvO3Xrklzd1q7rirwFoKuaso9B1zX9HQUUIHmakqJrmrbhRdeld2qgIChahB5B0vQlbZkB2qVBgVsgkr6FoalRIrQtBmkNQFE31YuStKld2a8Z+zdcb+j/8kit7yo1ffEnVJ1u6vcGNV2PzaenutW9o/8icNP52m7cWd1HupLdbBhWo2PUHza39549uLv9pNGzGvUvBiBNsh40YoX1ZwFpzv8BEQrAS0hVAAA='
+          obs=json.loads(gzip.decompress(base64.b64decode(PAYLOAD)))
+          obs['_planning_end_day']=29
+          obs['_pending_targets']=set()
+          target=('CARROT',FertilizerPlan(((2,),)))
+          tasks=build_tasks(obs,{(5,0):target},include_physical=True)
+          for t in tasks:
+              if t.position==(5,0):
+                  print('TASK',t.actions,dict(t.needs),t.mandatory,t.ends_cycle)
           PY
