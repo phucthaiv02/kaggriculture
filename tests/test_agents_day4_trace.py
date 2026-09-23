@@ -26,6 +26,10 @@ def _tile_summary(tile):
     }
 
 
+def _compact_task(task):
+    return (task.position, tuple(tuple(op) for op in task.actions), task.mandatory)
+
+
 def test_all_opening_wheat_successors_finish_on_day_four():
     env = make("kaggriculture", configuration=configuration(1), debug=False)
     agent = make_agent(END_DAY, seed=1)
@@ -44,6 +48,7 @@ def test_all_opening_wheat_successors_finish_on_day_four():
     hand_target = None
     mandatory_hand_target = None
     trace = []
+    unassigned_trace = []
 
     for step in range(int(env.configuration.episodeSteps) - 1):
         obs = state[0].observation
@@ -78,6 +83,11 @@ def test_all_opening_wheat_successors_finish_on_day_four():
             }
 
         if obs.day == 4:
+            if planner_state["unassigned"]:
+                unassigned_trace.append((
+                    obs.hour,
+                    tuple(_compact_task(task) for task in planner_state["unassigned"]),
+                ))
             positions = [
                 tuple(obs.farms[0]["farmer"]),
                 *map(tuple, obs.farms[0]["hands"]),
@@ -91,16 +101,14 @@ def test_all_opening_wheat_successors_finish_on_day_four():
                     operation and operation[0] in ("HARVEST", "PLANT", "WATER", "DROP", "PICKUP")
                 ):
                     x, y = position
-                    trace.append({
-                        "hour": obs.hour,
-                        "worker": worker,
-                        "position": position,
-                        "operation": operation,
-                        "tile": _tile_summary(obs.farms[0]["tiles"][y][x]),
-                        "hands": len(obs.farms[0]["hands"]),
-                        "inventory": dict(obs["private"]["inventories"][worker]),
-                        "wheat_seeds": obs["private"]["seeds"].get("WHEAT", 0),
-                    })
+                    trace.append((
+                        obs.hour,
+                        worker,
+                        position,
+                        tuple(operation),
+                        tuple(sorted(obs["private"]["inventories"][worker].items())),
+                        _tile_summary(obs.farms[0]["tiles"][y][x]),
+                    ))
 
         state[0].action = action
         state[1].action = pass_agent(state[1].observation)
@@ -118,30 +126,21 @@ def test_all_opening_wheat_successors_finish_on_day_four():
                 and tile.get("planted_day") == 4
             }
             missing = scheduled_wheat - replanted
-            missing_trace = [
-                event for event in trace if event["position"] in missing
+            missing_trace = [event for event in trace if event[2] in missing]
+            missing_unassigned = [
+                (hour, tuple(task for task in tasks if task[0] in missing))
+                for hour, tasks in unassigned_trace
+                if any(task[0] in missing for task in tasks)
             ]
-            final_tiles = {
-                position: _tile_summary(
-                    next_obs.farms[0]["tiles"][position[1]][position[0]]
-                )
-                for position in sorted(scheduled_wheat)
-            }
-            assert len(replanted) >= len(scheduled_wheat) and not missing, {
-                "live_wheat_at_start": sorted(live_wheat_at_start),
-                "scheduled_wheat": sorted(scheduled_wheat),
-                "frozen_wheat": sorted(frozen_wheat),
-                "purchase_wheat": sorted(scheduled_wheat & purchase_positions),
-                "missing": sorted(missing),
-                "replanted": sorted(replanted),
-                "day_four_start_hands": day_four_start_hands,
-                "hand_target": hand_target,
-                "mandatory_hand_target": mandatory_hand_target,
-                "day_five_hands": len(next_obs.farms[0]["hands"]),
-                "missing_trace": missing_trace,
-                "all_trace": trace,
-                "final_tiles": final_tiles,
-            }
+            assert not missing, (
+                f"missing={sorted(missing)} replanted={sorted(replanted)} "
+                f"live_start={sorted(live_wheat_at_start)} "
+                f"frozen={sorted(frozen_wheat)} "
+                f"purchase={sorted(scheduled_wheat & purchase_positions)} "
+                f"hands={day_four_start_hands}/{hand_target}/{mandatory_hand_target} "
+                f"missing_unassigned={missing_unassigned} "
+                f"missing_trace={missing_trace}"
+            )
             return
 
     raise AssertionError("simulation never reached day 5 hour 0")
