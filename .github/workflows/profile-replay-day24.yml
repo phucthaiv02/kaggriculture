@@ -25,13 +25,14 @@ jobs:
           python - <<'PY'
           import base64, cProfile, gzip, io, json, pstats, time
           from agents import planner
+          import agents.expansion_agent as ea
           from agents.forecast import MarketForecast, _cached_production_snapshot
+          from agents.scheduler import MAX_HANDS, hands_needed
 
           PAYLOAD = 'H4sIAANus2oC/+1ca3OiOhj+L/nM7oSbgN+oy1anVhx1xzntdBhW0y1TBA+ge7qO//0keKNUu4gXiOaLA0HyPnny5sntDTMQoJHteI73y5yiwP6Fes4IgaqsfpUFkVcFDoQRGuMEpcKBsWu/oQBUIQee7WAUgurjDIx8D72BqlTRhMpX/CRyXESePHoT1+Vm4NXxhqAK2k291QMcGAQ+zg7064ZObnGWXoSG1tDGeQjY3G87QgFOiPw46dl2Q4Tf8r0QDSaRM0XWxFv+B1R5Drw5yB3iNCcK4/uR/Z/lOs8oHNuetcBekVQMGAUYmfMHkT/jq4XFL/w8AVHv9n50DIzK9pyR7eKkmtlfgBysMPJqyiZMo3smyAhFH0thfyzZGldg2VPbce2fLuY/Cib42Rh5Q1wzFnnP+ul7E2xOmu/JKb8npzBVPnE7p4K0i1NBnnOf1n2319H7N0an808aLA8PBCtsBfuF/wxrDpj8gX4K94UpJGDWTLOd9NFb0+waaS/dQsw5vZTPRatyZlpJ6yee+sSlxSqTEijFKsGqmW1+9nIRlUYPoUQfKIFZRHsrf+f1UQ1K283SPhIoI5V0a+d2Rg/VI3k7oxDuZFSib1xFwwwlM5PiuZmUaNLNv472unXDaKcavVTscE/cd6YqFotXoFdTWRdQXBdQxNA5/xwwbb1SoBfQj3eb6qYRSwzxxQoZ093CdFc9iex+BlPM1T0I5+4eRDKupQNo7lX3IrAymMeECZpm7c74BrJc/G2exmqAwaTRny/BqUs0hojp3LMeKFhLy+slBSyoXaYzF1Lrx+wfaXFmuhewS9/rPC2CoEg81KPESfj2xfaGJPIJX0481x+8Ygv/TuxhgMtF0kGLLMe0yIy22wfkBSdA4ap4kNC0DKZSVEGW3gVT7WKwpnc65vFX1feezl2CNx6n8+ULolI8sMp3UKkIx6OSQbw4iEfczIWHb+buPQQtpHEzLadFyzNuNuerbmpZFE4jQMceQlKypH1+mNTEPOebiVHQhZ9I0ncHvVCnQ1k2s+XyBLhkwquVCO+FdEWlakhsdzXf7up7je8bxjeQM0SPBYucHrFS6jDIbYhVprtXPL4+v6jJp1+HOOnEdMc6xIncMmtfS1nIc65wTJGy8NGy41Uo8weFzWiufUZTBMR8EY5lOqx1fTDhUWFmOu/OU6ZOJQB8pPgp5t5MLBibmWCyFsdgXi9MCmK12WcBCoyqZG58ZScjKNg6v9xzGxREIhQSy1NwnDVOGQfOFBcJVGcgfCHlmi35qfIyt1oAJ4Xtmfd6z4wvE65I9j7ujabZWrihcXuLqSRpjeZdfKi+b5rN+KXvRqfXaDYejM7iDMniSDN5QuarcbbxjhUJ/wYhQqRgaywwCxRxDUXFWTjeFHmRHzhx2Phs/jQnFRS8oojku3r6ljCiyYq4saNpUNqY0tSK+t6apgmJskNeVpbF11QNrgjQNJLlggMeQllL8QBFWZvHlTBAyfJKlQ0QSdjAIN8eTYLgNX6NQVraJ0AW1gUor42/Nyyoc2w28n97xOjad8IXfxz7zY1+Z8RC0248POhWtx4fR7/p/GjV6la3He+JdO9Ns1dvGKun6fu20bNq+nfjw4vJO1Iry1M+2Dv9Cfmm6vx/ft1zuoxVAAA='
           obs = json.loads(gzip.decompress(base64.b64decode(PAYLOAD)))
           farm = obs['farms'][obs['player']]
           active, targets = [], {}
-          physical = empty = 0
           for y, row in enumerate(farm['tiles']):
               for x, tile in enumerate(row):
                   if tile == 'LOCKED':
@@ -42,52 +43,55 @@ jobs:
                       name = tile.get('animal') or (tile.get('crop') if tile.get('kind') == 'PLANT' else None)
                       if name:
                           targets[pos] = (name, False)
-                          physical += 1
-                      elif tile.get('kind') not in ('COOP', 'PASTURE'):
-                          empty += 1
-                  elif tile is None:
-                      empty += 1
 
-          original_mv = MarketForecast.marginal_value
-          mv_calls = 0
-          mv_seconds = 0.0
-          def timed_mv(self, *args, **kwargs):
-              global mv_calls, mv_seconds
-              t0 = time.perf_counter()
-              try:
-                  return original_mv(self, *args, **kwargs)
-              finally:
-                  mv_calls += 1
-                  mv_seconds += time.perf_counter() - t0
-          MarketForecast.marginal_value = timed_mv
+          _cached_production_snapshot.cache_clear()
+          t0 = time.perf_counter()
+          pending = planner.plan_targets(
+              obs, targets, active, 29,
+              max_positions=10,
+              replan_positions=set(active),
+          )
+          print(f'plan_targets={time.perf_counter()-t0:.6f}s pending={len(pending)} targets={sum(v is not None for v in targets.values())}')
 
-          def run(max_positions, prof=False):
-              global mv_calls, mv_seconds
-              local_targets = dict(targets)
-              mv_calls = 0
-              mv_seconds = 0.0
-              _cached_production_snapshot.cache_clear()
+          # Approximate the morning admission state conservatively: include all
+          # physical producers plus every choice just made for an empty tile.
+          daily_targets = {p: t for p, t in targets.items() if t is not None}
+          t0 = time.perf_counter()
+          tasks = ea.build_tasks(
+              obs, daily_targets,
+              assume_crop_seeds=True,
+              assume_animal_inputs=True,
+              prioritize_fertilizer_drop=False,
+          )
+          build_time = time.perf_counter() - t0
+          mandatory = [task for task in tasks if task.mandatory is not False]
+          optional = [task for task in tasks if task.mandatory is False]
+          print(f'build_tasks={build_time:.6f}s tasks={len(tasks)} mandatory={len(mandatory)} optional={len(optional)} actions={sum(len(t.actions) for t in tasks)}')
+
+          starts = tuple(map(tuple, farm['hands']))
+          shed = ea._open_shed_access(farm)
+          marginal = [
+              ea._hire_costs(farm, n + 1) - ea._hire_costs(farm, n)
+              for n in range(MAX_HANDS - len(farm['hands']))
+          ]
+
+          def profile_hands(label, work, costs):
               p = cProfile.Profile()
               t0 = time.perf_counter()
-              if prof:
-                  p.enable()
-              pending = planner.plan_targets(
-                  obs, local_targets, active, 29,
-                  max_positions=max_positions,
-                  replan_positions=set(active),
+              p.enable()
+              result = hands_needed(
+                  work, tuple(farm['farmer']), starts, shed,
+                  marginal_hire_costs=costs,
               )
-              if prof:
-                  p.disable()
+              p.disable()
               elapsed = time.perf_counter() - t0
-              print(f'RUN max_positions={max_positions} elapsed={elapsed:.6f}s mv_calls={mv_calls} mv_seconds={mv_seconds:.6f}s pending={len(pending)} cache={_cached_production_snapshot.cache_info()}')
-              if prof:
-                  s = io.StringIO()
-                  pstats.Stats(p, stream=s).strip_dirs().sort_stats('cumtime').print_stats(45)
-                  print(s.getvalue())
-              return elapsed
+              print(f'{label}={elapsed:.6f}s hand_target={result[0]} rejected={len(result[1])}')
+              s = io.StringIO()
+              pstats.Stats(p, stream=s).strip_dirs().sort_stats('cumtime').print_stats(35)
+              print(s.getvalue())
+              return result
 
-          print(f"OBS day={obs['day']} hour={obs['hour']} active={len(active)} physical={physical} empty={empty}")
-          run(0)
-          run(1)
-          run(10, prof=True)
+          hand_target, rejected = profile_hands('hands_needed_all', tasks, marginal)
+          if len(mandatory) != len(tasks):
+              profile_hands('hands_needed_mandatory', mandatory, None)
           PY
