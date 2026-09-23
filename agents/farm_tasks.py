@@ -21,7 +21,7 @@ from kaggle_environments.envs.kaggriculture.kaggriculture import CROPS as ENV_CR
 from kaggle_environments.envs.kaggriculture.kaggriculture import market_price
 
 from agents.schedules import (
-    ONGOING_CROPS, cycle_finished, is_maintenance_day, should_care_animal,
+    ONGOING_CROPS, cycle_turns_over_today, is_maintenance_day, should_care_animal,
     should_feed_animal, should_fertilize_today, animal_feed_end_age, should_harvest_animal,
 )
 
@@ -94,7 +94,7 @@ def executable_targets(obs, targets):
             continue
         if isinstance(tile, dict) and tile.get("kind") == "PLANT":
             crop = tile["crop"]
-            if not cycle_finished(crop, obs["day"] - tile["planted_day"], tile):
+            if not cycle_turns_over_today(crop, obs["day"] - tile["planted_day"], tile):
                 target = targets[position]
                 if not target or target[0] != crop:
                     result[position] = (crop, tile.get("fertilized_until_day", -1) >= tile["planted_day"])
@@ -195,14 +195,35 @@ def build_tasks(
             tile = farm["tiles"][y][x]
             if isinstance(tile, dict) and tile.get("kind") == "PLANT":
                 crop = tile["crop"]
+                age = day - tile["planted_day"]
+                turns_over = cycle_turns_over_today(crop, age, tile)
                 if tile.get("yield_units", 0) > 0:
-                    actions = [] if tile.get("watered_today") else [["WATER"]]
-                    tasks.append(Task(position, actions + [["HARVEST"]], urgent=True,
-                                      sells=Counter({crop: tile["yield_units"]}), mandatory=True))
+                    if crop in ONGOING_CROPS:
+                        scheduled_water = is_maintenance_day(
+                            crop, age,
+                            tile.get("fertilized_until_day", -1) >= day,
+                            None if prioritize_fertilizer_drop else position,
+                            tile["planted_day"],
+                        )
+                        need_water = (
+                            not tile.get("watered_today")
+                            and (scheduled_water or tile.get("consecutive_unwatered", 0) >= 1)
+                        )
+                    else:
+                        # Preserve the historical one-time-crop cashout bonus.
+                        need_water = not tile.get("watered_today")
+                    actions = [["WATER"]] if need_water else []
+                    actions.append(["HARVEST"])
+                    if turns_over:
+                        actions.append(["DIG"])
+                    tasks.append(Task(
+                        position, actions, urgent=True, ends_cycle=turns_over,
+                        sells=Counter({crop: tile["yield_units"]}), mandatory=True,
+                    ))
+                elif turns_over:
+                    tasks.append(Task(position, [["DIG"]], ends_cycle=True))
                 elif tile.get("consecutive_unwatered", 0) >= 1 and not tile.get("watered_today"):
                     tasks.append(Task(position, [["WATER"]], urgent=True))
-                elif cycle_finished(crop, day - tile["planted_day"], tile):
-                    tasks.append(Task(position, [["DIG"]], ends_cycle=True))
             continue
         name, fertilize_commit = target
         x, y = position
@@ -281,8 +302,11 @@ def build_tasks(
                     fertilizer_left -= 1
                 needs["FERTILIZER"] += 1
                 actions.append(["FERTILIZE"])
-            if (is_maintenance_day(crop, age, fertilize_commit)
-                    or tile.get("consecutive_unwatered", 0) >= 1) and not tile.get("watered_today"):
+            if (is_maintenance_day(
+                    crop, age, fertilize_commit,
+                    None if prioritize_fertilizer_drop else position,
+                    tile["planted_day"],
+                ) or tile.get("consecutive_unwatered", 0) >= 1) and not tile.get("watered_today"):
                 actions.append(["WATER"])
                 # Every scheduled WATER is protective work. Waiting until a
                 # crop has already missed once leaves no scheduling margin:
@@ -294,7 +318,12 @@ def build_tasks(
                 # maintenance day; harvesting that cached yield without
                 # WATER is legal in the engine but violates the opening
                 # policy and gives up today's growth opportunity.
-                if not tile.get("watered_today") and ["WATER"] not in actions:
+                # Opening keeps its historical water-before-harvest rule.
+                # Post-opening, equivalent spatial WATER profiles decide the
+                # protective day; harvesting cached output alone must not
+                # synchronize every ongoing crop back onto the same day.
+                if (prioritize_fertilizer_drop and not tile.get("watered_today")
+                        and ["WATER"] not in actions):
                     actions.append(["WATER"])
                 actions.append(["HARVEST"])
                 sells[crop] += tile["yield_units"]
@@ -310,7 +339,7 @@ def build_tasks(
             early_exit = (
                 crop not in ONGOING_CROPS and name != crop and tile.get("yield_units", 0) > 0
             )
-            if cycle_finished(crop, age, tile) or early_exit:
+            if cycle_turns_over_today(crop, age, tile) or early_exit:
                 ends_cycle = True
                 if crop not in ONGOING_CROPS:
                     if not tile.get("watered_today") and ["WATER"] not in actions:
@@ -535,7 +564,7 @@ def _animal_and_seed_demand(
             # conservative next-day feed reserve. Without counting it, Day 4
             # spends the last $60 buying redundant feed and leaves one of the
             # seven replacement seeds unfunded until after its PLANT action.
-            finished_today = cycle_finished("WHEAT", age, tile)
+            finished_today = cycle_turns_over_today("WHEAT", age, tile)
             if exits_early or finished_today:
                 wheat_incoming += tile.get("yield_units", 0)
         if name in CROPS:
@@ -545,7 +574,7 @@ def _animal_and_seed_demand(
                 seed_demand[name] += 1
             else:
                 crop, age = tile["crop"], day - tile["planted_day"]
-                if cycle_finished(crop, age, tile) and (
+                if cycle_turns_over_today(crop, age, tile) and (
                     replant_same_crop or name != crop
                 ):
                     seed_demand[name] += 1
