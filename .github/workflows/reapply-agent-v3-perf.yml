@@ -1,0 +1,34 @@
+name: Reapply agent-v3 performance patch
+
+on:
+  push:
+    branches: [agent-v3-perf-reapply]
+    paths:
+      - .github/workflows/reapply-agent-v3-perf.yml
+
+permissions:
+  contents: write
+
+jobs:
+  reapply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Reapply perf commit on current agent-v3
+        run: |
+          git fetch origin agent-v3
+          git checkout -B perf-on-current origin/agent-v3
+          test "$(git rev-parse HEAD)" = "18afbef9879438ecf5bf475fd25fc49e5d389bb6"
+          git fetch origin 73d0d2276ce418c8cb68a3ca5c988620dc128a63
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git cherry-pick 73d0d2276ce418c8cb68a3ca5c988620dc128a63
+          python -m py_compile agents/scheduler.py agents/expansion_agent.py agents/planner.py agents/forecast.py
+          git diff --check HEAD^ HEAD
+          git push --force-with-lease=agent-v3:18afbef9879438ecf5bf475fd25fc49e5d389bb6 origin HEAD:agent-v3
