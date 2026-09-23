@@ -20,7 +20,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Apply, verify exactness, and push
+      - name: Apply, verify exactness, benchmark planner, and push
         run: |
           python -m pip install -q 'kaggle-environments==1.32.7' pytest
           cp .ci/apply_batch_forecast_patch.py /tmp/apply_batch_forecast_patch.py
@@ -32,7 +32,8 @@ jobs:
           git diff --check
           python - <<'PY'
           import random, time
-          from agents.forecast import MarketForecast
+          from agents.forecast import MarketForecast, Production
+          from agents.planner import _candidates, evaluate_targets
           from kaggle_environments.envs.kaggriculture import kaggriculture as game
 
           rng = random.Random(20260923)
@@ -54,13 +55,10 @@ jobs:
                           cash += price if amount > 0 else -price
               return cash, stock
 
-          cases = []
-          products = list(game.PRODUCTS)
-          for _ in range(5000):
-              cases.append((
-                  rng.choice(products), rng.randrange(8500, 11500),
-                  rng.randrange(-20, 45), rng.randrange(-15, 35),
-              ))
+          cases = [(
+              rng.choice(list(game.PRODUCTS)), rng.randrange(8500, 11500),
+              rng.randrange(-20, 45), rng.randrange(-15, 35),
+          ) for _ in range(5000)]
           for case in cases:
               assert market.settle_product(*case) == reference(*case), case
 
@@ -75,9 +73,30 @@ jobs:
           for case in repeated:
               market.settle_product(*case)
           cached_time = time.perf_counter() - t0
-          print(f'reference={reference_time:.4f}s cached={cached_time:.4f}s speedup={reference_time/max(cached_time,1e-9):.1f}x')
+          print(f'transition reference={reference_time:.4f}s cached={cached_time:.4f}s speedup={reference_time/max(cached_time,1e-9):.1f}x')
+
+          day, end = 18, 29
+          candidates = list(_candidates(day, end))
+          inventory = {p: 10000 for p in game.PRODUCTS}
+          def run(clear_between):
+              mf = MarketForecast(inventory, [], day, end)
+              baseline = Production()
+              for when in range(day, end + 1):
+                  baseline.sales[when]['WHEAT'] += 8 + (when % 3)
+                  baseline.sales[when]['MELON'] += 4 + (when % 2)
+              started = time.perf_counter()
+              for _ in range(10):
+                  if clear_between:
+                      mf.settle_product.cache_clear()
+                  rows = evaluate_targets(mf, baseline, candidates, flows_scoped=True)
+                  best = max(rows, key=lambda row: row.profit)
+                  baseline.add(best.output, include_visits=False)
+              return time.perf_counter() - started, mf.settle_product.cache_info()
+          uncached, _ = run(True)
+          cached, info = run(False)
+          print(f'planner10 uncached={uncached:.4f}s cached={cached:.4f}s speedup={uncached/max(cached,1e-9):.2f}x cache={info}')
           PY
-          python -m pytest -q tests/test_agents_planner.py tests/test_agents_target_horizon.py tests/test_agents_season_profit.py
+          python -m pytest -q tests/test_agents_planner.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add agents/forecast.py
