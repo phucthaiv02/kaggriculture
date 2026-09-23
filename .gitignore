@@ -44,8 +44,5 @@ Thumbs.db
 
 # Project-generated simulation and analysis artifacts
 replays/
-shop_price_monte_carlo.html
-experiments/hands_capacity_by_producer.png
-experiments/hands_breakeven_by_producer.png
-experiments/hands_net_by_producer.png
-experiments/hands_net_by_producer.csv
+leaderboard/
+public/

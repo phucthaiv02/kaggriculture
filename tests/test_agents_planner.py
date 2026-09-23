@@ -4,7 +4,7 @@ from collections import Counter
 
 from kaggle_environments.envs.kaggriculture.kaggriculture import MARKET_I0, PRODUCTS, market_price
 
-from agents.planner import _expected_price, best_target, plan_targets, should_buy_land
+from agents.planner import best_target, plan_targets
 
 BASE_INVENTORY = {p: MARKET_I0 for p in PRODUCTS}
 
@@ -27,19 +27,6 @@ def make_obs(day, tiles=(), unlocked_quadrants=("NW",), inventory=None):
         "town": {"unlocked_shops": []},
         "private": {"shed": {}, "seeds": {}, "inventories": [{}]},
     }
-
-
-def test_expected_price_matches_engine_at_zero_commitment():
-    for product in PRODUCTS:
-        assert _expected_price(product, BASE_INVENTORY, {}) == market_price(product, MARKET_I0)
-
-
-def test_expected_price_drops_as_committed_units_pile_up():
-    """Selling more of the same product must never look more profitable than
-    selling less of it -- the whole point of pricing the marginal unit."""
-    light = _expected_price("MELON", BASE_INVENTORY, {"MELON": 12})
-    heavy = _expected_price("MELON", BASE_INVENTORY, {"MELON": 120})
-    assert heavy <= light
 
 
 def test_best_target_none_when_nothing_fits_the_remaining_days():
@@ -84,6 +71,64 @@ def test_unprofitable_candidates_are_rejected():
     assert choice is None
 
 
+def test_choose_keeps_current_target_inside_switch_margin(monkeypatch):
+    import agents.planner as planner
+    from agents.forecast import Production
+
+    best = planner.TargetProfit(("WHEAT", False), Production(), 110.0, 10.0)
+    current = planner.TargetProfit(("CORN", False), Production(), 109.5, 10.0)
+    monkeypatch.setattr(planner, "evaluate_targets", lambda *args, **kwargs: [best, current])
+
+    choice, _ = planner._choose(None, None, None, Counter(), current=current.choice)
+    assert choice == current.choice
+
+
+def test_choose_switches_when_current_target_loses_by_more_than_margin(monkeypatch):
+    import agents.planner as planner
+    from agents.forecast import Production
+
+    best = planner.TargetProfit(("WHEAT", False), Production(), 110.0, 10.0)
+    current = planner.TargetProfit(("CORN", False), Production(), 108.9, 10.0)
+    monkeypatch.setattr(planner, "evaluate_targets", lambda *args, **kwargs: [best, current])
+
+    choice, _ = planner._choose(None, None, None, Counter(), current=current.choice)
+    assert choice == best.choice
+
+
+def test_choose_without_current_preserves_o1_best_choice(monkeypatch):
+    import agents.planner as planner
+    from agents.forecast import Production
+
+    best = planner.TargetProfit(("WHEAT", False), Production(), 110.0, 10.0)
+    runner_up = planner.TargetProfit(("CORN", False), Production(), 109.5, 10.0)
+    monkeypatch.setattr(planner, "evaluate_targets", lambda *args, **kwargs: [runner_up, best])
+
+    choice, _ = planner._choose(None, None, None, Counter())
+    assert choice == best.choice
+
+
+def test_choose_logs_candidate_scores_and_switch_reason(monkeypatch):
+    import agents.planner as planner
+    from agents.forecast import Production
+
+    best = planner.TargetProfit(("WHEAT", False), Production(), 110.0, 10.0)
+    current = planner.TargetProfit(("CORN", False), Production(), 109.5, 10.0)
+    monkeypatch.setattr(planner, "evaluate_targets", lambda *args, **kwargs: [best, current])
+    market = type("Market", (), {"day": 3, "hour": 0})()
+    decisions = []
+
+    choice, _ = planner._choose(
+        market, None, None, Counter(), position=(2, 4),
+        current=current.choice, decision_log=decisions,
+    )
+
+    assert choice == current.choice
+    assert decisions[0]["position"] == [2, 4]
+    assert decisions[0]["reason"] == "retained_current_within_switch_margin"
+    assert [row["score"] for row in decisions[0]["candidates"]] == [100.0, 99.5]
+    assert [row["selected"] for row in decisions[0]["candidates"]] == [False, True]
+
+
 def test_plan_targets_diversifies_across_many_tiles_in_one_pass():
     """Regression test for the concentration bug found via full-pipeline
     testing: a whole freshly-claimed quadrant (or a fresh 25-tile board)
@@ -112,46 +157,31 @@ def test_plan_targets_does_not_touch_a_tile_mid_growth():
     assert targets[(0, 0)] == ("WHEAT", False)
 
 
+def test_same_day_turnover_is_not_limited_by_target_batch():
+    positions = [(x, y) for y in range(3) for x in range(4)]
+    tiles = {
+        position: {
+            "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+            "yield_units": 4, "watered_today": True,
+        }
+        for position in positions
+    }
+    obs = make_obs(day=4, tiles=tiles)
+    targets = {position: ("WHEAT", False) for position in positions}
+    pending = plan_targets(
+        obs, targets, positions, end_day=20,
+        max_positions=10, replan_positions=set(positions),
+    )
+    assert pending == []
+    assert all(position in targets for position in positions)
+
+
 def test_plan_targets_replans_a_finished_tile():
     tile = {"kind": "PLANT", "crop": "WHEAT", "planted_day": 0, "yield_units": 6, "watered_today": True}
     obs = make_obs(day=4, tiles={(0, 0): tile})
     targets = {(0, 0): ("WHEAT", False)}
     plan_targets(obs, targets, [(0, 0)], end_day=30)
     assert targets[(0, 0)] is not None  # some choice was (re-)made, not left stale by construction
-
-
-def test_should_buy_land_false_below_utilization_threshold():
-    positions = [(x, y) for y in range(5) for x in range(5)]
-    tiles = {positions[i]: {"kind": "PLANT", "crop": "WHEAT"} for i in range(10)}  # 10/25 = 40%
-    farm = {"unlocked_quadrants": ["NW"], "tiles": [[None] * 10 for _ in range(10)]}
-    for (x, y), tile in tiles.items():
-        farm["tiles"][y][x] = tile
-    assert should_buy_land(farm, positions) is False
-
-
-def test_should_buy_land_true_at_or_above_threshold():
-    positions = [(x, y) for y in range(5) for x in range(5)]
-    tiles = {positions[i]: {"kind": "PLANT", "crop": "WHEAT"} for i in range(19)}  # 19/25 = 76%
-    farm = {"unlocked_quadrants": ["NW"], "tiles": [[None] * 10 for _ in range(10)]}
-    for (x, y), tile in tiles.items():
-        farm["tiles"][y][x] = tile
-    assert should_buy_land(farm, positions) is True
-
-
-def test_should_buy_land_false_once_all_quadrants_owned():
-    positions = [(x, y) for y in range(5) for x in range(5)]
-    farm = {"unlocked_quadrants": ["NW", "NE", "SW", "SE"], "tiles": [[None] * 10 for _ in range(10)]}
-    for x, y in positions:
-        farm["tiles"][y][x] = {"kind": "PLANT", "crop": "WHEAT"}
-    assert should_buy_land(farm, positions) is False
-
-
-def test_should_buy_land_ignores_a_target_decision_with_nothing_actually_planted():
-    """Regression test: a target dict fully populated on day 0 (before a
-    single seed is in the ground) must not look like 100% utilization."""
-    positions = [(x, y) for y in range(5) for x in range(5)]
-    farm = {"unlocked_quadrants": ["NW"], "tiles": [[None] * 10 for _ in range(10)]}
-    assert should_buy_land(farm, positions) is False
 
 
 def test_finished_wheat_has_no_fallback_when_no_profitable_cycle_fits():
@@ -181,3 +211,51 @@ def test_empty_animal_structures_only_get_compatible_targets():
         targets = {(0, 0): ("WHEAT", False)}
         plan_targets(obs, targets, [(0, 0)], end_day=29)
         assert targets[(0, 0)] is None or targets[(0, 0)][0] in names
+
+
+def test_batched_planning_finishes_75_tiles_without_repricing_completed_batches(monkeypatch):
+    import agents.planner as planner
+
+    positions = [(x, y) for y in range(10) for x in range(10) if y < 5 or x < 5]
+    obs = make_obs(day=10, unlocked_quadrants=("NW", "NE", "SW"))
+    targets, visited = {}, []
+    choose = planner._choose
+
+    def record(*args, **kwargs):
+        visited.append(kwargs.get("position", args[-1] if args else None))
+        return choose(*args, **kwargs)
+
+    monkeypatch.setattr(planner, "_choose", record)
+    pending = positions
+    while pending:
+        before = dict(targets)
+        count = len(visited)
+        pending = plan_targets(obs, targets, positions, 29, max_positions=4, replan_positions=set(pending))
+        assert 1 <= len(visited) - count <= 4
+        assert all(targets[p] == choice for p, choice in before.items())
+    assert len(visited) == len(set(visited)) == 75
+    assert set(targets) == set(positions)
+
+
+def test_uncommitted_empty_target_is_not_forecast_as_future_supply(monkeypatch):
+    import agents.planner as planner
+    from agents.forecast import Production
+
+    obs = make_obs(day=7)
+    obs['_committed_targets'] = set()
+    targets = {(0, 0): ('WHEAT', False), (1, 0): None}
+    seen = []
+
+    def capture(_market, baseline, _candidates, counts, _labor=None, _position=(4, 4), **kwargs):
+        seen.append((Counter(counts), sum(baseline.sales.values(), Counter())))
+        return None, Production()
+
+    monkeypatch.setattr(planner, '_choose', capture)
+    plan_targets(obs, targets, [(0, 0), (1, 0)], 29,
+                 replan_positions={(1, 0)})
+    assert seen[0][0]['WHEAT'] == 0
+
+    obs['_committed_targets'] = {(0, 0)}
+    plan_targets(obs, targets, [(0, 0), (1, 0)], 29,
+                 replan_positions={(1, 0)})
+    assert seen[1][0]['WHEAT'] == 1

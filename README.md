@@ -6,16 +6,12 @@ Strategy agents, experiments, and regression tests for Kaggle's
 The production agent manages crops, animals, labor, land expansion, and market
 orders to maximize end-of-season cash.
 
-New PLACE/PLANT targets maximize net profit over a shared window of
-`min(16, end_day - day)` elapsed days, including harvests on the final day.
-Candidates whose first yield falls beyond this window are excluded. Only
-scheduled harvests within the window contribute revenue. Crops are replanted
-when at least one subsequent scheduled harvest fits, with every seed charged.
-Profit includes purchase, feed, fertilizer,
-additional labor, and market price impact, without profit-per-day normalization.
+See [`RULES.md`](RULES.md) for the agent flow, strategy, scheduling invariants,
+and rules for changing the code.
 
 ## Repository layout
 
+- `RULES.md` — current agent flow, strategy, and maintenance rules.
 - `agents/` — production planning, scheduling, forecasting, labor, selling,
   and farm-task logic.
 - `experiments/` — executable checks and analysis scripts for strategy and
@@ -76,15 +72,68 @@ python -m experiments.play_match --opponent path/to/notebook.ipynb
 The production agent always runs as player 0. Match outputs are written under
 `replays/` by default.
 
-Generate an offline sales/cashflow analysis from a replay JSON:
+Create a round-robin HTML leaderboard. Every pair plays once using the same
+randomly generated seed:
+
+```bash
+python -m experiments.agent_leaderboard
+```
+
+Matches run concurrently in four isolated processes by default. Process
+isolation is required because the game runner captures global stdout/stderr and
+is not thread-safe. Adjust concurrency based
+on available CPU and memory with `--workers 8`, or use `--workers 1` for
+sequential execution.
+
+The experiment automatically loads every `.py` and `.ipynb` file directly under
+`public/`; each agent is named after its filename without the extension. The
+production agent from `agents/` is also included as `current`. Use `--public-dir`
+to scan a different directory. Each invocation starts a run with a new random
+seed and records its seed, roster, status, and match results in
+`leaderboard/run.json`. If a run is interrupted, the next invocation resumes
+that run with its original seed; a new seed is generated only after it completes.
+Results are cached by agent content, engine configuration, and seed under
+`leaderboard/cache/`, and the HTML standings aggregate all completed runs. When
+a new public agent is added during an interrupted run, only its missing matches
+are played. Pass `--rerun-current` to replay matches involving `current`, or
+`--force` to replay every pair in the active run.
+
+Compare scheduling while freezing the baseline target trace and successful
+PLANT/PLACE/BUILD/DIG dates (save a copy of `agents/*.py` before editing):
+
+```bash
+python -m experiments.scheduler_comparison path/to/baseline/replay.json \
+  --baseline-source path/to/saved_agents --output replays/scheduler_comparison/new
+python -m experiments.benchmark_agent --opponent self --timeout 0.75
+```
+
+Keep the original `result.json` beside the baseline replay: it contains the
+seed that the engine may omit from the replay configuration. The comparison
+reports calendar mismatches and latency, and saves JSON and HTML replays.
+Its `--baseline` option uses the original greedy packing algorithm with the
+current buyer/seller, for a scheduling-only control. Routing is a bounded
+heuristic; a passing comparison is not a proof of a global optimum.
+
+Generate two offline comparison reports from a replay JSON:
 
 ```bash
 python -m experiments.sales_report replays/current_vs_pass_seed1.json
 ```
 
-This writes `<replay>.sales.html` plus `<replay>.sales.json`, comparing both
-players' executed `SELL` volume, average sale prices, daily cash, and actual
-market costs.
+This writes three files next to the replay:
+
+- `sales_analysis.html`: executed sales, average prices, daily cash, and market costs.
+- `operations_analysis.html`: daily successful hires, crop deaths that become weeds,
+  disappearing animals, productive tile counts, and worker actions for both players.
+  MOVE groups the four directions; action counts distinguish attempts from state changes.
+  Productive tiles contain a crop or animal; empty structures and unlocked land are
+  listed separately. Random weeds after harvesting or digging do not count as crop deaths.
+- `sales_analysis.json`: all financial and operations data, including loss events
+  with player, day, step, tile, producer, and cause.
+
+Both HTML files embed their charts and work offline. Day indices start at 0;
+end-of-day losses belong to the day just completed. A partial final day is labeled.
+With `--output path/custom.html`, the second HTML is `path/custom.operations.html`.
 
 Validate the crop and animal maintenance schedules:
 
