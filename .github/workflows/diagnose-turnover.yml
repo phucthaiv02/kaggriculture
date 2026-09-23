@@ -23,7 +23,7 @@ jobs:
           git fetch origin agent-v3
           git checkout --detach origin/agent-v3
           python - <<'PY'
-          from collections import Counter, defaultdict
+          from collections import Counter
           from kaggle_environments import make
           from agents.expansion_agent import make_agent
           from experiments.crop_schedules import pass_agent
@@ -39,22 +39,25 @@ jobs:
               env.run([make_agent(29, seed=seed), pass_agent])
               print('SEED', seed, 'STATUS', [s.status for s in env.state], 'REWARD', [s.reward for s in env.state])
               hist=[]
-              for step_idx, step in enumerate(env.steps):
-                  ob=step[0]['observation']
-                  hist.append((step_idx,int(ob['day']),int(ob['hour']),ob['farms'][0]['tiles'],step[0].get('action')))
+              for step_idx, replay_step in enumerate(env.steps):
+                  ob=replay_step[0]['observation']
+                  hist.append((step_idx,int(ob['day']),int(ob['hour']),ob['farms'][0]['tiles'],replay_step[0].get('action')))
 
               turnover=[]
               weeds=[]
               water=Counter()
               plant=Counter()
               for i in range(1,len(hist)):
-                  step,day,hour,tiles,action=hist[i]
-                  _,pday,phour,prev,_=hist[i-1]
+                  step_idx,day,hour,tiles,action=hist[i]
+                  _,_,_,prev,_=hist[i-1]
                   if isinstance(action, dict):
-                      for ops in [action.get('farmer',[]), *action.get('hands',[])]:
-                          for op in ops:
-                              if op and op[0]=='WATER': water[day]+=1
-                              if op and op[0]=='PLANT': plant[day]+=1
+                      ops=[]
+                      if action.get('farmer'):
+                          ops.append(action['farmer'])
+                      ops.extend(action.get('hands') or [])
+                      for op in ops:
+                          if op and op[0]=='WATER': water[day]+=1
+                          if op and op[0]=='PLANT': plant[day]+=1
                   for y in range(10):
                       for x in range(10):
                           a,b=prev[y][x],tiles[y][x]
@@ -63,7 +66,7 @@ jobs:
                               for j in range(i+1,min(len(hist),i+50)):
                                   nn=name(hist[j][3][y][x])
                                   if nn:
-                                      successor=(hist[j][0]-step, nn, hist[j][1], hist[j][2])
+                                      successor=(hist[j][0]-step_idx, nn, hist[j][1], hist[j][2])
                                       break
                               turnover.append((day,hour,(x,y),a.get('crop'),successor))
                           if isinstance(a,dict) and a.get('kind')=='PLANT' and isinstance(b,dict) and b.get('kind')=='WEED':
