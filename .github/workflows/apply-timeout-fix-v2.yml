@@ -1,4 +1,4 @@
-name: Apply production forecast cache
+name: Profile replay day24 planner
 
 on:
   push:
@@ -6,13 +6,10 @@ on:
     paths:
       - .github/workflows/apply-timeout-fix-v2.yml
 
-permissions:
-  contents: write
-
 jobs:
-  apply:
+  profile:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,86 +17,76 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Apply, verify exactness, benchmark forecast, and push
+      - name: Profile actual replay observation
         run: |
-          python -m pip install -q 'kaggle-environments==1.32.7' pytest
-          cp .ci/apply_production_forecast_cache.py /tmp/apply_production_forecast_cache.py
+          python -m pip install -q 'kaggle-environments==1.32.7'
           git fetch origin agent-v3
-          EXPECTED=$(git rev-parse origin/agent-v3)
-          git checkout -B timeout-v2 origin/agent-v3
-          python /tmp/apply_production_forecast_cache.py
-          python -m py_compile agents/forecast.py agents/planner.py
-          git diff --check
+          git checkout --detach origin/agent-v3
           python - <<'PY'
-          import time
-          import agents.planner as planner
-          from agents.forecast import production, _simulate_production, _cached_production_snapshot
-          from kaggle_environments.envs.kaggriculture import kaggriculture as game
+          import base64, cProfile, gzip, io, json, pstats, time
+          from agents import planner
+          from agents.forecast import MarketForecast, _cached_production_snapshot
 
-          def signature(flow):
-              return (
-                  tuple((d, tuple(sorted(v.items()))) for d, v in sorted(flow.sales.items())),
-                  tuple((d, tuple(sorted(v.items()))) for d, v in sorted(flow.inputs.items())),
-                  tuple((d, tuple(v)) for d, v in sorted(flow.visits.items())),
-              )
+          PAYLOAD = 'H4sIAANus2oC/+1ca3OiOhj+L/nM7oSbgN+oy1anVhx1xzntdBhW0y1TBA+ge7qO//0keKNUu4gXiOaLA0HyPnny5sntDTMQoJHteI73y5yiwP6Fes4IgaqsfpUFkVcFDoQRGuMEpcKBsWu/oQBUIQee7WAUgurjDIx8D72BqlTRhMpX/CRyXESePHoT1+Vm4NXxhqAK2k291QMcGAQ+zg7064ZObnGWXoSG1tDGeQjY3G87QgFOiPw46dl2Q4Tf8r0QDSaRM0XWxFv+B1R5Drw5yB3iNCcK4/uR/Z/lOs8oHNuetcBekVQMGAUYmfMHkT/jq4XFL/w8AVHv9n50DIzK9pyR7eKkmtlfgBysMPJqyiZMo3smyAhFH0thfyzZGldg2VPbce2fLuY/Cib42Rh5Q1wzFnnP+ul7E2xOmu/JKb8npzBVPnE7p4K0i1NBnnOf1n2319H7N0an808aLA8PBCtsBfuF/wxrDpj8gX4K94UpJGDWTLOd9NFb0+waaS/dQsw5vZTPRatyZlpJ6yee+sSlxSqTEijFKsGqmW1+9nIRlUYPoUQfKIFZRHsrf+f1UQ1K283SPhIoI5V0a+d2Rg/VI3k7oxDuZFSib1xFwwwlM5PiuZmUaNLNv472unXDaKcavVTscE/cd6YqFotXoFdTWRdQXBdQxNA5/xwwbb1SoBfQj3eb6qYRSwzxxQoZ093CdFc9iex+BlPM1T0I5+4eRDKupQNo7lX3IrAymMeECZpm7c74BrJc/G2exmqAwaTRny/BqUs0hojp3LMeKFhLy+slBSyoXaYzF1Lrx+wfaXFmuhewS9/rPC2CoEg81KPESfj2xfaGJPIJX0481x+8Ygv/TuxhgMtF0kGLLMe0yIy22wfkBSdA4ap4kNC0DKZSVEGW3gVT7WKwpnc65vFX1feezl2CNx6n8+ULolI8sMp3UKkIx6OSQbw4iEfczIWHb+buPQQtpHEzLadFyzNuNuerbmpZFE4jQMceQlKypH1+mNTEPOebiVHQhZ9I0ncHvVCnQ1k2s+XyBLhkwquVCO+FdEWlakhsdzXf7up7je8bxjeQM0SPBYucHrFS6jDIbYhVprtXPL4+v6jJp1+HOOnEdMc6xIncMmtfS1nIc65wTJGy8NGy41Uo8weFzWiufUZTBMR8EY5lOqx1fTDhUWFmOu/OU6ZOJQB8pPgp5t5MLBibmWCyFsdgXi9MCmK12WcBCoyqZG58ZScjKNg6v9xzGxREIhQSy1NwnDVOGQfOFBcJVGcgfCHlmi35qfIyt1oAJ4Xtmfd6z4wvE65I9j7ujabZWrihcXuLqSRpjeZdfKi+b5rN+KXvRqfXaDYejM7iDMniSDN5QuarcbbxjhUJ/wYhQqRgaywwCxRxDUXFWTjeFHmRHzhx2Phs/jQnFRS8oojku3r6ljCiyYq4saNpUNqY0tSK+t6apgmJskNeVpbF11QNrgjQNJLlggMeQllL8QBFWZvHlTBAyfJKlQ0QSdjAIN8eTYLgNX6NQVraJ0AW1gUor42/Nyyoc2w28n97xOjad8IXfxz7zY1+Z8RC0248POhWtx4fR7/p/GjV6la3He+JdO9Ns1dvGKun6fu20bNq+nfjw4vJO1Iry1M+2Dv9Cfmm6vx/ft1zuoxVAAA='
+          obs = json.loads(gzip.decompress(base64.b64decode(PAYLOAD)))
+          farm = obs['farms'][obs['player']]
+          active, targets = [], {}
+          physical = empty = 0
+          for y, row in enumerate(farm['tiles']):
+              for x, tile in enumerate(row):
+                  if tile == 'LOCKED':
+                      continue
+                  pos = (x, y)
+                  active.append(pos)
+                  if isinstance(tile, dict):
+                      name = tile.get('animal') or (tile.get('crop') if tile.get('kind') == 'PLANT' else None)
+                      if name:
+                          targets[pos] = (name, False)
+                          physical += 1
+                      elif tile.get('kind') not in ('COOP', 'PASTURE'):
+                          empty += 1
+                  elif tile is None:
+                      empty += 1
 
-          cases = [
-              ('WHEAT', False, 0, 29, None),
-              ('MELON', True, 0, 20, None),
-              ('STRAWBERRY', (9, 13), 0, 20, None),
-              ('GOOSE', False, 0, 29, None),
-          ]
-          tile = game._new_plant('MELON', 10, 24)
-          tile.update(yield_units=4, consecutive_unwatered=1, fertilized_until_day=-1)
-          cases.append(('MELON', False, 20, 29, tile))
-          animal = game._new_animal('SHEEP', 4)
-          animal.update(yield_units=4, fertilizer_available=True, pending_care_bonus=2)
-          cases.append(('SHEEP', False, 20, 29, animal))
+          original_mv = MarketForecast.marginal_value
+          mv_calls = 0
+          mv_seconds = 0.0
+          def timed_mv(self, *args, **kwargs):
+              global mv_calls, mv_seconds
+              t0 = time.perf_counter()
+              try:
+                  return original_mv(self, *args, **kwargs)
+              finally:
+                  mv_calls += 1
+                  mv_seconds += time.perf_counter() - t0
+          MarketForecast.marginal_value = timed_mv
 
-          for case in cases:
+          def run(max_positions, prof=False):
+              global mv_calls, mv_seconds
+              local_targets = dict(targets)
+              mv_calls = 0
+              mv_seconds = 0.0
               _cached_production_snapshot.cache_clear()
-              expected = _simulate_production(*case)
-              actual = production(*case)
-              assert signature(actual) == signature(expected), case
-              again = production(*case)
-              assert again is not actual
-              before = signature(again)
-              actual.sales[999]['WHEAT'] += 123
-              assert signature(again) == before
+              p = cProfile.Profile()
+              t0 = time.perf_counter()
+              if prof:
+                  p.enable()
+              pending = planner.plan_targets(
+                  obs, local_targets, active, 29,
+                  max_positions=max_positions,
+                  replan_positions=set(active),
+              )
+              if prof:
+                  p.disable()
+              elapsed = time.perf_counter() - t0
+              print(f'RUN max_positions={max_positions} elapsed={elapsed:.6f}s mv_calls={mv_calls} mv_seconds={mv_seconds:.6f}s pending={len(pending)} cache={_cached_production_snapshot.cache_info()}')
+              if prof:
+                  s = io.StringIO()
+                  pstats.Stats(p, stream=s).strip_dirs().sort_stats('cumtime').print_stats(45)
+                  print(s.getvalue())
 
-          _cached_production_snapshot.cache_clear()
-          t0 = time.perf_counter()
-          for _ in range(120):
-              _simulate_production('MELON', False, 20, 29, tile)
-          uncached_tiles = time.perf_counter() - t0
-          _cached_production_snapshot.cache_clear()
-          t0 = time.perf_counter()
-          for _ in range(120):
-              production('MELON', False, 20, 29, tile)
-          cached_tiles = time.perf_counter() - t0
-          print(f'cohort120 uncached={uncached_tiles:.4f}s cached={cached_tiles:.4f}s speedup={uncached_tiles/max(cached_tiles,1e-9):.1f}x cache={_cached_production_snapshot.cache_info()}')
-
-          planner.production = _simulate_production
-          t0 = time.perf_counter()
-          uncached_candidates = list(planner._candidates(12, 28))
-          uncached_candidates_time = time.perf_counter() - t0
-          planner.production = production
-          _cached_production_snapshot.cache_clear()
-          t0 = time.perf_counter()
-          cached_candidates = list(planner._candidates(12, 28))
-          cached_candidates_time = time.perf_counter() - t0
-          assert len(cached_candidates) == len(uncached_candidates)
-          for old, new in zip(uncached_candidates, cached_candidates):
-              assert old[0] == new[0] and old[2] == new[2]
-              assert signature(old[1]) == signature(new[1])
-          print(f'candidates={len(cached_candidates)} uncached={uncached_candidates_time:.4f}s cached={cached_candidates_time:.4f}s speedup={uncached_candidates_time/max(cached_candidates_time,1e-9):.2f}x cache={_cached_production_snapshot.cache_info()}')
+          print(f"OBS day={obs['day']} hour={obs['hour']} active={len(active)} physical={physical} empty={empty}")
+          run(0)
+          run(1)
+          run(10, prof=True)
           PY
-          # test_agents_labor currently fails on unpatched agent-v3 because its
-          # Revenue test double predates MarketForecast.marginal_value(). Keep
-          # this timeout patch gated by the suites that exercise touched code.
-          python -m pytest -q tests/test_agents_forecast.py tests/test_agents_planner.py
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add agents/forecast.py
-          git commit -m 'perf: cache interpreter production forecasts'
-          git push --force-with-lease=agent-v3:${EXPECTED} origin HEAD:agent-v3
