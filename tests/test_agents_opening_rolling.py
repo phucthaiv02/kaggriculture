@@ -4,6 +4,8 @@ from kaggle_environments import make
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
 
 from agents.expansion_agent import make_agent
+from agents.farm_tasks import build_tasks
+from agents.rolling_scheduler import planning_observation
 from experiments.crop_schedules import pass_agent
 
 
@@ -41,6 +43,17 @@ def _animals(obs):
     return result
 
 
+def _task_summary(task):
+    return {
+        "position": task.position,
+        "actions": task.actions,
+        "needs": dict(task.needs),
+        "mandatory": task.mandatory,
+        "immediate_drop": task.immediate_drop,
+        "refinance_feed": task.refinance_feed,
+    }
+
+
 def test_day_two_opening_conversion_is_admitted_and_buys_cow():
     env = make("kaggriculture", configuration=_configuration(), debug=False)
     agent = make_agent(END_DAY, seed=1)
@@ -54,9 +67,24 @@ def test_day_two_opening_conversion_is_admitted_and_buys_cow():
     market_ledger = []
     execution_ledger = []
     animal_snapshots = []
+    late_trace = []
 
     for step in range(int(env.configuration.episodeSteps) - 1):
         obs = state[0].observation
+
+        before_tasks = []
+        if obs.day == 1 and obs.hour >= 13 and planner_state.get("daily_targets"):
+            task_obs = planning_observation(dict(obs, _planning_end_day=END_DAY))
+            generated = build_tasks(
+                task_obs,
+                planner_state["daily_targets"],
+                prioritize_fertilizer_drop=planner_state["opening_active"],
+            )
+            before_tasks = [
+                _task_summary(task) for task in generated
+                if task.position == (1, 4)
+            ]
+
         action = agent(obs)
         market = action.get("market", [])
         if market:
@@ -65,6 +93,23 @@ def test_day_two_opening_conversion_is_admitted_and_buys_cow():
                 len(obs.farms[0]["hands"]), obs.farms[0].get("hires_today", 0),
                 obs.private["shed"].get("FERTILIZER", 0), market,
             ))
+
+        if obs.day == 1 and obs.hour >= 13:
+            tile = obs.farms[0]["tiles"][4][1]
+            late_trace.append({
+                "hour": obs.hour,
+                "money": obs.farms[0]["money"],
+                "shed_wheat": obs.private["shed"].get("WHEAT", 0),
+                "tile": dict(tile) if isinstance(tile, dict) else tile,
+                "generated_task": before_tasks,
+                "frozen": (1, 4) in planner_state["frozen_positions"],
+                "schedule_admitted": planner_state["schedule_admitted"],
+                "unassigned": [_task_summary(task) for task in planner_state["unassigned"]],
+                "worker_positions": [tuple(obs.farms[0]["farmer"]), *map(tuple, obs.farms[0]["hands"])],
+                "inventories": [dict(inventory) for inventory in obs.private["inventories"]],
+                "action": action,
+                "remaining_plans": [list(plan.queue) for plan in planner_state["plans"]],
+            })
 
         if obs.day <= 1:
             positions = [tuple(obs.farms[0]["farmer"]), *map(tuple, obs.farms[0]["hands"])]
@@ -92,6 +137,8 @@ def test_day_two_opening_conversion_is_admitted_and_buys_cow():
                 f"daily(4,3)={planner_state['daily_targets'].get((4, 3))}",
                 f"daily(3,3)={planner_state['daily_targets'].get((3, 3))}",
                 f"hands={planner_state['hand_target']} mandatory={planner_state['mandatory_hand_target']}",
+                "late trace:",
+                *map(str, late_trace),
                 "animal snapshots:",
                 *map(str, animal_snapshots),
                 "execution(day,hour,worker,pos,op,inventory):",
