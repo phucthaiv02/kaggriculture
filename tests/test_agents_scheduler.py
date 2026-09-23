@@ -162,7 +162,8 @@ def test_hands_needed_zero_for_no_tasks():
     assert dropped == []
 
 
-def test_ready_animal_harvest_precedes_other_urgent_animal_work():
+def test_equal_scheduled_work_is_routed_by_geometry_not_action_kind():
+    """Execution routing must not invent a HARVEST-before-FEED runtime priority."""
     feed = Task((4, 3), [["FEED"], ["CARE"]], urgent=True)
     harvest = Task(
         (0, 0), [["HARVEST"]], urgent=True, animal_harvest=True,
@@ -171,7 +172,7 @@ def test_ready_animal_harvest_precedes_other_urgent_animal_work():
         [feed, harvest], farmer_start=SHED, hand_count=0,
     )
     assert unassigned == []
-    assert plans[0].queue.index(["HARVEST"]) < plans[0].queue.index(["FEED"])
+    assert plans[0].queue.index(["FEED"]) < plans[0].queue.index(["HARVEST"])
 
 
 def test_hands_needed_zero_when_farmer_alone_fits():
@@ -222,7 +223,7 @@ def test_build_queues_drops_sellable_only_if_it_fits_the_budget():
     get a forced return trip -- that would just eat a task that could have
     been done instead, and inventory drops to the shed automatically at day
     end regardless (see kaggriculture's _end_of_day)."""
-    padding = [["WATER"]] * 18  # burn most of the farmer's 24-turn budget
+    padding = [["WATER"]] * 18
     far_task = Task((9, 9), padding, sells=Counter({"WHEAT": 4}))
     plans, _ = build_queues([far_task], farmer_start=SHED, hand_count=0)
     queue = plans[0].queue
@@ -240,12 +241,12 @@ def test_farmer_far_from_shed_is_charged_the_approach_distance():
     """The farmer's default spawn is not the shed; hands_needed must budget
     for that trip (see _pack's module docstring) or it will systematically
     under-hire on day 0."""
-    far_start = (0, 0)  # distance 8 from SHED=(4,4)
-    tasks = [Task((4, 4), [["WATER"]] * 15)]  # 15 + 8 baseline = 23, exactly the budget
+    far_start = (0, 0)
+    tasks = [Task((4, 4), [["WATER"]] * 15)]
     count, dropped = hands_needed(tasks, farmer_start=far_start)
     assert dropped == []
     assert count == 0
-    tasks_over_budget = [Task((4, 4), [["WATER"]] * 16)]  # now 1 turn over budget
+    tasks_over_budget = [Task((4, 4), [["WATER"]] * 16)]
     count2, dropped2 = hands_needed(tasks_over_budget, farmer_start=far_start)
     assert count2 >= 1
 
@@ -393,7 +394,7 @@ def test_stocked_feed_routes_share_one_bulk_pickup():
     assert queues[0].count(["FEED"]) == 2
     assert queues[0].count(["CARE"]) == 2
     assert queues[0][-1] == ["DROP"]
-    assert len(queues[0]) < 14  # Two separate seven-turn deliveries.
+    assert len(queues[0]) < 14
 
 
 def test_feed_consolidation_requires_stock_and_preserves_opening():
