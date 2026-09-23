@@ -22,6 +22,7 @@ jobs:
           python-version: '3.11'
       - name: Apply, verify exactness, and push
         run: |
+          python -m pip install -q 'kaggle-environments==1.32.7' pytest
           cp .ci/apply_batch_forecast_patch.py /tmp/apply_batch_forecast_patch.py
           git fetch origin agent-v3
           EXPECTED=$(git rev-parse origin/agent-v3)
@@ -63,8 +64,6 @@ jobs:
           for case in cases:
               assert market.settle_product(*case) == reference(*case), case
 
-          # Repeated finite market states are exactly what fertilizer/crop
-          # candidates generate. Demonstrate the cache removes repeated unit loops.
           repeated = cases[:300] * 80
           t0 = time.perf_counter()
           for case in repeated:
