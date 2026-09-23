@@ -1,0 +1,31 @@
+name: Baseline scheduler tests
+
+on:
+  push:
+    branches: [agent-v3-turnover-watering-fix]
+    paths:
+      - .github/workflows/baseline-scheduler-tests.yml
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent-v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install runtime
+        run: python -m pip install --upgrade kaggle-environments pytest
+      - name: Run scheduler baseline
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest -q tests/test_agents_scheduler.py
