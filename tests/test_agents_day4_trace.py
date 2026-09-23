@@ -1,8 +1,8 @@
 """Focused regression/diagnostic for the opening Day-4 WHEAT turnover.
 
-The seven opening WHEAT tiles are a useful stress case for rolling execution:
-all seven successor PLANT+WATER chains are known at the start of the day and
-must survive every intraday route rebuild after HARVEST changes tile state.
+The live WHEAT batch on Day 4 is a useful stress case for rolling execution:
+all successor PLANT+WATER chains are known at the start of the day and must
+survive every intraday route rebuild after HARVEST changes tile state.
 """
 
 from kaggle_environments import make
@@ -46,9 +46,16 @@ def test_all_opening_wheat_successors_finish_on_day_four():
                 for x, tile in enumerate(row)
                 if isinstance(tile, dict)
                 and tile.get("crop") == "WHEAT"
-                and tile.get("planted_day") == 0
             }
-            assert len(day_four_wheat) == 7, sorted(day_four_wheat)
+            assert len(day_four_wheat) == 7, {
+                "positions": sorted(day_four_wheat),
+                "tiles": {
+                    position: _tile_summary(
+                        obs.farms[0]["tiles"][position[1]][position[0]]
+                    )
+                    for position in sorted(day_four_wheat)
+                },
+            }
 
         action = agent(obs)
 
