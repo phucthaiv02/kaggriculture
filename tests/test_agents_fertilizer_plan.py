@@ -128,6 +128,7 @@ def test_product_local_marginal_value_matches_full_portfolio_subtraction():
     baseline_value = market.value(baseline)
     cache = {}
     # Sample every crop/animal family plus several fertilizer-plan variants.
+    # This also guards the allocation-free marginal path used by the planner.
     candidates = list(_candidates(day, end_day))
     sampled = candidates[::max(1, len(candidates) // 24)]
     for _choice, candidate, _cost in sampled:
