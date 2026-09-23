@@ -188,6 +188,18 @@ def _choose_carried_assignment(tasks, starts, inventories, budgets, shed_access,
     return buckets, remaining, shed_left, []
 
 
+def _routing_unassigned(tasks):
+    """Only optional work may fall out of an intraday routing pass.
+
+    Mandatory work was already admitted by the daily schedule. A rolling pass
+    can temporarily be unable to route it while inventory is being deposited,
+    a market order is landing, or another admitted dependency is clearing.
+    That is a state wait, not a reason to reopen labor admission mid-day.
+    The next observation rebuilds the mandatory task from live state again.
+    """
+    return [task for task in tasks if task.mandatory is False]
+
+
 def build_rolling_queues(
     tasks,
     starts,
@@ -217,7 +229,7 @@ def build_rolling_queues(
 
     # A refinance task is not optional fertilizer income. It is the resource
     # predecessor of a scheduled FEED when the farm cannot buy WHEAT yet:
-    # COLLECT -> DROP -> SELL -> BUY WHEAT -> FEED.  Frozen queues used to
+    # COLLECT -> DROP -> SELL -> BUY WHEAT -> FEED. Frozen queues used to
     # preserve that predecessor implicitly. Rolling execution must encode the
     # dependency explicitly so route optimization cannot discard it as an
     # ordinary sellable-output task.
@@ -260,11 +272,15 @@ def build_rolling_queues(
     )
 
     # A planned DROP is not shed stock until the next observation. If remaining
-    # work currently lacks inputs, execute only the dependency-clearing prefixes
-    # instead of issuing speculative PICKUPs against inventory that does not yet
-    # exist in the shed. The next turn will rebuild with the deposited stock.
+    # work currently lacks inputs, execute only the dependency-clearing prefixes.
+    # Mandatory remaining work is still part of the admitted daily schedule; it
+    # must not be reported as a fresh admission failure just because its input
+    # is in transit. The next turn rebuilds it from the new shed/market state.
     if depositing and shortage_now:
-        return [WorkerPlan(start, prefix) for start, prefix in zip(starts, prefixes)], remaining
+        return (
+            [WorkerPlan(start, prefix) for start, prefix in zip(starts, prefixes)],
+            _routing_unassigned(remaining),
+        )
 
     plans, unassigned = build_queues(
         remaining,
@@ -279,4 +295,7 @@ def build_rolling_queues(
     merged = []
     for start, prefix, plan in zip(starts, prefixes, plans):
         merged.append(WorkerPlan(start, prefix + plan.queue))
-    return merged, unassigned
+    # Intraday route feasibility never reopens daily labor admission. Mandatory
+    # tasks omitted from this ephemeral pass are regenerated on the next live
+    # observation; only optional work is allowed to remain genuinely unassigned.
+    return merged, _routing_unassigned(unassigned)
