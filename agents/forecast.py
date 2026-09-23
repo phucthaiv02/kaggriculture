@@ -115,6 +115,7 @@ class MarketForecast:
         self.center_products = set(game.TOWN_CENTER_PRODUCTS)
         self.price = lru_cache(maxsize=None)(lambda product, stock: game.market_price(product, stock, params))
         self.trade = lru_cache(maxsize=None)(self._trade)
+        self.settle_product = lru_cache(maxsize=None)(self._settle_product)
         # Candidate Production objects are reused across every tile repriced in
         # one morning. Cache their touched markets once instead of rescanning
         # up to sixteen days of sales/inputs for every tile.
@@ -205,6 +206,25 @@ class MarketForecast:
 
         return self._value_products(baseline, products, candidate) - baseline_value
 
+    def _settle_product(self, product, stock, own_amount, rival_amount):
+        """Exact one-product settlement transition, cached across candidates."""
+        cash = 0
+        own_units = abs(own_amount)
+        rival_units = abs(rival_amount)
+        for unit in range(max(own_units, rival_units)):
+            quoted = []
+            if unit < own_units:
+                price = self.price(product, stock if own_amount > 0 else stock - 1)
+                quoted.append((0, own_amount, price))
+            if unit < rival_units:
+                price = self.price(product, stock if rival_amount > 0 else stock - 1)
+                quoted.append((1, rival_amount, price))
+            for player, amount, price in quoted:
+                stock += int(price > 1) if amount > 0 else -1
+                if player == 0:
+                    cash += price if amount > 0 else -price
+        return cash, stock
+
     def _settle_day(self, stocks, flows, when, products=None, extra=None):
         """Settle daily market pressure independently for each product.
 
@@ -232,26 +252,11 @@ class MarketForecast:
             if not own_amount and not rival_amount:
                 continue
 
-            own_units = abs(own_amount)
-            rival_units = abs(rival_amount)
-            for unit in range(max(own_units, rival_units)):
-                stock = stocks.get(product, 0)
-                quoted = []
-                if unit < own_units:
-                    price = self.price(product, stock if own_amount > 0 else stock - 1)
-                    quoted.append((0, own_amount, price))
-                if unit < rival_units:
-                    price = self.price(product, stock if rival_amount > 0 else stock - 1)
-                    quoted.append((1, rival_amount, price))
-
-                # Same-product units for both players are quoted against the
-                # same pre-round stock, then committed together.
-                for player, amount, price in quoted:
-                    stocks[product] = stocks.get(product, 0) + (
-                        int(price > 1) if amount > 0 else -1
-                    )
-                    if player == 0:
-                        cash += price if amount > 0 else -price
+            product_cash, next_stock = self.settle_product(
+                product, stocks.get(product, 0), own_amount, rival_amount
+            )
+            stocks[product] = next_stock
+            cash += product_cash
         return cash
 
     def marginal_profit(self, baseline, candidate, fixed_cost, baseline_value=None):
