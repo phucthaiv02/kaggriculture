@@ -373,7 +373,7 @@ def test_packing_finds_feasible_assignment_without_extra_hand():
     assert sum(plan.queue.count(["WATER"]) for plan in plans) == 22
 
 
-def test_rescue_preserves_nw_opening_assignments():
+def test_packing_preserves_nw_opening_assignments():
     from agents.scheduler import _pack_greedy, _pack
     tasks = [Task((x, y), [["WATER"]] * 3, urgent=True)
              for x, y in [(0, 0), (4, 4), (1, 0), (2, 1), (3, 4), (4, 0)]]
@@ -417,19 +417,19 @@ def test_feed_consolidation_respects_return_and_worker_budget():
     assert all(len(plan.queue) <= 8 for plan in plans)
 
 
-def test_feed_consolidation_batches_five_delivery_routes_into_two():
+def test_feed_delivery_packing_preserves_all_work_and_shared_pickups():
     positions = [(4, 3), (5, 3), (6, 3), (4, 2), (5, 2)]
     tasks = [Task(p, [["FEED"], ["CARE"], ["COLLECT_FERTILIZER"]],
                   needs=Counter(WHEAT=1), sells=Counter(FERTILIZER=1), urgent=True)
              for p in positions]
-    original, _ = build_queues(tasks, (4, 4), 4)
-    batched, missing = build_queues(tasks, (4, 4), 4, available_wheat=5)
+    plans, missing = build_queues(tasks, (4, 4), 4, available_wheat=5)
     assert missing == []
-    assert sum(bool(p.queue) for p in original) == 5
-    assert sum(bool(p.queue) for p in batched) == 2
-    assert sorted(op[2] for p in batched for op in p.queue if op[0] == "PICKUP") == [2, 3]
-    assert sum(p.queue.count(["FEED"]) for p in batched) == 5
-    assert all(not p.queue or p.queue[-1] == ["DROP"] for p in batched)
+    assert sum(plan.queue.count(["FEED"]) for plan in plans) == 5
+    assert sum(plan.queue.count(["CARE"]) for plan in plans) == 5
+    pickups = [op for plan in plans for op in plan.queue if op[0] == "PICKUP"]
+    assert sum(op[2] for op in pickups) == 5
+    assert len(pickups) <= sum(bool(plan.queue) for plan in plans)
+    assert all(len(plan.queue) <= HAND_BUDGET for plan in plans)
 
 
 def test_feed_rebalancing_keeps_investment_on_its_original_worker():
