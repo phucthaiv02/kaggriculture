@@ -28,20 +28,21 @@ jobs:
           from experiments.play_match import configuration, resolve_opponent
 
           POS=(5,0)
+          trace=[]
           original_build_tasks=module.build_tasks
           def traced_build_tasks(obs, targets, *args, **kwargs):
               tasks=original_build_tasks(obs, targets, *args, **kwargs)
               if int(obs.get('day',-1))==26:
                   matches=[t for t in tasks if t.position==POS]
                   tile=obs['farms'][obs['player']]['tiles'][POS[1]][POS[0]]
-                  print('BUILD_TASKS',{
+                  trace.append(('BUILD_TASKS',{
                       'hour':int(obs.get('hour',-1)),
                       'target':repr(targets.get(POS)),
                       'pending':POS in obs.get('_pending_targets',()),
                       'seed_carrot':obs['private']['seeds'].get('CARROT',0),
                       'tile':repr(tile),
                       'tasks':[(t.actions,dict(t.needs),t.mandatory,t.ends_cycle) for t in matches],
-                  })
+                  }))
               return tasks
           module.build_tasks=traced_build_tasks
 
@@ -50,40 +51,35 @@ jobs:
           state=cells['state']; targets=cells['targets']
           opponent,_,_=resolve_opponent('public/A.ipynb')
 
+          def snapshot(obs,label,action=None):
+              farm=obs['farms'][obs['player']]
+              trace.append((label,{
+                  'hour':int(obs['hour']),
+                  'tile':repr(farm['tiles'][0][5]),
+                  'seed_carrot':obs['private']['seeds'].get('CARROT',0),
+                  'target':repr(targets.get(POS)),
+                  'daily_target':repr(state.get('daily_targets',{}).get(POS)),
+                  'frozen':POS in state.get('frozen_positions',set()),
+                  'pending':POS in state.get('pending_targets',set()),
+                  'plan_frozen':state.get('plan_frozen'),
+                  'emergency_hires':state.get('emergency_hires'),
+                  'unassigned':[(t.position,t.actions,t.mandatory) for t in state.get('unassigned',[]) if getattr(t,'position',None)==POS],
+                  'workers':[tuple(farm['farmer']),*map(tuple,farm['hands'])],
+                  'queues':[p.queue[:] for p in state.get('plans',[])],
+                  'action':action,
+              }))
+
           def traced_agent(obs, config=None):
               day=int(obs['day']); hour=int(obs['hour'])
-              if day==26 and (hour==0 or hour>=17):
-                  farm=obs['farms'][obs['player']]
-                  print('BEFORE',{
-                      'hour':hour,
-                      'tile':repr(farm['tiles'][0][5]),
-                      'seed_carrot':obs['private']['seeds'].get('CARROT',0),
-                      'target':repr(targets.get(POS)),
-                      'daily_target':repr(state.get('daily_targets',{}).get(POS)),
-                      'frozen':POS in state.get('frozen_positions',set()),
-                      'pending':POS in state.get('pending_targets',set()),
-                      'plan_frozen':state.get('plan_frozen'),
-                      'unassigned':[(t.position,t.actions,t.mandatory) for t in state.get('unassigned',[]) if getattr(t,'position',None)==POS],
-                      'workers':[tuple(farm['farmer']),*map(tuple,farm['hands'])],
-                      'queues':[p.queue[:] for p in state.get('plans',[])],
-                  })
+              watched=day==26 and (hour==0 or hour>=17)
+              if watched: snapshot(obs,'BEFORE')
               action=agent(obs,config)
-              if day==26 and (hour==0 or hour>=17):
-                  print('AFTER',{
-                      'hour':hour,
-                      'action':action,
-                      'target':repr(targets.get(POS)),
-                      'daily_target':repr(state.get('daily_targets',{}).get(POS)),
-                      'frozen':POS in state.get('frozen_positions',set()),
-                      'pending':POS in state.get('pending_targets',set()),
-                      'plan_frozen':state.get('plan_frozen'),
-                      'emergency_hires':state.get('emergency_hires'),
-                      'unassigned':[(t.position,t.actions,t.mandatory) for t in state.get('unassigned',[]) if getattr(t,'position',None)==POS],
-                      'queues':[p.queue[:] for p in state.get('plans',[])],
-                  })
+              if watched: snapshot(obs,'AFTER',action)
               return action
 
           env=make('kaggriculture',configuration=configuration(1),debug=False)
           env.run([traced_agent,opponent])
           print('STATUS',[s.status for s in env.state],'REWARD',[s.reward for s in env.state])
+          for label,row in trace:
+              print(label,row)
           PY
