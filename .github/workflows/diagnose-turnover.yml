@@ -17,84 +17,73 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Run current agent-v3 against A and correlate turnover
+      - name: Trace day26 delayed successor against A
         run: |
           python -m pip install -q 'kaggle-environments==1.32.7'
           git fetch origin agent-v3
           git checkout --detach origin/agent-v3
-          rm -rf /tmp/turnover-a && mkdir -p /tmp/turnover-a
-          timeout 300s python -m experiments.play_match --opponent public/A.ipynb --seed 1 --output-dir /tmp/turnover-a
           python - <<'PY'
-          import json
-          from collections import Counter, defaultdict
-          from pathlib import Path
+          import agents.expansion_agent as module
+          from kaggle_environments import make
+          from experiments.play_match import configuration, resolve_opponent
 
-          root=Path('/tmp/turnover-a')
-          match=sorted(root.glob('current_vs_A_seed1_*'))[-1]
-          replay=json.loads((match/'replay.json').read_text())
-          decisions=json.loads((match/'planner_decisions.json').read_text())
-          result=json.loads((match/'result.json').read_text())
-          print('RESULT',result)
+          POS=(5,0)
+          original_build_tasks=module.build_tasks
+          def traced_build_tasks(obs, targets, *args, **kwargs):
+              tasks=original_build_tasks(obs, targets, *args, **kwargs)
+              if int(obs.get('day',-1))==26:
+                  matches=[t for t in tasks if t.position==POS]
+                  tile=obs['farms'][obs['player']]['tiles'][POS[1]][POS[0]]
+                  print('BUILD_TASKS',{
+                      'hour':int(obs.get('hour',-1)),
+                      'target':repr(targets.get(POS)),
+                      'pending':POS in obs.get('_pending_targets',()),
+                      'seed_carrot':obs['private']['seeds'].get('CARROT',0),
+                      'tile':repr(tile),
+                      'tasks':[(t.actions,dict(t.needs),t.mandatory,t.ends_cycle) for t in matches],
+                  })
+              return tasks
+          module.build_tasks=traced_build_tasks
 
-          obs=[step[0]['observation'] for step in replay['steps']]
-          decision_map=defaultdict(list)
-          for d in decisions:
-              decision_map[(int(d['day']),tuple(d['position']))].append(d)
+          agent=module.make_agent(29,seed=1)
+          cells=dict(zip(agent.__code__.co_freevars,(c.cell_contents for c in agent.__closure__)))
+          state=cells['state']; targets=cells['targets']
+          opponent,_,_=resolve_opponent('public/A.ipynb')
 
-          def producer(tile):
-              if not isinstance(tile,dict): return None
-              return tile.get('crop') or tile.get('animal')
+          def traced_agent(obs, config=None):
+              day=int(obs['day']); hour=int(obs['hour'])
+              if day==26 and (hour==0 or hour>=17):
+                  farm=obs['farms'][obs['player']]
+                  print('BEFORE',{
+                      'hour':hour,
+                      'tile':repr(farm['tiles'][0][5]),
+                      'seed_carrot':obs['private']['seeds'].get('CARROT',0),
+                      'target':repr(targets.get(POS)),
+                      'daily_target':repr(state.get('daily_targets',{}).get(POS)),
+                      'frozen':POS in state.get('frozen_positions',set()),
+                      'pending':POS in state.get('pending_targets',set()),
+                      'plan_frozen':state.get('plan_frozen'),
+                      'unassigned':[(t.position,t.actions,t.mandatory) for t in state.get('unassigned',[]) if getattr(t,'position',None)==POS],
+                      'workers':[tuple(farm['farmer']),*map(tuple,farm['hands'])],
+                      'queues':[p.queue[:] for p in state.get('plans',[])],
+                  })
+              action=agent(obs,config)
+              if day==26 and (hour==0 or hour>=17):
+                  print('AFTER',{
+                      'hour':hour,
+                      'action':action,
+                      'target':repr(targets.get(POS)),
+                      'daily_target':repr(state.get('daily_targets',{}).get(POS)),
+                      'frozen':POS in state.get('frozen_positions',set()),
+                      'pending':POS in state.get('pending_targets',set()),
+                      'plan_frozen':state.get('plan_frozen'),
+                      'emergency_hires':state.get('emergency_hires'),
+                      'unassigned':[(t.position,t.actions,t.mandatory) for t in state.get('unassigned',[]) if getattr(t,'position',None)==POS],
+                      'queues':[p.queue[:] for p in state.get('plans',[])],
+                  })
+              return action
 
-          rows=[]
-          for i in range(len(obs)-1):
-              a,b=obs[i],obs[i+1]
-              ta,tb=a['farms'][0]['tiles'],b['farms'][0]['tiles']
-              day=int(b['day']); hour=int(b['hour'])
-              for y in range(10):
-                  for x in range(10):
-                      before,after=ta[y][x],tb[y][x]
-                      if not (isinstance(before,dict) and before.get('kind')=='PLANT' and after is None):
-                          continue
-                      if day < 8 or day >= 28:
-                          continue
-                      first_nonempty=None
-                      first_producer=None
-                      for j in range(i+1,min(len(obs),i+1+72)):
-                          tile=obs[j]['farms'][0]['tiles'][y][x]
-                          if first_nonempty is None and tile is not None:
-                              first_nonempty=(j-(i+1),int(obs[j]['day']),int(obs[j]['hour']),tile.get('kind') if isinstance(tile,dict) else type(tile).__name__)
-                          p=producer(tile)
-                          if p:
-                              first_producer=(j-(i+1),int(obs[j]['day']),int(obs[j]['hour']),p)
-                              break
-                      ds=decision_map.get((day,(x,y)),[])
-                      latest=ds[-1] if ds else None
-                      selected=None if not latest else latest.get('selected')
-                      reason=None if not latest else latest.get('reason')
-                      rows.append({
-                          'day':day,'hour':hour,'pos':(x,y),'crop':before.get('crop'),
-                          'decision_selected':selected,'decision_reason':reason,
-                          'first_nonempty':first_nonempty,'first_producer':first_producer,
-                      })
-
-          same=0; delayed=0; never=0
-          for r in rows:
-              fp=r['first_producer']
-              if fp and fp[1]==r['day']:
-                  same+=1
-              elif fp:
-                  delayed+=1
-              else:
-                  never+=1
-          print('SUMMARY','freed',len(rows),'same_day_producer',same,'later_producer',delayed,'no_producer_72',never)
-          print('NON_SAME_DAY')
-          for r in rows:
-              fp=r['first_producer']
-              if not fp or fp[1]!=r['day']:
-                  print(r)
-
-          print('DAY10_DECISIONS')
-          for d in decisions:
-              if int(d['day'])==10:
-                  print({'pos':d['position'],'current':d.get('current'),'selected':d.get('selected'),'reason':d.get('reason')})
+          env=make('kaggriculture',configuration=configuration(1),debug=False)
+          env.run([traced_agent,opponent])
+          print('STATUS',[s.status for s in env.state],'REWARD',[s.reward for s in env.state])
           PY
