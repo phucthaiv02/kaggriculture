@@ -60,10 +60,12 @@ def test_v5_wiring_only_replaces_real_scoped_planner_candidates(monkeypatch):
     import agents.v5_wiring as wiring
 
     seen = []
+    replacement_output = Production()
 
     def fake_paths(_market, _baseline, day, end_day, *, first_names, **_kwargs):
         seen.append((day, end_day, set(first_names)))
-        return [(("WHEAT", False), Production(), 0, ((day, ("WHEAT", False)),))]
+        return [(("WHEAT", False), replacement_output, 0,
+                 ((day, ("WHEAT", False)),))]
 
     captured = []
 
@@ -83,7 +85,10 @@ def test_v5_wiring_only_replaces_real_scoped_planner_candidates(monkeypatch):
     )
 
     assert seen == [(3, 12, {"MELON"})]
-    assert captured == [(("WHEAT", False), captured[0][1], 0)]
+    assert len(captured) == 1
+    assert captured[0][0] == ("WHEAT", False)
+    assert captured[0][1] is replacement_output
+    assert captured[0][2] == 0
 
 
 def test_direct_choose_compatibility_does_not_expand_paths(monkeypatch):
