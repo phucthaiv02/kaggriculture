@@ -1,0 +1,173 @@
+name: Agent v5 baseline benchmark
+
+on:
+  push:
+    branches: [agent-v5]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-v5-benchmark-${{ github.sha }}
+  cancel-in-progress: true
+
+env:
+  BASELINE_COMMIT: d8aaff07d00fc8836a3f7d3c6ed828269f943f39
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout agent-v5
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade kaggle-environments pytest
+          python -m pip freeze > ci-artifacts-v5-requirements.txt
+
+      - name: Compile benchmark and production agent
+        run: |
+          python -m py_compile experiments/agent_v5_benchmark.py agents/*.py
+          git diff --check
+
+      - name: Run focused regressions
+        run: |
+          timeout 180s python -m pytest -q \
+            tests/test_agents_planner.py \
+            tests/test_agents_forecast.py \
+            tests/test_agents_animal_horizon.py \
+            tests/test_agents_farm_tasks.py
+
+      - name: Benchmark current agent-v5 state
+        run: |
+          mkdir -p ci-artifacts/v5-benchmark/current/replays
+          timeout 540s python -m experiments.agent_v5_benchmark \
+            --opponent "$GITHUB_WORKSPACE/public/A.ipynb" \
+            --seeds 1 7 \
+            --output ci-artifacts/v5-benchmark/current/summary.json \
+            --replay-dir ci-artifacts/v5-benchmark/current/replays
+
+      - name: Benchmark pinned agent-v3 baseline
+        run: |
+          BASE="$RUNNER_TEMP/agent-v3-baseline"
+          git worktree add --detach "$BASE" "$BASELINE_COMMIT"
+          cp experiments/agent_v5_benchmark.py "$BASE/experiments/agent_v5_benchmark.py"
+          mkdir -p ci-artifacts/v5-benchmark/baseline/replays
+          (
+            cd "$BASE"
+            timeout 540s python -m experiments.agent_v5_benchmark \
+              --opponent "$GITHUB_WORKSPACE/public/A.ipynb" \
+              --seeds 1 7 \
+              --output "$GITHUB_WORKSPACE/ci-artifacts/v5-benchmark/baseline/summary.json" \
+              --replay-dir "$GITHUB_WORKSPACE/ci-artifacts/v5-benchmark/baseline/replays"
+          )
+
+      - name: Compare v5 with baseline
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("ci-artifacts/v5-benchmark")
+          candidate_path = root / "current" / "summary.json"
+          baseline_path = root / "baseline" / "summary.json"
+          if not candidate_path.exists() or not baseline_path.exists():
+              print("benchmark summary missing; earlier step failed")
+              raise SystemExit(0)
+
+          candidate = json.loads(candidate_path.read_text())
+          baseline = json.loads(baseline_path.read_text())
+
+          def match_index(report):
+              return {row["seed"]: row for row in report["matches"]}
+
+          C = match_index(candidate)
+          B = match_index(baseline)
+          per_seed = []
+          for seed in sorted(set(C) & set(B)):
+              c, b = C[seed], B[seed]
+              per_seed.append({
+                  "seed": seed,
+                  "cash": {"baseline": b["current_cash"], "v5": c["current_cash"],
+                           "delta": c["current_cash"] - b["current_cash"]},
+                  "margin": {"baseline": b["margin"], "v5": c["margin"],
+                             "delta": c["margin"] - b["margin"]},
+                  "plant_to_weed": {"baseline": b["health"]["plant_to_weed"],
+                                     "v5": c["health"]["plant_to_weed"]},
+                  "animal_escapes": {"baseline": b["health"]["animal_escapes"],
+                                      "v5": c["health"]["animal_escapes"]},
+                  "turnover_gap_max_steps": {
+                      "baseline": b["health"]["turnover_gap_max_steps"],
+                      "v5": c["health"]["turnover_gap_max_steps"],
+                  },
+                  "candidates_evaluated": {
+                      "baseline": b["planner"]["candidates_evaluated"],
+                      "v5": c["planner"]["candidates_evaluated"],
+                  },
+              })
+
+          comparison = {
+              "baseline_commit": "d8aaff07d00fc8836a3f7d3c6ed828269f943f39",
+              "candidate_commit": "${{ github.sha }}",
+              "opponent_sha256": candidate.get("opponent_sha256"),
+              "aggregate": {
+                  "average_cash": {
+                      "baseline": baseline["aggregate"]["average_cash"],
+                      "v5": candidate["aggregate"]["average_cash"],
+                      "delta": candidate["aggregate"]["average_cash"] - baseline["aggregate"]["average_cash"],
+                  },
+                  "average_margin": {
+                      "baseline": baseline["aggregate"]["average_margin"],
+                      "v5": candidate["aggregate"]["average_margin"],
+                      "delta": candidate["aggregate"]["average_margin"] - baseline["aggregate"]["average_margin"],
+                  },
+                  "plant_to_weed": {
+                      "baseline": baseline["aggregate"]["plant_to_weed"],
+                      "v5": candidate["aggregate"]["plant_to_weed"],
+                  },
+                  "animal_escapes": {
+                      "baseline": baseline["aggregate"]["animal_escapes"],
+                      "v5": candidate["aggregate"]["animal_escapes"],
+                  },
+                  "candidates_evaluated": {
+                      "baseline": baseline["aggregate"]["candidates_evaluated"],
+                      "v5": candidate["aggregate"]["candidates_evaluated"],
+                  },
+              },
+              "latency": {
+                  "baseline": baseline["latency"],
+                  "v5": candidate["latency"],
+                  "delta_p95_seconds": candidate["latency"]["p95_seconds"] - baseline["latency"]["p95_seconds"],
+                  "delta_max_seconds": candidate["latency"]["max_seconds"] - baseline["latency"]["max_seconds"],
+              },
+              "per_seed": per_seed,
+          }
+          path = root / "comparison.json"
+          path.write_text(json.dumps(comparison, indent=2) + "\n")
+          print(json.dumps(comparison, indent=2))
+          PY
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-v5-benchmark-${{ github.sha }}
+          path: |
+            ci-artifacts/v5-benchmark
+            ci-artifacts-v5-requirements.txt
+          if-no-files-found: warn
+          retention-days: 14
