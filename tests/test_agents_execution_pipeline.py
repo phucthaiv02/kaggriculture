@@ -4,6 +4,7 @@ from agents.expansion_agent import (
     _needs_route_rebuild,
     _plans_have_work,
     _pop_market_batch,
+    _should_keep_incumbent_route,
     _strip_partial_animal_builds,
 )
 from agents.farm_tasks import Task
@@ -69,6 +70,34 @@ def test_empty_worker_plan_container_is_not_treated_as_live_schedule():
     assert _plans_have_work([
         WorkerPlan((4, 4), []), WorkerPlan((5, 4), [["WEST"]])
     ])
+
+
+def test_incomplete_rolling_candidate_keeps_valid_incumbent():
+    incumbent = [WorkerPlan((1, 1), [["WEST"], ["WATER"]])]
+    missing = Task((0, 1), [["WATER"]], mandatory=True)
+
+    assert _should_keep_incumbent_route(
+        incumbent, [missing], previous_invalidated=False, worker_count=1
+    )
+    assert not _should_keep_incumbent_route(
+        incumbent, [missing], previous_invalidated=True, worker_count=1
+    )
+    assert not _should_keep_incumbent_route(
+        [WorkerPlan((1, 1), [])], [missing],
+        previous_invalidated=False, worker_count=1,
+    )
+    assert not _should_keep_incumbent_route(
+        incumbent, [missing], previous_invalidated=False, worker_count=2
+    )
+
+
+def test_optional_rolling_loss_does_not_block_better_candidate():
+    incumbent = [WorkerPlan((1, 1), [["WEST"]])]
+    optional = Task((0, 1), [["WATER"]], mandatory=False)
+
+    assert not _should_keep_incumbent_route(
+        incumbent, [optional], previous_invalidated=False, worker_count=1
+    )
 
 
 def test_rolling_keeps_zero_distance_admitted_successor_before_remote_feed():
