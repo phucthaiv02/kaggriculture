@@ -1,6 +1,7 @@
 from collections import Counter
 
 from agents.expansion_agent import (
+    _market_remainder,
     _needs_route_rebuild,
     _plans_have_work,
     _pop_market_batch,
@@ -22,6 +23,17 @@ def test_market_batch_preserves_orders_beyond_engine_cap():
     assert len(second) == 3
     assert first + second == [["HIRE", index] for index in range(13)]
     assert queue == []
+
+
+def test_market_remainder_keeps_seed_hire_and_other_orders_beyond_engine_cap():
+    orders = [["SELL", "MILK", 1] for _ in range(10)] + [
+        ["BUY_SEED", "WHEAT", 3],
+        ["HIRE"],
+        ["BUY_ANIMAL", "COW", 1],
+        ["BUY_PRODUCT", "WHEAT", 2],
+    ]
+
+    assert _market_remainder(orders) == orders[10:]
 
 
 def test_post_opening_never_leaves_standalone_animal_build():
