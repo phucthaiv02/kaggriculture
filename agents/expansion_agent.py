@@ -72,6 +72,11 @@ def _pop_market_batch(queue, cap=MARKET_ORDER_CAP):
     return batch
 
 
+def _market_remainder(orders, cap=MARKET_ORDER_CAP):
+    """Preserve every valid order the engine cap defers to a later turn."""
+    return list(orders[cap:])
+
+
 def _strip_partial_animal_builds(tasks, opening_active=False):
     """Post-opening, BUILD and PLACE are one atomic investment task."""
     if opening_active:
@@ -604,10 +609,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             )
             full_market = list(sales) + list(orders)
             if not state["opening_active"]:
-                state["morning_market_queue"] = [
-                    order for order in full_market[MARKET_ORDER_CAP:]
-                    if order[0] in ("BUY_ANIMAL", "BUY_PRODUCT")
-                ]
+                state["morning_market_queue"] = _market_remainder(full_market)
             return {
                 "farmer": ["PASS"], "hands": [["PASS"] for _ in farm["hands"]],
                 "market": full_market[:MARKET_ORDER_CAP],
