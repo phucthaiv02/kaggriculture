@@ -37,7 +37,14 @@ def queue_commitments(positions, plans):
 
 
 def reconcile_animals(obs, targets):
-    """Pin owned animals to compatible vacant tiles until a daily plan places them."""
+    """Pin owned animals without changing a target chosen by the planner.
+
+    Reconciliation is an execution concern: it may attach carried/shed stock to
+    an already-compatible target, or to a genuinely unplanned vacant tile, but
+    it must never turn (for example) a SHEEP target into COW merely because a
+    COW happens to be in inventory. Target selection remains owned by the
+    opening book / planner.
+    """
     farm = obs["farms"][obs["player"]]
     stock = Counter(obs["private"]["shed"])
     for inventory in obs["private"]["inventories"]:
@@ -52,6 +59,9 @@ def reconcile_animals(obs, targets):
                 position = (x, y)
                 if position in pinned:
                     continue
+                target = targets.get(position)
+                if target is not None and target[0] != animal:
+                    continue
                 compatible = tile is None or (
                     isinstance(tile, dict)
                     and tile.get("kind") == ANIMAL_STRUCTURE[animal]
@@ -61,7 +71,7 @@ def reconcile_animals(obs, targets):
                     candidates.append(position)
         candidates.sort(
             key=lambda p: (
-                targets.get(p) != (animal, False),
+                targets.get(p) is None,
                 farm["tiles"][p[1]][p[0]] is None,
                 abs(p[0] - 4) + abs(p[1] - 4),
                 p,
