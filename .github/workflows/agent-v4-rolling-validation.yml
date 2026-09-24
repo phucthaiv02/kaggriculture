@@ -41,5 +41,6 @@ jobs:
             tests/test_agents_scheduler.py \
             tests/test_agents_farm_tasks.py \
             tests/test_agents_execution_pipeline.py \
+            tests/test_agents_day3_trace.py \
             tests/test_agents_day4_trace.py \
             tests/test_agents_integration.py
