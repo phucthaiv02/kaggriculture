@@ -109,6 +109,30 @@ def _plans_have_work(plans):
     return any(plan.queue for plan in plans)
 
 
+def _should_keep_incumbent_route(
+    previous_plans,
+    candidate_unassigned,
+    previous_invalidated,
+    worker_count,
+):
+    """Keep a still-valid feasible route if a rolling candidate loses work.
+
+    Daily admission is the authority on what must finish. Rolling routing may
+    improve worker assignment and order, but it is only a candidate replacement.
+    If that candidate drops an admitted mandatory task while the current route
+    still has executable work and was not invalidated by the engine, replacing
+    the incumbent would turn a feasible schedule into an incomplete one.
+
+    An invalidated route, an exhausted route, or a worker-count mismatch is not
+    a safe incumbent and must be rebuilt from live state instead.
+    """
+    if previous_invalidated:
+        return False
+    if len(previous_plans) != worker_count or not _plans_have_work(previous_plans):
+        return False
+    return any(task.mandatory is not False for task in candidate_unassigned)
+
+
 # One land purchase unlocks one 5x5 quadrant. Price and admit up to the whole
 # quadrant in the following morning instead of intentionally carrying 5-15
 # already-selected empty tiles for extra days. Target scoring itself is unchanged.
@@ -310,6 +334,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         "purchase_positions": set(), "committed_targets": set(),
         "investment_backlog": set(), "daily_targets": {},
         "morning_market_queue": [], "replan_needed": True,
+        "route_invalidated": False,
     }
     opening_governs = make_opening_controller()
 
@@ -325,10 +350,13 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
 
         `frozen_positions` is the daily schedule boundary. Rebuilding may change
         worker assignment and route order inside that set, but it cannot pull in
-        a task the daily admission did not accept. There is deliberately no
-        stale-queue fallback: an exhausted WorkerPlan is not evidence that its
-        old schedule is still feasible.
+        a task the daily admission did not accept. The existing route is the
+        feasibility incumbent: a new rolling candidate may replace it only if
+        the candidate still covers every admitted mandatory task. An exhausted
+        or engine-invalidated route is never retained merely because it is old.
         """
+        previous_plans = state["plans"]
+        previous_invalidated = state["route_invalidated"]
         frozen_targets = {
             position: targets.get(position)
             for position in state["frozen_positions"]
@@ -361,12 +389,31 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             _open_shed_access(farm),
             obs["private"]["shed"],
         )
+
+        if _should_keep_incumbent_route(
+            previous_plans,
+            unassigned,
+            previous_invalidated,
+            len(starts),
+        ):
+            # The candidate lost already-admitted work. Keep executing the
+            # remaining incumbent queue; the next state-changing observation
+            # may yield a strictly better complete candidate.
+            state["unassigned"] = [
+                task for task in state["unassigned"]
+                if task.mandatory is False
+            ]
+            state["replan_needed"] = False
+            state["route_invalidated"] = False
+            return
+
         state["plans"], state["unassigned"] = plans, unassigned
         assigned = {id(task) for task in replanned} - {id(task) for task in unassigned}
         state["reserved"] = reserved_items(
             [task for task in replanned if id(task) in assigned]
         )
         state["replan_needed"] = False
+        state["route_invalidated"] = False
 
     def agent(obs, configuration=None):
         effective_end = end_day
@@ -500,6 +547,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                 plans=[], reserved={},
                 frozen_positions=set(), unassigned=[], schedule_admitted=False,
                 morning_market_queue=[], replan_needed=True,
+                route_invalidated=False,
             )
             # hands_needed already ran the exact feasibility pack at the chosen
             # headcount. Repacking the same tasks here was a duplicate
@@ -682,6 +730,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             # The admission pass just produced a route from this exact live
             # observation. Do not immediately throw it away with a second pack.
             state["replan_needed"] = False
+            state["route_invalidated"] = False
 
         if state["replan_needed"] or not _plans_have_work(state["plans"]):
             _rebuild_rolling_routes(obs, farm, hour)
@@ -779,6 +828,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         # maintenance. Rebuild only after a dependency/topology change, an
         # invalidated queued op, or a market purchase that changes available
         # inputs on the next observation.
+        state["route_invalidated"] = invalidated
         state["replan_needed"] = bool(
             invalidated
             or _needs_route_rebuild(worker_ops)
