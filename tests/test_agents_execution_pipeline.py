@@ -104,3 +104,32 @@ def test_rolling_keeps_zero_distance_admitted_successor_before_remote_feed():
     assert not unassigned
     assert plans[0].queue[:2] == [["PLANT", "WHEAT"], ["WATER"]]
     assert ["FEED"] in plans[0].queue[2:]
+
+
+def test_rolling_does_nearby_mandatory_work_before_drop_when_it_saves_budget():
+    """Carried output must not force an avoidable shed round trip.
+
+    From (2,3), DROP-first needs 13 turns to visit (0,3) and finish four
+    scheduled actions. Visiting the tile first and DROPPING afterward needs 12,
+    so rolling routing must keep the admitted task feasible.
+    """
+    turnover = Task(
+        (0, 3),
+        [["WATER"], ["HARVEST"], ["PLANT", "WHEAT"], ["WATER"]],
+        sells=Counter({"WHEAT": 1}),
+        mandatory=True,
+    )
+
+    plans, unassigned = build_rolling_queues(
+        [turnover],
+        starts=[(2, 3)],
+        inventories=[{"WHEAT": 1}],
+        budgets=[12],
+        shed_access=((4, 4),),
+        shed={},
+    )
+
+    assert not unassigned
+    assert plans[0].queue[:2] == [["WEST"], ["WEST"]]
+    assert plans[0].queue[2:6] == turnover.actions
+    assert plans[0].queue[-1] == ["DROP"]
