@@ -10,19 +10,33 @@ python_bin="${PYTHON_BIN:-python}"
 mkdir -p "$build_dir"
 archive_tmp="$(mktemp "$build_dir/submission.tar.gz.XXXXXX")"
 smoke_dir="$(mktemp -d /tmp/kagriculture-submission.XXXXXX)"
+stage_dir="$(mktemp -d /tmp/kagriculture-build.XXXXXX)"
 
 cleanup() {
     rm -f -- "$archive_tmp"
     rm -rf -- "$smoke_dir"
+    rm -rf -- "$stage_dir"
 }
 trap cleanup EXIT
 
-cd "$repo_dir"
+# ``agents`` collides with kaggle_environments.envs.lux_ai_s3.agents when
+# Kaggle executes main.py as raw source rather than importing it as a module.
+# Give the submitted package a competition-specific name while leaving the
+# development package (and all local imports/tests) unchanged.
+cp -R "$repo_dir/agents" "$stage_dir/kagriculture_agent"
+sed 's/from agents\./from kagriculture_agent./g; s/import agents\./import kagriculture_agent./g' \
+    "$repo_dir/main.py" > "$stage_dir/main.py"
+find "$stage_dir/kagriculture_agent" -type f -name '*.py' -exec \
+    sed -i \
+        -e 's/from agents\./from kagriculture_agent./g' \
+        -e 's/import agents\./import kagriculture_agent./g' {} +
+
+cd "$stage_dir"
 tar \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
     -czf "$archive_tmp" \
-    main.py agents
+    main.py kagriculture_agent
 
 tar -xzf "$archive_tmp" -C "$smoke_dir"
 cd "$smoke_dir"
