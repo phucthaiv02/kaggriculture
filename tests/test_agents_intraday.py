@@ -3,7 +3,7 @@
 from collections import Counter
 
 from agents.farm_tasks import Task, build_tasks
-from agents.intraday import queue_commitments
+from agents.intraday import queue_commitments, reconcile_animals
 from agents.rolling_scheduler import build_rolling_queues, planning_observation
 from agents.scheduler import SHED_ACCESS, WorkerPlan
 from test_agents_farm_tasks import animal_tile, make_obs
@@ -90,3 +90,24 @@ def test_queue_commitments_describes_only_current_ephemeral_routes():
     assert occupied == {(5, 4)}
     assert not seeds
     assert supplies == {"WHEAT": 1}
+
+
+def test_animal_reconciliation_never_rewrites_a_different_planned_target():
+    obs = make_obs(
+        day=3,
+        tiles={
+            (3, 3): {"kind": "PASTURE"},
+            (4, 3): {"kind": "PASTURE"},
+        },
+        shed={"COW": 1},
+    )
+    targets = {
+        (3, 3): ("SHEEP", False),
+        (4, 3): ("COW", False),
+    }
+
+    pinned = reconcile_animals(obs, targets)
+
+    assert pinned == {(4, 3)}
+    assert targets[(3, 3)] == ("SHEEP", False)
+    assert targets[(4, 3)] == ("COW", False)
