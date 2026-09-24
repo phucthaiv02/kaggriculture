@@ -1,4 +1,4 @@
-"""Focused regression/diagnostic for the opening Day-4 WHEAT turnover.
+"""Focused regressions/diagnostics for opening crop turnover and survival.
 
 The Day-4 WHEAT schedule is a useful stress case for rolling execution:
 successor PLANT+WATER chains admitted that morning must survive every
@@ -9,6 +9,8 @@ from kaggle_environments import make
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
 
 from agents.expansion_agent import make_agent
+from agents.farm_tasks import build_tasks
+from agents.rolling_scheduler import planning_observation
 from experiments.crop_schedules import pass_agent
 from tests.test_agents_integration import END_DAY, configuration
 
@@ -144,3 +146,103 @@ def test_all_opening_wheat_successors_finish_on_day_four():
             return
 
     raise AssertionError("simulation never reached day 5 hour 0")
+
+
+def test_no_opening_crop_turns_to_weed_through_day_five():
+    """Protect every live crop, not just the Day-4 WHEAT turnover cohort."""
+    env = make("kaggriculture", configuration=configuration(1), debug=False)
+    agent = make_agent(END_DAY, seed=1)
+    cells = {
+        name: cell.cell_contents
+        for name, cell in zip(agent.__code__.co_freevars, agent.__closure__)
+    }
+    planner_state = cells["state"]
+    targets = cells["targets"]
+    state = env.state
+    history = {}
+
+    for step in range(int(env.configuration.episodeSteps) - 1):
+        obs = state[0].observation
+        before_tiles = obs.farms[0]["tiles"]
+        action = agent(obs)
+
+        if 3 <= obs.day <= 5:
+            worker_positions = [
+                tuple(obs.farms[0]["farmer"]),
+                *map(tuple, obs.farms[0]["hands"]),
+            ]
+            worker_ops = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
+            ops_by_position = {
+                position: operation
+                for position, operation in zip(worker_positions, worker_ops)
+                if operation != ["PASS"]
+            }
+            frozen = set(planner_state.get("frozen_positions", ()))
+            frozen_targets = {position: targets.get(position) for position in frozen}
+            generated = build_tasks(
+                planning_observation(obs),
+                frozen_targets,
+                prioritize_fertilizer_drop=planner_state.get("opening_active", False),
+                include_physical=False,
+            )
+            generated_by_position = {
+                task.position: _compact_task(task) for task in generated
+            }
+            unassigned_positions = {
+                task.position for task in planner_state.get("unassigned", ())
+            }
+            for y, row in enumerate(before_tiles):
+                for x, tile in enumerate(row):
+                    if not (isinstance(tile, dict) and tile.get("kind") == "PLANT"):
+                        continue
+                    position = (x, y)
+                    history.setdefault(position, []).append((
+                        obs.day,
+                        obs.hour,
+                        _tile_summary(tile),
+                        targets.get(position),
+                        position in frozen,
+                        position in unassigned_positions,
+                        generated_by_position.get(position),
+                        ops_by_position.get(position),
+                        tuple(tuple(op) for plan in planner_state.get("plans", ()) for op in plan.queue
+                              if op and op[0] == "WATER"),
+                    ))
+
+        state[0].action = action
+        state[1].action = pass_agent(state[1].observation)
+        state = official_game.interpreter(state, env)
+        state[0].observation.step = step + 1
+        next_obs = state[0].observation
+
+        if 3 <= obs.day <= 5:
+            transitions = []
+            for y, row in enumerate(before_tiles):
+                for x, before in enumerate(row):
+                    after = next_obs.farms[0]["tiles"][y][x]
+                    if (
+                        isinstance(before, dict)
+                        and before.get("kind") == "PLANT"
+                        and isinstance(after, dict)
+                        and after.get("kind") == "WEED"
+                    ):
+                        transitions.append((x, y))
+            assert not transitions, {
+                "transition_from": (obs.day, obs.hour),
+                "transition_to": (next_obs.day, next_obs.hour),
+                "positions": transitions,
+                "trace": {
+                    position: history.get(position, [])[-30:]
+                    for position in transitions
+                },
+                "hands": len(obs.farms[0]["hands"]),
+                "hand_target": planner_state.get("hand_target"),
+                "mandatory_hand_target": planner_state.get("mandatory_hand_target"),
+                "route_invalidated": planner_state.get("route_invalidated"),
+                "replan_needed": planner_state.get("replan_needed"),
+            }
+
+        if next_obs.day > 5:
+            return
+
+    raise AssertionError("simulation ended before day five crop survival trace completed")
