@@ -101,3 +101,28 @@ def test_direct_choose_compatibility_does_not_expand_paths(monkeypatch):
     monkeypatch.setattr(wiring, "production_path_candidates", fail)
     monkeypatch.setattr(planner, "evaluate_targets", lambda *args, **kwargs: [])
     planner._choose(None, None, [], Counter())
+
+
+def test_schedule_guard_detects_mandatory_feed_beyond_turn_budget():
+    from agents.farm_tasks import Task
+    from agents.scheduler import WorkerPlan
+    from agents.v5_schedule_guard import missing_mandatory_tasks
+
+    feed = Task(
+        (2, 0), [["FEED"]], needs=Counter({"WHEAT": 1}), mandatory=True,
+    )
+    plan = WorkerPlan((0, 0), [["EAST"], ["EAST"], ["FEED"]])
+
+    assert missing_mandatory_tasks([feed], [plan], [2]) == [feed]
+    assert missing_mandatory_tasks([feed], [plan], [3]) == []
+
+
+def test_schedule_guard_ignores_optional_work_outside_budget():
+    from agents.farm_tasks import Task
+    from agents.scheduler import WorkerPlan
+    from agents.v5_schedule_guard import missing_mandatory_tasks
+
+    optional = Task((1, 0), [["HARVEST"]], mandatory=False)
+    plan = WorkerPlan((0, 0), [["EAST"], ["HARVEST"]])
+
+    assert missing_mandatory_tasks([optional], [plan], [1]) == []
