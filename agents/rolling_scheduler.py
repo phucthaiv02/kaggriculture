@@ -217,76 +217,6 @@ def _choose_carried_assignment(tasks, starts, inventories, budgets, shed_access,
     return buckets, remaining, shed_left, []
 
 
-def _pin_predeposit_mandatory(
-    buckets,
-    remaining,
-    starts,
-    inventories,
-    budgets,
-    shed_access,
-):
-    """Do nearby no-input admitted work before returning carried output.
-
-    A worker carrying harvested output is still perfectly able to WATER,
-    HARVEST, DIG or consume a globally-owned seed on another scheduled tile.
-    Forcing DROP first adds a shed round trip and can make a schedule that was
-    feasible at admission become infeasible later in the same day. Repeatedly
-    attach mandatory tasks with no worker-carried input dependency when the
-    whole `current route -> task -> eventual DROP` still fits the worker budget.
-
-    The final DROP remains part of the feasibility check, so this optimization
-    cannot strand carried goods merely to squeeze in more work.
-    """
-    remaining = list(remaining)
-    while True:
-        best = None
-        for task_index, task in enumerate(remaining):
-            if task.mandatory is False or any(amount > 0 for amount in task.needs.values()):
-                continue
-            for worker, bucket in enumerate(buckets):
-                base_queue, base_end, base_carried = _bucket_queue(
-                    starts[worker], bucket, shed_access, inventories[worker]
-                )
-                if not base_carried:
-                    continue
-
-                candidate_bucket = bucket + [task]
-                queue, end, carried_after = _bucket_queue(
-                    starts[worker], candidate_bucket, shed_access, inventories[worker]
-                )
-                if carried_after:
-                    shed = nearest_shed(end, shed_access)
-                    projected = len(queue) + len(route(end, shed)) + 1
-                else:
-                    projected = len(queue)
-                if projected > budgets[worker]:
-                    continue
-
-                base_shed = nearest_shed(base_end, shed_access)
-                base_projected = len(base_queue) + len(route(base_end, base_shed)) + 1
-                distance = (
-                    abs(base_end[0] - task.position[0])
-                    + abs(base_end[1] - task.position[1])
-                )
-                key = (
-                    projected - base_projected,
-                    distance,
-                    projected,
-                    task.position[1],
-                    task.position[0],
-                    worker,
-                    task_index,
-                )
-                if best is None or key < best[0]:
-                    best = (key, task_index, worker)
-
-        if best is None:
-            return buckets, remaining
-
-        _key, task_index, worker = best
-        buckets[worker].append(remaining.pop(task_index))
-
-
 def _routing_unassigned(tasks):
     """Only optional work may fall out while a resource dependency is in flight.
 
@@ -347,9 +277,10 @@ def build_rolling_queues(
     is meant to execute; callers rebuild from the next observation.
 
     Carried inventory is a real dependency, not stale queue state. Work that
-    can consume it stays with that carrier. Before returning unrelated output
-    to the shed, nearby admitted work that needs no carried input may stay on
-    that worker when doing so still leaves room for the final DROP.
+    can consume it stays with that carrier. Any inventory left after those
+    continuations is routed back to the shed before unrelated work. This is
+    what preserves old multi-turn flows such as fertilizer refinancing without
+    preserving the old frozen queue itself.
     """
     starts = [tuple(position) for position in starts]
     budgets = list(budgets)
@@ -372,9 +303,6 @@ def build_rolling_queues(
     pinned, remaining, shed_left, stranded = _choose_carried_assignment(
         tasks, starts, inventories, budgets, shed_access, shed
     )
-    pinned, remaining = _pin_predeposit_mandatory(
-        pinned, remaining, starts, inventories, budgets, shed_access
-    )
 
     prefixes, endpoints, remaining_budgets = [], [], []
     depositing = False
@@ -383,10 +311,10 @@ def build_rolling_queues(
     ):
         queue, end, carried_after = _bucket_queue(start, bucket, shed_access, inventory)
 
-        # Carried leftovers return to shared shed state only after local/nearby
-        # admitted work that can safely precede the deposit has been attached.
-        # `stranded` remains the resource-dependency case where another task
-        # cannot proceed until this worker actually DROPs its carried item.
+        # Once all directly consumable carried inputs have been assigned, any
+        # leftovers must become shared shed state again. Otherwise a per-turn
+        # rebuild can strand harvested goods or a collected FERTILIZER forever
+        # because the old queue continuation no longer exists.
         must_deposit = bool(carried_after) or worker in stranded
         if must_deposit:
             shed_position = nearest_shed(end, shed_access)
