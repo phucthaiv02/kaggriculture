@@ -163,10 +163,16 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
 
     for step in range(int(env.configuration.episodeSteps) - 1):
         obs = state[0].observation
+        before_day, before_hour = obs.day, obs.hour
         before_tiles = obs.farms[0]["tiles"]
+        before_snapshot = {
+            (x, y): _tile_summary(tile)
+            for y, row in enumerate(before_tiles)
+            for x, tile in enumerate(row)
+        }
         action = agent(obs)
 
-        if 3 <= obs.day <= 5:
+        if 3 <= before_day <= 5:
             worker_positions = [
                 tuple(obs.farms[0]["farmer"]),
                 *map(tuple, obs.farms[0]["hands"]),
@@ -191,23 +197,19 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
             unassigned_positions = {
                 task.position for task in planner_state.get("unassigned", ())
             }
-            for y, row in enumerate(before_tiles):
-                for x, tile in enumerate(row):
-                    if not (isinstance(tile, dict) and tile.get("kind") == "PLANT"):
-                        continue
-                    position = (x, y)
-                    history.setdefault(position, []).append((
-                        obs.day,
-                        obs.hour,
-                        _tile_summary(tile),
-                        targets.get(position),
-                        position in frozen,
-                        position in unassigned_positions,
-                        generated_by_position.get(position),
-                        ops_by_position.get(position),
-                        tuple(tuple(op) for plan in planner_state.get("plans", ()) for op in plan.queue
-                              if op and op[0] == "WATER"),
-                    ))
+            for position, tile in before_snapshot.items():
+                if not (isinstance(tile, dict) and tile.get("kind") == "PLANT"):
+                    continue
+                history.setdefault(position, []).append((
+                    before_day,
+                    before_hour,
+                    tile,
+                    targets.get(position),
+                    position in frozen,
+                    position in unassigned_positions,
+                    generated_by_position.get(position),
+                    ops_by_position.get(position),
+                ))
 
         state[0].action = action
         state[1].action = pass_agent(state[1].observation)
@@ -215,20 +217,20 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
         state[0].observation.step = step + 1
         next_obs = state[0].observation
 
-        if 3 <= obs.day <= 5:
+        if 3 <= before_day <= 5:
             transitions = []
-            for y, row in enumerate(before_tiles):
-                for x, before in enumerate(row):
-                    after = next_obs.farms[0]["tiles"][y][x]
-                    if (
-                        isinstance(before, dict)
-                        and before.get("kind") == "PLANT"
-                        and isinstance(after, dict)
-                        and after.get("kind") == "WEED"
-                    ):
-                        transitions.append((x, y))
+            for position, before in before_snapshot.items():
+                x, y = position
+                after = next_obs.farms[0]["tiles"][y][x]
+                if (
+                    isinstance(before, dict)
+                    and before.get("kind") == "PLANT"
+                    and isinstance(after, dict)
+                    and after.get("kind") == "WEED"
+                ):
+                    transitions.append(position)
             assert not transitions, {
-                "transition_from": (obs.day, obs.hour),
+                "transition_from": (before_day, before_hour),
                 "transition_to": (next_obs.day, next_obs.hour),
                 "positions": transitions,
                 "trace": {
