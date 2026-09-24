@@ -12,6 +12,7 @@ from __future__ import annotations
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
 
 LAND_ORDER = official_game.LAND_ORDER
+LAND_PRICES = official_game.LAND_PRICES
 
 # 12 MELON + 9 WHEAT + 2 COW + 2 SHEEP = 25 (NW's whole board). Wheat is
 # funded ahead of each animal's verified age-relative FEED schedule. In
@@ -21,7 +22,7 @@ OPENING_COUNTS = {"MELON": 12, "WHEAT": 9, "COW": 2, "SHEEP": 2}
 OPENING_SIZE = sum(OPENING_COUNTS.values())
 
 # Submit one fixed land purchase at hour 0 on each scheduled day index.
-LAND_BUY_DAYS = (7, 10)
+LAND_BUY_DAYS = (6, 10)
 
 # Convert two of the initial WHEAT targets to one COW and one SHEEP together
 # on day 2 (the UI's Day 3). Their two harvested WHEAT units can then feed

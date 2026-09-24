@@ -19,7 +19,8 @@ FARMER_BUDGET = 23
 HAND_BUDGET = 23
 SHED = (4, 4)
 SHED_ACCESS = ((4, 4), (5, 4), (4, 5), (5, 5))
-# Cap daily hiring; actual headcount is bounded by workload and cash.
+# Cap daily hiring; overflow HIRE orders are dispatched in morning batches
+# before routes freeze, so admission may use the full supported workforce.
 MAX_HANDS = 16
 
 
@@ -76,21 +77,36 @@ def _cashout_length(current, bucket, shed_for):
     return abs(current[0]-shed[0]) + abs(current[1]-shed[1]) + 1
 
 
-def _task_queue(start, bucket, shed_access):
+def _uncovered_needs(needs, inventory):
+    """Return supplies which are not already carried by this worker."""
+    available = Counter(inventory or {})
+    missing = Counter()
+    for item, amount in needs.items():
+        carried = min(amount, available[item])
+        available[item] -= carried
+        if amount > carried:
+            missing[item] = amount - carried
+    return missing
+
+
+def _task_queue(start, bucket, shed_access, initial_inventory=None):
     """Build the mandatory route, sharing execution and packing accounting.
 
     DROP empties the worker's inventory. Only collect supplies through the
     next DROP, so later supplies stay available in the shed in the meantime.
     """
     queue, current = [], start
+    carried = initial_inventory
     pickup_needed = True
     for task_index, task in enumerate(bucket):
-        if pickup_needed:
+        if pickup_needed and (task.needs or not task.ends_cycle):
             needs = Counter()
             for later in bucket[task_index:]:
                 needs.update(later.needs)
                 if later.immediate_drop:
                     break
+            needs = _uncovered_needs(needs, carried)
+            carried = None
             if needs:
                 shed = nearest_shed(current, shed_access)
                 queue += route(current, shed)
@@ -115,7 +131,7 @@ def _task_queue(start, bucket, shed_access):
     return queue, current
 
 
-def _task_length(start, bucket, shed_for):
+def _task_length(start, bucket, shed_for, initial_inventory=None):
     """Count mandatory steps without allocating speculative action queues."""
     # Almost every production route has just one initial supply pickup.
     # Avoid Counter allocation/update for every speculative insertion.
@@ -124,6 +140,7 @@ def _task_length(start, bucket, shed_for):
         for task in bucket:
             for item, amount in task.needs.items():
                 needs[item] = needs.get(item, 0) + amount
+        needs = _uncovered_needs(needs, initial_inventory)
         current, length = start, 0
         if needs:
             current = shed_for(start)
@@ -135,13 +152,16 @@ def _task_length(start, bucket, shed_for):
             current = position
         return length + _cashout_length(current, bucket, shed_for)
     length, current, pickup_needed = 0, start, True
+    carried = initial_inventory
     for index, task in enumerate(bucket):
-        if pickup_needed:
+        if pickup_needed and (task.needs or not task.ends_cycle):
             needs = Counter()
             for later in bucket[index:]:
                 needs.update(later.needs)
                 if later.immediate_drop:
                     break
+            needs = _uncovered_needs(needs, carried)
+            carried = None
             if needs:
                 shed = shed_for(current)
                 length += abs(current[0]-shed[0]) + abs(current[1]-shed[1])
@@ -181,10 +201,6 @@ def _priority(task):
     )
 
 
-def _rescue_priority(task):
-    """Compatibility alias for the single daily priority policy."""
-    return _priority(task)
-
 
 def _bucket_budget(base_budget, bucket, terminal_day):
     """Return the executable worker budget for one terminal-day bucket.
@@ -205,6 +221,7 @@ def _pack_greedy(
     shed_access=SHED_ACCESS,
     variant=0,
     group_animal=False,
+    worker_inventories=None,
 ):
     """Greedy bin-pack using exact route length with an O(1) common fast path.
 
@@ -215,6 +232,7 @@ def _pack_greedy(
     tasks retain the exact legacy projection as a bounded slow path.
     """
     buckets = [[] for _ in worker_starts]
+    worker_inventories = list(worker_inventories or [{} for _ in worker_starts])
 
     sheds = {}
     def shed_for(position):
@@ -225,8 +243,7 @@ def _pack_greedy(
     def distance(a, b):
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-    priority_for = _rescue_priority if group_animal else _priority
-    priorities = {id(task): priority_for(task) for task in tasks}
+    priorities = {id(task): _priority(task) for task in tasks}
     terminal_day = any(task.terminal_day or task.cashout for task in tasks)
 
     if group_animal:
@@ -303,7 +320,13 @@ def _pack_greedy(
                     elif _is_animal_service(queued):
                         paired_service = index
 
-            use_fast = fast_bucket[worker] and task_fast
+            deferred_cashout = any(
+                queued.ends_cycle and not queued.needs for queued in [*bucket, task]
+            )
+            use_fast = (
+                fast_bucket[worker] and task_fast and not worker_inventories[worker]
+                and not ((need_items[worker] or task_need_items) and deferred_cashout)
+            )
             if use_fast:
                 old_items = need_items[worker]
                 new_pickups = len(old_items | task_need_items)
@@ -348,7 +371,10 @@ def _pack_greedy(
                     fast_detail = candidate_path
                 else:
                     candidate_bucket = bucket[:insertion] + [task] + bucket[insertion:]
-                    projected = _task_length(worker_starts[worker], candidate_bucket, shed_for)
+                    projected = _task_length(
+                        worker_starts[worker], candidate_bucket, shed_for,
+                        worker_inventories[worker],
+                    )
                     fits = projected <= _bucket_budget(
                         budgets[worker], candidate_bucket, terminal_day
                     )
@@ -433,6 +459,7 @@ def _pack(
     budgets,
     shed_access=SHED_ACCESS,
     optimize_routes=True,
+    worker_inventories=None,
 ):
     """Pack tasks, separating feasibility search from route polishing.
 
@@ -441,13 +468,17 @@ def _pack(
     scale badly with farm size. Final queue construction may still request
     route polishing, but stops as soon as no sellable output is stranded.
     """
-    best = _pack_greedy(tasks, worker_starts, budgets, shed_access)
+    best = _pack_greedy(
+        tasks, worker_starts, budgets, shed_access,
+        worker_inventories=worker_inventories,
+    )
     if not tasks or _full_assignment_step_lower_bound(tasks, worker_starts) > sum(budgets):
         return best
 
     if best[1] and any(_is_animal_service(task) for task in tasks):
         grouped = _pack_greedy(
-            tasks, worker_starts, budgets, shed_access, group_animal=True
+            tasks, worker_starts, budgets, shed_access, group_animal=True,
+            worker_inventories=worker_inventories,
         )
         if not grouped[1]:
             return grouped
@@ -457,7 +488,8 @@ def _pack(
             return best
         for variant in (1, 2, 3):
             candidate = _pack_greedy(
-                tasks, worker_starts, budgets, shed_access, variant
+                tasks, worker_starts, budgets, shed_access, variant,
+                worker_inventories=worker_inventories,
             )
             if not candidate[1]:
                 return candidate
@@ -488,7 +520,10 @@ def _pack(
         return best
 
     for variant in (1, 2, 3):
-        candidate = _pack_greedy(tasks, worker_starts, budgets, shed_access, variant)
+        candidate = _pack_greedy(
+            tasks, worker_starts, budgets, shed_access, variant,
+            worker_inventories=worker_inventories,
+        )
         candidate_score = score(candidate)
         if candidate_score < best_score:
             best, best_score = candidate, candidate_score
@@ -663,6 +698,7 @@ def build_queues(
     existing_hand_budget=None,
     worker_budgets=None,
     available_wheat=None,
+    worker_inventories=None,
 ):
     """Assign tasks to farmer + hand_count hands and build their routes.
 
@@ -685,18 +721,41 @@ def build_queues(
         if len(worker_budgets) != len(starts):
             raise ValueError("worker_budgets must contain one budget per worker")
         budgets = list(worker_budgets)
-    buckets, unassigned = _pack(tasks, starts, budgets, shed_access)
+    worker_inventories = list(worker_inventories or [{} for _ in starts])
+    if len(worker_inventories) != len(starts):
+        raise ValueError("worker_inventories must contain one inventory per worker")
+    buckets, unassigned = _pack(
+        tasks, starts, budgets, shed_access,
+        worker_inventories=worker_inventories,
+    )
 
     demand = sum(t.needs.get("WHEAT", 0) for t in tasks)
     if available_wheat is not None and 1 < demand <= available_wheat and len(shed_access) > 1:
-        buckets = _rebalance_feed(buckets, starts, budgets, shed_access, tasks)
+        admitted_buckets = buckets
+        rebalanced = _rebalance_feed(
+            [list(bucket) for bucket in buckets], starts, budgets, shed_access, tasks
+        )
+        # Rebalancing is only a route optimization. It may never invalidate
+        # admission by producing a concrete queue which cannot finish inside
+        # that worker remaining turns. Validate exact queues, including carried
+        # supplies, rather than relying on another route-length estimate.
+        terminal = any(t.terminal_day or t.cashout for t in tasks)
+        rebalanced_fits = True
+        for start, budget, bucket, inventory in zip(
+            starts, budgets, rebalanced, worker_inventories
+        ):
+            queue, _ = _task_queue(start, bucket, shed_access, inventory)
+            if len(queue) > _bucket_budget(budget, bucket, terminal):
+                rebalanced_fits = False
+                break
+        buckets = rebalanced if rebalanced_fits else admitted_buckets
 
     plans = []
-    for start, budget, bucket in zip(starts, budgets, buckets):
+    for start, budget, bucket, inventory in zip(starts, budgets, buckets, worker_inventories):
         if not bucket:
             plans.append(WorkerPlan(start, []))
             continue
-        queue, current = _task_queue(start, bucket, shed_access)
+        queue, current = _task_queue(start, bucket, shed_access, inventory)
         carries_sellable = any(task.sells and not task.immediate_drop for task in bucket)
         if carries_sellable and not _cashout_needed(bucket):
             shed = nearest_shed(current, shed_access)

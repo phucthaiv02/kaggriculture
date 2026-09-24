@@ -41,10 +41,6 @@ def schedule_open_tiles(obs, targets, plans, shed_access, hire_costs=()):
     return {}, 0
 
 
-def rescue_survival(obs, plans):
-    """Deprecated compatibility hook; survival belongs to the daily task set."""
-    return None
-
 
 def reconcile_animals(obs, targets):
     """Pin owned animals to compatible vacant tiles until a daily plan places them."""

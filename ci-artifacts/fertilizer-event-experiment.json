@@ -1,0 +1,220 @@
+{
+  "purpose": "dated fertilizer opportunity-cost experiment",
+  "day": 8,
+  "end_day": 24,
+  "searched": [
+    {
+      "supply": 1,
+      "found": true,
+      "best_gain": 10.0
+    },
+    {
+      "supply": 2,
+      "found": true,
+      "best_gain": 10.0
+    },
+    {
+      "supply": 3,
+      "found": true,
+      "best_gain": 10.0
+    },
+    {
+      "supply": 4,
+      "found": true,
+      "best_gain": 10.0
+    },
+    {
+      "supply": 5,
+      "found": true,
+      "best_gain": 10.0
+    },
+    {
+      "supply": 6,
+      "found": true,
+      "best_gain": 10.0
+    }
+  ],
+  "case": {
+    "initial_fertilizer_stock": 10270,
+    "fertilizer_sales_per_day": 1,
+    "events": [
+      10,
+      14,
+      18,
+      22
+    ],
+    "fertilizer_spot_sale_price": {
+      "10": 46,
+      "14": 45,
+      "18": 44,
+      "22": 43
+    },
+    "fertilizer_horizon_opportunity_cost": {
+      "10": 43.0,
+      "14": 43.0,
+      "18": 43.0,
+      "22": 43.0
+    },
+    "best_event_plan": {
+      "fertilize_days": [
+        18,
+        22
+      ],
+      "market_cash": 438.0,
+      "fertilizer_uses": 2,
+      "wheat_sales": 20
+    },
+    "best_boolean_plan": {
+      "fertilize_days": [],
+      "market_cash": 428.0,
+      "fertilizer_uses": 0,
+      "wheat_sales": 16
+    },
+    "gain_over_boolean": 10.0,
+    "plans": [
+      {
+        "fertilize_days": [
+          18,
+          22
+        ],
+        "market_cash": 438.0,
+        "fertilizer_uses": 2,
+        "wheat_sales": 20
+      },
+      {
+        "fertilize_days": [
+          22
+        ],
+        "market_cash": 436.0,
+        "fertilizer_uses": 1,
+        "wheat_sales": 18
+      },
+      {
+        "fertilize_days": [
+          14,
+          22
+        ],
+        "market_cash": 435.0,
+        "fertilizer_uses": 2,
+        "wheat_sales": 20
+      },
+      {
+        "fertilize_days": [
+          14,
+          18,
+          22
+        ],
+        "market_cash": 435.0,
+        "fertilizer_uses": 3,
+        "wheat_sales": 22
+      },
+      {
+        "fertilize_days": [
+          18
+        ],
+        "market_cash": 433.0,
+        "fertilizer_uses": 1,
+        "wheat_sales": 18
+      },
+      {
+        "fertilize_days": [
+          10,
+          22
+        ],
+        "market_cash": 432.0,
+        "fertilizer_uses": 2,
+        "wheat_sales": 20
+      },
+      {
+        "fertilize_days": [
+          10,
+          18,
+          22
+        ],
+        "market_cash": 432.0,
+        "fertilizer_uses": 3,
+        "wheat_sales": 22
+      },
+      {
+        "fertilize_days": [
+          14
+        ],
+        "market_cash": 430.0,
+        "fertilizer_uses": 1,
+        "wheat_sales": 18
+      },
+      {
+        "fertilize_days": [
+          14,
+          18
+        ],
+        "market_cash": 430.0,
+        "fertilizer_uses": 2,
+        "wheat_sales": 20
+      },
+      {
+        "fertilize_days": [],
+        "market_cash": 428.0,
+        "fertilizer_uses": 0,
+        "wheat_sales": 16
+      },
+      {
+        "fertilize_days": [
+          10
+        ],
+        "market_cash": 427.0,
+        "fertilizer_uses": 1,
+        "wheat_sales": 18
+      },
+      {
+        "fertilize_days": [
+          10,
+          18
+        ],
+        "market_cash": 427.0,
+        "fertilizer_uses": 2,
+        "wheat_sales": 20
+      },
+      {
+        "fertilize_days": [
+          10,
+          14,
+          22
+        ],
+        "market_cash": 427.0,
+        "fertilizer_uses": 3,
+        "wheat_sales": 22
+      },
+      {
+        "fertilize_days": [
+          10,
+          14,
+          18,
+          22
+        ],
+        "market_cash": 427.0,
+        "fertilizer_uses": 4,
+        "wheat_sales": 24
+      },
+      {
+        "fertilize_days": [
+          10,
+          14,
+          18
+        ],
+        "market_cash": 424.0,
+        "fertilizer_uses": 3,
+        "wheat_sales": 22
+      },
+      {
+        "fertilize_days": [
+          10,
+          14
+        ],
+        "market_cash": 422.0,
+        "fertilizer_uses": 2,
+        "wheat_sales": 20
+      }
+    ]
+  }
+}

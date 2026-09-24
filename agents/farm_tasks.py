@@ -68,11 +68,16 @@ def _new_planting_actions(name, fertilize_commit, seeds_available, animals_avail
     # immediately when a crop frees the target tile; PLACE can follow now if
     # inputs are ready, or on a later day without rebuilding the pasture.
     feed_on_placement = should_feed_animal(name, 0)
-    if not (animals_available and (wheat_available or not feed_on_placement)):
+    if not animals_available:
         return (actions or None), Counter()
     actions += [["PLACE", name]]
     needs = Counter({name: 1})
-    if feed_on_placement:
+    # PLACE is the atomic successor. Age-0 FEED is attached only when its
+    # WHEAT is actually available; otherwise the newly live animal is picked
+    # up by the normal survival task on the next observation. This lets the
+    # opening refinance feed from fertilizer without stranding bought animals
+    # in the shed behind empty pastures.
+    if feed_on_placement and wheat_available:
         actions.append(["FEED"])
         if should_care_animal(name, 0):
             actions.append(["CARE"])
@@ -121,6 +126,7 @@ def build_tasks(
     assume_animal_inputs=False,
     prioritize_fertilizer_drop=False,
     include_physical=True,
+    preserve_turnovers=False,
 ):
     """List every tile's required actions for today, given the standing targets.
 
@@ -142,7 +148,14 @@ def build_tasks(
             if target and target[0] in CROPS:
                 seeds_left[target[0]] += 1
     animals_left = Counter({a: shed.get(a, 0) for a in ANIMALS})
-    wheat_left = shed.get("WHEAT", 0)
+    # Intraday replans must see supplies already carried by workers. The
+    # scheduler tracks which worker owns them; this aggregate only decides
+    # whether to build the direct FEED chain instead of the much longer
+    # fertilizer-refinance fallback.
+    wheat_left = shed.get("WHEAT", 0) + sum(
+        inventory.get("WHEAT", 0)
+        for inventory in obs["private"].get("inventories", ())
+    )
     if assume_animal_inputs:
         for position, target in targets.items():
             if not target or target[0] not in ANIMALS:
@@ -198,6 +211,26 @@ def build_tasks(
                 age = day - tile["planted_day"]
                 turns_over = cycle_turns_over_today(crop, age, tile)
                 if tile.get("yield_units", 0) > 0:
+                    if (crop not in ONGOING_CROPS
+                            and age < ENV_CROPS[crop]["first_yield_day"]):
+                        # WATER can bank yield before the engine permits a
+                        # one-time crop to be harvested. A planner-pending
+                        # target must preserve that crop, not emit a silent
+                        # early HARVEST no-op every time routes are rebuilt.
+                        need_water = (
+                            not tile.get("watered_today")
+                            and (is_maintenance_day(
+                                crop, age,
+                                tile.get("fertilized_until_day", -1) >= day,
+                                None if prioritize_fertilizer_drop else position,
+                                tile["planted_day"],
+                            ) or tile.get("consecutive_unwatered", 0) >= 1)
+                        )
+                        if need_water:
+                            tasks.append(Task(
+                                position, [["WATER"]], urgent=True, mandatory=True,
+                            ))
+                        continue
                     if crop in ONGOING_CROPS:
                         scheduled_water = is_maintenance_day(
                             crop, age,
@@ -337,7 +370,10 @@ def build_tasks(
             # that would forfeit entire future production cycles, not a few
             # bonus units.
             early_exit = (
-                crop not in ONGOING_CROPS and name != crop and tile.get("yield_units", 0) > 0
+                crop not in ONGOING_CROPS
+                and name != crop
+                and age >= ENV_CROPS[crop]["first_yield_day"]
+                and tile.get("yield_units", 0) > 0
             )
             if cycle_turns_over_today(crop, age, tile) or early_exit:
                 ends_cycle = True
@@ -413,6 +449,61 @@ def build_tasks(
                 actions += new_actions
                 needs += new_needs
 
+        # Turnover is an atomic lifecycle commitment: never remove the old
+        # producer unless the already-selected successor can also be established.
+        # This applies during opening too; a standalone bootstrap BUILD is not a
+        # turnover and remains legal.
+        establishes_successor = any(op[0] in ("PLANT", "PLACE") for op in actions)
+        successor_committed = position in obs.get("_committed_targets", ())
+        if (ends_cycle and target is not None and successor_committed
+                and ((preserve_turnovers is True
+                      or (preserve_turnovers and position in preserve_turnovers))
+                     or not establishes_successor)):
+            # Keep the old producer alive while the committed replacement is
+            # temporarily infeasible. Atomicity forbids HARVEST/DIG, but it
+            # must not erase protective maintenance from the same task.
+            # A mature one-time crop and an ongoing crop at its final
+            # production age cannot safely wait for a successor. Cash out and
+            # clear them now; carry the missing successor as lifecycle debt.
+            # Younger producers remain protected.
+            final_ongoing_turnover = (
+                isinstance(tile, dict)
+                and tile.get("kind") == "PLANT"
+                and tile["crop"] in ONGOING_CROPS
+                and cycle_turns_over_today(tile["crop"], age, tile)
+            )
+            mature_cashout = (
+                isinstance(tile, dict)
+                and tile.get("kind") == "PLANT"
+                and tile["crop"] not in ONGOING_CROPS
+                and age >= ENV_CROPS[tile["crop"]]["max_yield_day"]
+                and tile.get("yield_units", 0) > 0
+            )
+            forced_cashout = mature_cashout or final_ongoing_turnover
+            if forced_cashout:
+                # Keep protective operations through the cashout, but never
+                # retain the successor's post-PLANT WATER after PLANT itself
+                # was removed from the chain.
+                cashout_actions = []
+                for operation in actions:
+                    if operation[0] in ("WATER", "FERTILIZE", "HARVEST", "DIG"):
+                        cashout_actions.append(operation)
+                    if operation[0] == ("DIG" if final_ongoing_turnover else "HARVEST"):
+                        break
+                actions = cashout_actions
+            else:
+                actions = [
+                    operation for operation in actions
+                    if operation[0] in ("WATER", "FERTILIZE")
+                ]
+            needs = Counter({
+                item: amount for item, amount in needs.items()
+                if item == "FERTILIZER"
+            })
+            if not forced_cashout:
+                sells = Counter()
+                ends_cycle = False
+
         if actions:
             tasks.append(
                 Task(
@@ -435,7 +526,7 @@ def build_tasks(
             starving_animal = bool(
                 isinstance(tile, dict) and tile.get("animal")
                 and tile.get("consecutive_unfed", 0) >= 1
-                and ["FEED"] in task.actions
+                and (["FEED"] in task.actions or task.refinance_feed)
             )
             physical = isinstance(tile, dict) and bool(
                 tile.get("animal") or tile.get("kind") == "PLANT"
@@ -790,7 +881,11 @@ def purchase_orders(
     next_day_feed_reserve = (
         0
         if obs["day"] == 0
-        else wheat_cost(live_animals + pending_feed + new_animal_feed)
+        else wheat_cost(max(
+            0,
+            live_animals + pending_feed + new_animal_feed
+            - wheat_on_hand - wheat_incoming,
+        ))
     )
 
     # Same affordability-capping as animals, and for the same reason: with
@@ -804,9 +899,12 @@ def purchase_orders(
     # Complete animal targets before spending their accumulating fertilizer
     # proceeds on replacement seeds. In the opening this is what preserves
     # enough cash to buy and PLACE the sixth animal on day index 3.
-    for name, n in (() if unfunded_animals > 0 else sorted(
+    # An unaffordable animal commitment must not freeze unrelated crop
+    # lifecycle work. Buy every affordable admitted replacement seed after
+    # reserving feed cash; the animal stays committed for a later morning.
+    for name, n in sorted(
         seed_demand.items(), key=lambda item: SEED_COST[item[0]]
-    )):
+    ):
         if not n:
             continue
         spendable = max(0, money - next_day_feed_reserve)

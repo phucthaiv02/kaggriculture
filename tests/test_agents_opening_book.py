@@ -56,12 +56,12 @@ def test_opening_uses_requested_portfolio():
     assert OPENING_COUNTS == {"MELON": 12, "WHEAT": 9, "COW": 2, "SHEEP": 2}
 
 
-def test_fixed_land_purchases_are_on_days_seven_and_ten():
+def test_fixed_land_purchases_are_on_days_six_and_ten():
     farm = {"unlocked_quadrants": ["NW"]}
-    assert LAND_BUY_DAYS == (7, 10)
-    assert should_buy_land_on_schedule({"day": 6, "hour": 0}, farm) is False
-    assert should_buy_land_on_schedule({"day": 7, "hour": 0}, farm) is True
-    assert should_buy_land_on_schedule({"day": 7, "hour": 1}, farm) is False
+    assert LAND_BUY_DAYS == (6, 10)
+    assert should_buy_land_on_schedule({"day": 5, "hour": 0}, farm) is False
+    assert should_buy_land_on_schedule({"day": 6, "hour": 0}, farm) is True
+    assert should_buy_land_on_schedule({"day": 6, "hour": 1}, farm) is False
     assert should_buy_land_on_schedule({"day": 8, "hour": 0}, farm) is False
     assert should_buy_land_on_schedule({"day": 10, "hour": 0}, farm) is True
     assert should_buy_land_on_schedule({"day": 10, "hour": 1}, farm) is False

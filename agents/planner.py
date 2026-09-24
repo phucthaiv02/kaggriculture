@@ -391,7 +391,7 @@ def plan_targets(obs, targets, active_positions, end_day, *, max_positions=None,
             baseline.add(_rotation(name, fertilize, day, end_day)[0], position, include_visits=False)
             counts[target[0]] += 1
 
-    market = MarketForecast(obs["market"]["inventory"], obs["town"]["unlocked_shops"],
+    market = MarketForecast(obs["market"]["inventory"], obs.get("town", {}).get("unlocked_shops", []),
                             day, end_day, obs.get("hour", 0), obs["market"].get("params"), external)
     candidates = list(_candidates(day, end_day))
     # Assign in a stable order near the shed, updating supply after every pick.
