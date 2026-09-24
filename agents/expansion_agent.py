@@ -684,9 +684,19 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             state["reserved"] = reserved_items(
                 [task for task in tasks if id(task) in admitted_ids]
             )
+            admitted_dependency_positions = {
+                position for position in state["purchase_positions"]
+                if position in state["daily_targets"]
+            }
+            # Morning admission prices investments with their market inputs
+            # assumed available.  If a BUY has not landed yet, build_tasks may
+            # temporarily have no executable Task for an already-built pen (or
+            # an empty crop tile).  Keep those pre-admitted positions inside the
+            # frozen daily boundary so a later market delivery can materialize
+            # PICKUP -> PLACE/PLANT without reopening target selection.
             state["frozen_positions"] = {
                 task.position for task in tasks if id(task) in admitted_ids
-            }
+            } | admitted_dependency_positions
             investment_task_positions = {
                 task.position for task in tasks
                 if any(op[0] in ("PLANT", "PLACE") for op in task.actions)
@@ -695,7 +705,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                 task.position for task in tasks
                 if id(task) in admitted_ids
                 and task.position in investment_task_positions
-            }
+            } | admitted_dependency_positions
             state["committed_targets"].difference_update(investment_task_positions)
             state["committed_targets"].update(admitted_investments)
             state["investment_backlog"].difference_update(admitted_investments)
