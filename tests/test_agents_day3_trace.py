@@ -1,19 +1,27 @@
-"""Find the first crop -> WEED transition in the opening simulation.
+"""Trace the admitted animal dependency immediately after an intraday BUY.
 
-The useful question is not which later rolling rebuild notices the damage, but
-whether the dying tile still had a scheduled survival task immediately before
-the engine ended the day.  Fail at that first transition with the planner,
-route and generated-task state for only the affected positions.
+This is a focused diagnostic for the opening conversion path.  A successful
+BUY_ANIMAL should materialize PICKUP -> PLACE (and FEED when age-0 feeding is
+required) for the already-admitted target without reopening target selection.
 """
 
 from kaggle_environments import make
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
 
 from agents.expansion_agent import make_agent
-from agents.farm_tasks import build_tasks
+from agents.farm_tasks import ANIMALS, build_tasks
 from agents.rolling_scheduler import planning_observation
 from experiments.crop_schedules import pass_agent
 from tests.test_agents_integration import END_DAY, configuration
+
+
+def _task_summary(task):
+    return {
+        "position": task.position,
+        "actions": task.actions,
+        "needs": dict(task.needs),
+        "mandatory": task.mandatory,
+    }
 
 
 def _tile_summary(tile):
@@ -23,36 +31,13 @@ def _tile_summary(tile):
         key: tile.get(key)
         for key in (
             "kind", "crop", "animal", "planted_day", "placed_day",
-            "yield_units", "watered_today", "consecutive_unwatered",
-            "fed_today", "consecutive_unfed", "fertilized_until_day",
+            "yield_units", "fed_today", "consecutive_unfed",
         )
         if key in tile
     }
 
 
-def _task_summary(task):
-    return {
-        "position": task.position,
-        "actions": task.actions,
-        "needs": dict(task.needs),
-        "mandatory": task.mandatory,
-        "urgent": task.urgent,
-        "sells": dict(task.sells),
-    }
-
-
-def _plan_summary(plans, limit=14):
-    return [
-        {
-            "start": tuple(plan.start),
-            "queue": list(plan.queue[:limit]),
-            "queue_len": len(plan.queue),
-        }
-        for plan in plans
-    ]
-
-
-def test_first_opening_weed_transition_keeps_its_survival_task():
+def test_trace_intraday_animal_unlock_task_materialization():
     env = make("kaggriculture", configuration=configuration(1), debug=False)
     agent = make_agent(END_DAY, seed=1)
     cells = {
@@ -60,99 +45,97 @@ def test_first_opening_weed_transition_keeps_its_survival_task():
         for name, cell in zip(agent.__code__.co_freevars, agent.__closure__)
     }
     planner_state = cells["state"]
+    targets = cells["targets"]
     state = env.state
+    buy_hour = None
+    buy_orders = None
 
     for step in range(int(env.configuration.episodeSteps) - 1):
         obs = state[0].observation
-        before_tiles = obs.farms[0]["tiles"]
         action = agent(obs)
 
-        # Rebuild the same physical/daily task view from the pre-transition
-        # observation.  This is diagnostic only: if WATER is absent here the
-        # bug is task generation/admission; if present but the tile still dies,
-        # the bug is route/execution coverage.
-        generated = build_tasks(
-            planning_observation(obs),
-            planner_state.get("daily_targets", {}),
-            prioritize_fertilizer_drop=planner_state.get("opening_active", False),
-        )
-        generated_by_position = {}
-        for task in generated:
-            generated_by_position.setdefault(task.position, []).append(task)
-
-        positions = [
-            tuple(obs.farms[0]["farmer"]),
-            *map(tuple, obs.farms[0]["hands"]),
-        ]
-        operations = [
-            action.get("farmer", ["PASS"]),
-            *action.get("hands", []),
-        ]
-        worker_snapshot = [
-            {
-                "worker": index,
-                "position": position,
-                "operation": operation,
-                "inventory": dict(obs["private"]["inventories"][index]),
-            }
-            for index, (position, operation)
-            in enumerate(zip(positions, operations))
-        ]
-        route_snapshot = _plan_summary(planner_state.get("plans", ()))
-        unassigned_snapshot = [
-            _task_summary(task) for task in planner_state.get("unassigned", ())
-        ]
-        frozen_snapshot = set(planner_state.get("frozen_positions", ()))
-        daily_targets = dict(planner_state.get("daily_targets", {}))
+        if obs.day == 3:
+            animal_orders = [
+                order for order in action.get("market", [])
+                if order[:1] == ["BUY_ANIMAL"]
+            ]
+            if animal_orders and buy_hour is None:
+                buy_hour = obs.hour
+                buy_orders = animal_orders
+            elif buy_hour is not None and obs.hour == buy_hour + 1:
+                frozen = set(planner_state.get("frozen_positions", ()))
+                frozen_targets = {
+                    position: targets.get(position)
+                    for position in frozen
+                }
+                replanned = build_tasks(
+                    planning_observation(obs),
+                    frozen_targets,
+                    prioritize_fertilizer_drop=planner_state.get("opening_active", False),
+                    include_physical=False,
+                )
+                animal_targets = {
+                    position: target for position, target in targets.items()
+                    if target and target[0] in ANIMALS
+                }
+                empty_animal_targets = {
+                    position: target
+                    for position, target in animal_targets.items()
+                    if not (
+                        isinstance(obs.farms[0]["tiles"][position[1]][position[0]], dict)
+                        and obs.farms[0]["tiles"][position[1]][position[0]].get("animal")
+                        == target[0]
+                    )
+                }
+                raise AssertionError({
+                    "buy_hour": buy_hour,
+                    "buy_orders": buy_orders,
+                    "hour": obs.hour,
+                    "money": obs.farms[0]["money"],
+                    "shed": {
+                        key: obs["private"]["shed"].get(key, 0)
+                        for key in ("WHEAT", "COW", "SHEEP")
+                    },
+                    "animal_targets": animal_targets,
+                    "empty_animal_targets": empty_animal_targets,
+                    "empty_target_tiles": {
+                        position: _tile_summary(
+                            obs.farms[0]["tiles"][position[1]][position[0]]
+                        )
+                        for position in empty_animal_targets
+                    },
+                    "frozen_animal_targets": {
+                        position: target
+                        for position, target in frozen_targets.items()
+                        if target and target[0] in ANIMALS
+                    },
+                    "daily_animal_targets": {
+                        position: target
+                        for position, target in planner_state.get("daily_targets", {}).items()
+                        if target and target[0] in ANIMALS
+                    },
+                    "generated_animal_tasks": [
+                        _task_summary(task) for task in replanned
+                        if frozen_targets.get(task.position)
+                        and frozen_targets[task.position][0] in ANIMALS
+                    ],
+                    "all_generated_tasks": [_task_summary(task) for task in replanned],
+                    "plans": [list(plan.queue[:16]) for plan in planner_state.get("plans", ())],
+                    "unassigned": [
+                        _task_summary(task)
+                        for task in planner_state.get("unassigned", ())
+                    ],
+                    "frozen_count": len(frozen),
+                    "route_invalidated": planner_state.get("route_invalidated"),
+                    "replan_needed": planner_state.get("replan_needed"),
+                })
 
         state[0].action = action
         state[1].action = pass_agent(state[1].observation)
         state = official_game.interpreter(state, env)
         state[0].observation.step = step + 1
-        next_obs = state[0].observation
 
-        new_weeds = []
-        for y, row in enumerate(next_obs.farms[0]["tiles"]):
-            for x, tile in enumerate(row):
-                before = before_tiles[y][x]
-                if (isinstance(tile, dict) and tile.get("kind") == "WEED"
-                        and isinstance(before, dict)
-                        and before.get("kind") == "PLANT"):
-                    new_weeds.append((x, y))
+        if state[0].observation.day > 3 and buy_hour is None:
+            raise AssertionError("no day-three animal BUY found")
 
-        if new_weeds:
-            affected = {}
-            for position in new_weeds:
-                x, y = position
-                affected[position] = {
-                    "before": _tile_summary(before_tiles[y][x]),
-                    "after": _tile_summary(next_obs.farms[0]["tiles"][y][x]),
-                    "target": daily_targets.get(position),
-                    "frozen": position in frozen_snapshot,
-                    "generated": [
-                        _task_summary(task)
-                        for task in generated_by_position.get(position, ())
-                    ],
-                    "unassigned": [
-                        task for task in unassigned_snapshot
-                        if tuple(task["position"]) == position
-                    ],
-                }
-            raise AssertionError({
-                "transition_from": (obs.day, obs.hour),
-                "transition_to": (next_obs.day, next_obs.hour),
-                "new_weeds": new_weeds,
-                "affected": affected,
-                "workers": worker_snapshot,
-                "plans_after_dispatch": route_snapshot,
-                "hands": len(obs.farms[0]["hands"]),
-                "hand_target": planner_state.get("hand_target"),
-                "mandatory_hand_target": planner_state.get("mandatory_hand_target"),
-                "route_invalidated": planner_state.get("route_invalidated"),
-                "replan_needed": planner_state.get("replan_needed"),
-            })
-
-        if next_obs.day > 4:
-            raise AssertionError("no crop -> WEED transition found through day 4")
-
-    raise AssertionError("simulation ended before the diagnostic horizon")
+    raise AssertionError("simulation ended before the day-three unlock trace")
