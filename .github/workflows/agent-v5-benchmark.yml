@@ -47,6 +47,7 @@ jobs:
         run: |
           timeout 180s python -m pytest -q \
             tests/test_agent_v5_benchmark.py \
+            tests/test_agents_production_paths.py \
             tests/test_agents_planner.py \
             tests/test_agents_forecast.py \
             tests/test_agents_animal_horizon.py \
@@ -160,6 +161,20 @@ jobs:
           path = root / "comparison.json"
           path.write_text(json.dumps(comparison, indent=2) + "\n")
           print(json.dumps(comparison, indent=2))
+
+          failures = []
+          if candidate["aggregate"]["plant_to_weed"] > baseline["aggregate"]["plant_to_weed"]:
+              failures.append(
+                  "PLANT->WEED regressed: "
+                  f"{candidate['aggregate']['plant_to_weed']} > {baseline['aggregate']['plant_to_weed']}"
+              )
+          if candidate["aggregate"]["animal_escapes"] > baseline["aggregate"]["animal_escapes"]:
+              failures.append(
+                  "animal escapes regressed: "
+                  f"{candidate['aggregate']['animal_escapes']} > {baseline['aggregate']['animal_escapes']}"
+              )
+          if failures:
+              raise SystemExit("\n".join(failures))
           PY
 
       - name: Upload benchmark artifacts
