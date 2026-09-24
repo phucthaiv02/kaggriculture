@@ -120,11 +120,13 @@ def _should_keep_incumbent_route(
     Daily admission is the authority on what must finish. Rolling routing may
     improve worker assignment and order, but it is only a candidate replacement.
     If that candidate drops an admitted mandatory task while the current route
-    still has executable work and was not invalidated by the engine, replacing
-    the incumbent would turn a feasible schedule into an incomplete one.
+    still has executable work and was not invalidated by the engine/dependency
+    graph, replacing the incumbent would turn a feasible schedule into an
+    incomplete one.
 
-    An invalidated route, an exhausted route, or a worker-count mismatch is not
-    a safe incumbent and must be rebuilt from live state instead.
+    An invalidated route, an exhausted route, a worker-count mismatch, or a
+    newly unlocked market dependency is not a safe incumbent and must be rebuilt
+    from live state instead.
     """
     if previous_invalidated:
         return False
@@ -353,7 +355,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         a task the daily admission did not accept. The existing route is the
         feasibility incumbent: a new rolling candidate may replace it only if
         the candidate still covers every admitted mandatory task. An exhausted
-        or engine-invalidated route is never retained merely because it is old.
+        or dependency-invalidated route is never retained merely because it is old.
         """
         previous_plans = state["plans"]
         previous_invalidated = state["route_invalidated"]
@@ -371,12 +373,6 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         replanned = _strip_partial_animal_builds(
             replanned, opening_active=state["opening_active"]
         )
-        # Every task here comes from a position admitted by the morning
-        # schedule. Rebuilding after HARVEST/PLANT may change the physical
-        # tile enough for build_tasks to classify the successor as an
-        # "optional investment" again, but rolling execution must not reopen
-        # admission or drop the remainder of an already-admitted chain.
-        # This is schedule commitment, not an action-kind runtime priority.
         for task in replanned:
             task.mandatory = True
         starts = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
@@ -396,9 +392,6 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             previous_invalidated,
             len(starts),
         ):
-            # The candidate lost already-admitted work. Keep executing the
-            # remaining incumbent queue; the next state-changing observation
-            # may yield a strictly better complete candidate.
             state["unassigned"] = [
                 task for task in state["unassigned"]
                 if task.mandatory is False
@@ -549,9 +542,6 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                 morning_market_queue=[], replan_needed=True,
                 route_invalidated=False,
             )
-            # hands_needed already ran the exact feasibility pack at the chosen
-            # headcount. Repacking the same tasks here was a duplicate
-            # superlinear morning pass used only to recover the same rejected set.
             rejected_ids = {id(task) for task in rejected}
             mandatory_ids = {
                 id(task) for task in tasks if task.mandatory is not False
@@ -575,10 +565,6 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             }
             state["investment_backlog"].update(rejected_investments)
 
-            # Hour-0 funding must mirror the admission rule used after market
-            # orders land. Otherwise a mandatory HARVEST->PLANT successor can
-            # be frozen into today's schedule at hour 1 without its seed ever
-            # being purchased because preliminary packing happened to reject it.
             assigned_tasks = [
                 task for task in tasks if id(task) in pre_admitted_ids
             ]
@@ -653,12 +639,6 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             shed_access = _open_shed_access(farm)
             remaining_budget = max(0, 24 - hour)
             pending_budget = max(0, 23 - hour)
-            # Optional labor was already economically sized and ordered at
-            # hour 0. Re-running the full economic hand search after the
-            # morning market queue cannot add an optional worker here; this
-            # phase only schedules workers that actually arrived. If mandatory
-            # work still does not fit, the emergency path below sizes the exact
-            # missing survival capacity.
             hand_count = len(existing_hands)
             state["hand_target"] = hand_count
             plans, unassigned = build_queues(
@@ -723,12 +703,7 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                 task.position for task in deferred_tasks
                 if task.position in investment_task_positions
             )
-            # Admission is a once-per-day decision. Rolling execution may
-            # reassign/reorder the admitted set but never reopens headcount or
-            # task admission later in the day.
             state["schedule_admitted"] = True
-            # The admission pass just produced a route from this exact live
-            # observation. Do not immediately throw it away with a second pack.
             state["replan_needed"] = False
             state["route_invalidated"] = False
 
@@ -824,15 +799,17 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                 )
         market = market[:10]
 
-        # Continue a worker's current route through ordinary movement and
-        # maintenance. Rebuild only after a dependency/topology change, an
-        # invalidated queued op, or a market purchase that changes available
-        # inputs on the next observation.
-        state["route_invalidated"] = invalidated
+        market_dependency_unlocked = any(
+            order and order[0].startswith("BUY_") for order in market
+        )
+        # A market BUY lands only on the next observation. At that point the
+        # old route may not contain PLACE/FEED/PLANT work that was impossible
+        # before the purchase, so it must not win the incumbent guard.
+        state["route_invalidated"] = invalidated or market_dependency_unlocked
         state["replan_needed"] = bool(
             invalidated
             or _needs_route_rebuild(worker_ops)
-            or any(order and order[0].startswith("BUY_") for order in market)
+            or market_dependency_unlocked
         )
         return {"farmer": farmer_op, "hands": hand_ops, "market": market}
 
