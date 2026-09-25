@@ -19,7 +19,7 @@ from agents.farm_tasks import (
     reserved_items,
 )
 from agents.opening_book import make_opening_controller, should_buy_land_on_schedule
-from agents.intraday import queue_commitments, reconcile_animals
+from agents.intraday import MOVES, TILE_ACTIONS, queue_commitments, reconcile_animals
 from agents.planner import SEASON_END_DAY, plan_targets
 from agents.horizon import can_start_today
 from agents.scheduler import MAX_HANDS, build_queues, hands_needed
@@ -113,20 +113,47 @@ def _plans_have_work(plans):
     return any(plan.queue for plan in plans)
 
 
+def _route_work(starts, plans):
+    """Semantic tile work still represented by ephemeral worker queues.
+
+    Compare work rather than route geometry: a BUY may justify replacing the
+    incumbent only when the rebuilt candidate actually exposes a tile action
+    that the current admitted route did not yet contain (for example PLACE
+    after BUY_ANIMAL or FEED after BUY_PRODUCT). Repeated BUY attempts that
+    expose no new work must not reshuffle already-progressing routes.
+    """
+    work = set()
+    for worker, start in enumerate(starts):
+        if worker >= len(plans):
+            continue
+        x, y = start
+        for operation in plans[worker].queue:
+            if not operation:
+                continue
+            op = operation[0]
+            if op in MOVES:
+                dx, dy = MOVES[op]
+                x, y = x + dx, y + dy
+            elif op in TILE_ACTIONS:
+                work.add(((x, y), tuple(operation)))
+    return work
+
+
 def _should_keep_incumbent_route(
     previous_plans,
     candidate_unassigned,
     previous_invalidated,
     worker_count,
+    candidate_adds_work=True,
 ):
-    """Keep a still-valid feasible route if a rolling candidate loses work.
+    """Keep a still-valid admitted route unless replacement adds real work.
 
     Daily admission is the authority on what must finish. Rolling routing may
     improve worker assignment and order, but it is only a candidate replacement.
-    If that candidate drops an admitted mandatory task while the current route
-    still has executable work and was not invalidated by the engine/dependency
-    graph, replacing the incumbent would turn a feasible schedule into an
-    incomplete one.
+    A valid incumbent is retained when a candidate loses admitted mandatory
+    work, and also when a market-triggered rebuild merely rearranges the same
+    semantic work. A complete candidate may replace it only when a newly
+    materialized dependency appears in that candidate.
 
     An invalidated route, an exhausted route, or a worker-count mismatch is not
     a safe incumbent and must be rebuilt from live state instead.
@@ -135,7 +162,9 @@ def _should_keep_incumbent_route(
         return False
     if len(previous_plans) != worker_count or not _plans_have_work(previous_plans):
         return False
-    return any(task.mandatory is not False for task in candidate_unassigned)
+    if any(task.mandatory is not False for task in candidate_unassigned):
+        return True
+    return not candidate_adds_work
 
 
 # One land purchase unlocks one 5x5 quadrant. Price and admit up to the whole
@@ -388,12 +417,16 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             _open_shed_access(farm),
             obs["private"]["shed"],
         )
+        candidate_adds_work = bool(
+            _route_work(starts, plans) - _route_work(starts, previous_plans)
+        )
 
         if _should_keep_incumbent_route(
             previous_plans,
             unassigned,
             previous_invalidated,
             len(starts),
+            candidate_adds_work=candidate_adds_work,
         ):
             state["unassigned"] = [
                 task for task in state["unassigned"]
@@ -805,9 +838,10 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         # A successful scheduled worker operation advances the incumbent queue;
         # it does not invalidate or reopen that schedule. Rebuild only after a
         # real execution mismatch/no-op, when a BUY may have materialized an
-        # admitted dependency, or once the current queues are exhausted. This
-        # keeps already-admitted progress stable while still letting market
-        # dependencies join the live route as soon as they become executable.
+        # admitted dependency, or once the current queues are exhausted. The
+        # rolling candidate is accepted only if it actually exposes new
+        # semantic tile work; repeated BUY attempts cannot reshuffle an
+        # unchanged admitted remainder.
         state["route_invalidated"] = invalidated
         state["replan_needed"] = bool(
             invalidated
