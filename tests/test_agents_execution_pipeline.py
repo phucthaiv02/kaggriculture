@@ -105,12 +105,35 @@ def test_incomplete_rolling_candidate_keeps_valid_incumbent():
     )
 
 
-def test_optional_rolling_loss_does_not_block_better_candidate():
+def test_complete_market_candidate_without_new_work_keeps_incumbent():
+    incumbent = [WorkerPlan((1, 1), [["WEST"], ["HARVEST"]])]
+
+    assert _should_keep_incumbent_route(
+        incumbent,
+        [],
+        previous_invalidated=False,
+        worker_count=1,
+        candidate_adds_work=False,
+    )
+    assert not _should_keep_incumbent_route(
+        incumbent,
+        [],
+        previous_invalidated=False,
+        worker_count=1,
+        candidate_adds_work=True,
+    )
+
+
+def test_optional_rolling_loss_does_not_block_newly_materialized_candidate():
     incumbent = [WorkerPlan((1, 1), [["WEST"]])]
     optional = Task((0, 1), [["WATER"]], mandatory=False)
 
     assert not _should_keep_incumbent_route(
-        incumbent, [optional], previous_invalidated=False, worker_count=1
+        incumbent,
+        [optional],
+        previous_invalidated=False,
+        worker_count=1,
+        candidate_adds_work=True,
     )
 
 
