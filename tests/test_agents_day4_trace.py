@@ -160,6 +160,7 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
     targets = cells["targets"]
     state = env.state
     history = {}
+    morning = None
 
     for step in range(int(env.configuration.episodeSteps) - 1):
         obs = state[0].observation
@@ -170,6 +171,20 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
             for x, tile in enumerate(row)
         }
         action = agent(obs)
+
+        if before_day == 4 and before_hour <= 2:
+            if morning is None:
+                morning = []
+            morning.append({
+                "hour": before_hour,
+                "money": obs.farms[0]["money"],
+                "hands": len(obs.farms[0]["hands"]),
+                "hires_today": obs.farms[0].get("hires_today", 0),
+                "market": tuple(tuple(order) for order in action.get("market", [])),
+                "queue": tuple(tuple(order) for order in planner_state.get("morning_market_queue", [])),
+                "hand_target": planner_state.get("hand_target"),
+                "mandatory_hand_target": planner_state.get("mandatory_hand_target"),
+            })
 
         if 3 <= before_day <= 5:
             worker_positions = [
@@ -240,7 +255,8 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
                 }
                 raise AssertionError(
                     f"transition={before_day}:{before_hour}->{next_obs.day}:{next_obs.hour}; "
-                    f"positions={transitions}; hands={len(obs.farms[0]['hands'])}; "
+                    f"positions={transitions}; morning={morning}; "
+                    f"hands={len(obs.farms[0]['hands'])}; "
                     f"hand_target={planner_state.get('hand_target')}; "
                     f"mandatory_hand_target={planner_state.get('mandatory_hand_target')}; "
                     f"trace={compact}"
