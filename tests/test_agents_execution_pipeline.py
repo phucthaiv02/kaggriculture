@@ -60,21 +60,19 @@ def test_opening_keeps_bootstrap_build_behavior():
     assert task.actions == [["BUILD_PASTURE"]]
 
 
-def test_successful_scheduled_operations_keep_current_route():
-    """Progress inside an admitted queue must not trigger a global repack.
+def test_ordinary_movement_and_maintenance_keep_current_route():
+    assert not _needs_route_rebuild([
+        ["WEST"], ["EAST"], ["WATER"], ["FEED"], ["CARE"], ["FERTILIZE"]
+    ])
 
-    Dependency materialization from market BUYs and real execution mismatches
-    are handled by expansion_agent directly. Successful movement, maintenance,
-    pickup/drop and tile operations simply advance the already-admitted route.
-    """
-    operations = [
-        ["WEST"], ["EAST"], ["WATER"], ["FEED"], ["CARE"], ["FERTILIZE"],
+
+def test_dependency_or_tile_topology_change_requests_candidate_rebuild():
+    for operation in (
         ["PICKUP", "WHEAT", 1], ["DROP"], ["HARVEST"], ["DIG"],
         ["PLANT", "WHEAT"], ["PLACE", "COW"], ["BUILD_PASTURE"],
         ["COLLECT_FERTILIZER"],
-    ]
-
-    assert not _needs_route_rebuild(operations)
+    ):
+        assert _needs_route_rebuild([operation])
 
 
 def test_empty_worker_plan_container_is_not_treated_as_live_schedule():
