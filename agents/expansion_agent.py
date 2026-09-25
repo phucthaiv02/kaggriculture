@@ -94,16 +94,15 @@ def _strip_partial_animal_builds(tasks, opening_active=False):
     return cleaned
 
 
-# A rolling rebuild is useful only when the executable dependency graph changes.
-# WATER/FEED/CARE/FERTILIZE are already encoded inside the current Task route and
-# do not unlock a different tile. Repacking every MOVE (or every maintenance op)
-# made workers repeatedly trade destinations and burn the day on WEST/EAST
-# oscillations. These operations change inventory, occupancy, or the set of live
-# tile tasks, so the next observation should rebuild from the new state.
-ROLLING_REPLAN_OPS = {
-    "PICKUP", "DROP", "HARVEST", "DIG", "PLANT", "PLACE",
-    "BUILD_COOP", "BUILD_PASTURE", "COLLECT_FERTILIZER",
-}
+# Successful operations already belong to the admitted queue and therefore
+# advance, rather than invalidate, that schedule. Repacking after every
+# HARVEST/DIG/PLANT/PICKUP/etc. repeatedly reset worker progress and could push
+# an unchanged mandatory task past the end of the day. A rolling rebuild is
+# needed only when execution actually no-ops/mismatches, when a market BUY may
+# materialize a previously unavailable dependency, or when all current queues
+# are exhausted and the admitted remainder must be reconstructed from live
+# state. The caller handles those conditions directly.
+ROLLING_REPLAN_OPS = frozenset()
 
 
 def _needs_route_rebuild(operations):
@@ -803,13 +802,12 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         market_dependency_may_change = any(
             order and order[0].startswith("BUY_") for order in market
         )
-        # Submitting a BUY is a reason to rebuild from the next observation,
-        # because the dependency may have landed.  It is not evidence that the
-        # incumbent route itself became invalid.  Treating every repeated or
-        # unaffordable BUY as invalid let a late, capacity-short candidate erase
-        # still-feasible admitted maintenance.  Only an execution mismatch/no-op
-        # invalidates the incumbent; a successful BUY can still replace it when
-        # the rebuilt candidate is complete and materializes the new dependency.
+        # A successful scheduled worker operation advances the incumbent queue;
+        # it does not invalidate or reopen that schedule. Rebuild only after a
+        # real execution mismatch/no-op, when a BUY may have materialized an
+        # admitted dependency, or once the current queues are exhausted. This
+        # keeps already-admitted progress stable while still letting market
+        # dependencies join the live route as soon as they become executable.
         state["route_invalidated"] = invalidated
         state["replan_needed"] = bool(
             invalidated
