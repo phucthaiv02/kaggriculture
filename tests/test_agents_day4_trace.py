@@ -1,9 +1,4 @@
-"""Focused regressions/diagnostics for opening crop turnover and survival.
-
-The Day-4 WHEAT schedule is a useful stress case for rolling execution:
-successor PLANT+WATER chains admitted that morning must survive every
-intraday route rebuild after HARVEST changes tile state.
-"""
+"""Focused regressions/diagnostics for opening crop turnover and survival."""
 
 from kaggle_environments import make
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
@@ -13,6 +8,8 @@ from agents.farm_tasks import build_tasks
 from agents.rolling_scheduler import planning_observation
 from experiments.crop_schedules import pass_agent
 from tests.test_agents_integration import END_DAY, configuration
+
+MOVES = {"EAST": (1, 0), "WEST": (-1, 0), "SOUTH": (0, 1), "NORTH": (0, -1)}
 
 
 def _tile_summary(tile):
@@ -30,6 +27,34 @@ def _tile_summary(tile):
 
 def _compact_task(task):
     return (task.position, tuple(tuple(op) for op in task.actions), task.mandatory)
+
+
+def _planned_water_owners(starts, current_ops, plans):
+    """Map each queued WATER destination to workers after this turn's op.
+
+    ``agent`` has already popped the current operation from every WorkerPlan,
+    while the observation still contains pre-action positions.  Replay that
+    current op first, then each remaining queue, so the diagnostic sees the
+    actual destinations encoded by the live ephemeral routes.
+    """
+    owners = {}
+    for worker, start in enumerate(starts):
+        x, y = start
+        operations = []
+        if worker < len(current_ops):
+            operations.append(current_ops[worker])
+        if worker < len(plans):
+            operations.extend(plans[worker].queue)
+        for operation in operations:
+            if not operation:
+                continue
+            op = operation[0]
+            if op in MOVES:
+                dx, dy = MOVES[op]
+                x, y = x + dx, y + dy
+            elif op == "WATER":
+                owners.setdefault((x, y), []).append(worker)
+    return {position: tuple(workers) for position, workers in owners.items()}
 
 
 def test_all_opening_wheat_successors_finish_on_day_four():
@@ -172,6 +197,15 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
         }
         action = agent(obs)
 
+        worker_positions = [
+            tuple(obs.farms[0]["farmer"]),
+            *map(tuple, obs.farms[0]["hands"]),
+        ]
+        worker_ops = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
+        planned_water = _planned_water_owners(
+            worker_positions, worker_ops, planner_state.get("plans", ())
+        )
+
         if before_day == 4 and before_hour <= 2:
             if morning is None:
                 morning = []
@@ -187,11 +221,6 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
             })
 
         if 3 <= before_day <= 5:
-            worker_positions = [
-                tuple(obs.farms[0]["farmer"]),
-                *map(tuple, obs.farms[0]["hands"]),
-            ]
-            worker_ops = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
             ops_by_position = {
                 position: tuple(operation)
                 for position, operation in zip(worker_positions, worker_ops)
@@ -224,7 +253,11 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
                     position in frozen,
                     position in unassigned_positions,
                     generated_by_position.get(position),
+                    planned_water.get(position),
                     ops_by_position.get(position),
+                    tuple(len(plan.queue) for plan in planner_state.get("plans", ())),
+                    bool(planner_state.get("replan_needed")),
+                    bool(planner_state.get("route_invalidated")),
                 ))
 
         state[0].action = action
@@ -255,11 +288,7 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
                 }
                 raise AssertionError(
                     f"transition={before_day}:{before_hour}->{next_obs.day}:{next_obs.hour}; "
-                    f"positions={transitions}; morning={morning}; "
-                    f"hands={len(obs.farms[0]['hands'])}; "
-                    f"hand_target={planner_state.get('hand_target')}; "
-                    f"mandatory_hand_target={planner_state.get('mandatory_hand_target')}; "
-                    f"trace={compact}"
+                    f"positions={transitions}; morning={morning}; trace={compact}"
                 )
 
         if next_obs.day > 5:
