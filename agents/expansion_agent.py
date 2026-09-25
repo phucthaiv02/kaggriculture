@@ -129,9 +129,8 @@ def _should_keep_incumbent_route(
     graph, replacing the incumbent would turn a feasible schedule into an
     incomplete one.
 
-    An invalidated route, an exhausted route, a worker-count mismatch, or a
-    newly unlocked market dependency is not a safe incumbent and must be rebuilt
-    from live state instead.
+    An invalidated route, an exhausted route, or a worker-count mismatch is not
+    a safe incumbent and must be rebuilt from live state instead.
     """
     if previous_invalidated:
         return False
@@ -686,12 +685,6 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                 position for position in state["purchase_positions"]
                 if position in state["daily_targets"]
             }
-            # Morning admission prices investments with their market inputs
-            # assumed available.  If a BUY has not landed yet, build_tasks may
-            # temporarily have no executable Task for an already-built pen (or
-            # an empty crop tile).  Keep those pre-admitted positions inside the
-            # frozen daily boundary so a later market delivery can materialize
-            # PICKUP -> PLACE/PLANT without reopening target selection.
             state["frozen_positions"] = {
                 task.position for task in tasks if id(task) in admitted_ids
             } | admitted_dependency_positions
@@ -807,17 +800,21 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
                 )
         market = market[:10]
 
-        market_dependency_unlocked = any(
+        market_dependency_may_change = any(
             order and order[0].startswith("BUY_") for order in market
         )
-        # A market BUY lands only on the next observation. At that point the
-        # old route may not contain PLACE/FEED/PLANT work that was impossible
-        # before the purchase, so it must not win the incumbent guard.
-        state["route_invalidated"] = invalidated or market_dependency_unlocked
+        # Submitting a BUY is a reason to rebuild from the next observation,
+        # because the dependency may have landed.  It is not evidence that the
+        # incumbent route itself became invalid.  Treating every repeated or
+        # unaffordable BUY as invalid let a late, capacity-short candidate erase
+        # still-feasible admitted maintenance.  Only an execution mismatch/no-op
+        # invalidates the incumbent; a successful BUY can still replace it when
+        # the rebuilt candidate is complete and materializes the new dependency.
+        state["route_invalidated"] = invalidated
         state["replan_needed"] = bool(
             invalidated
             or _needs_route_rebuild(worker_ops)
-            or market_dependency_unlocked
+            or market_dependency_may_change
         )
         return {"farmer": farmer_op, "hands": hand_ops, "market": market}
 
