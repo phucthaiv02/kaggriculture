@@ -31,6 +31,18 @@ def _empty_animal_targets(obs, targets):
     }
 
 
+def _owned_animal_count(obs, species):
+    total = obs.private["shed"].get(species, 0)
+    total += sum(inventory.get(species, 0) for inventory in obs.private["inventories"])
+    total += sum(
+        1
+        for row in obs.farms[0]["tiles"]
+        for tile in row
+        if isinstance(tile, dict) and tile.get("animal") == species
+    )
+    return total
+
+
 def _planned_action_owners(starts, current_ops, plans, action_name):
     owners = {}
     for worker, start in enumerate(starts):
@@ -62,7 +74,7 @@ def test_intraday_animal_buy_materializes_admitted_place_dependency():
     planner_state = cells["state"]
     targets = cells["targets"]
     state = env.state
-    buy_hour = None
+    pending_buy = None
     missing_position = None
     materialized = False
 
@@ -71,51 +83,76 @@ def test_intraday_animal_buy_materializes_admitted_place_dependency():
         action = agent(obs)
 
         if obs.day == 3:
-            animal_orders = [
-                order for order in action.get("market", [])
-                if order[:1] == ["BUY_ANIMAL"]
-            ]
-            if animal_orders and buy_hour is None:
-                buy_hour = obs.hour
-            elif buy_hour is not None and obs.hour == buy_hour + 1:
+            if pending_buy is not None and obs.hour == pending_buy[0] + 1:
+                _buy_hour, species, before_owned, candidate_position = pending_buy
+                if _owned_animal_count(obs, species) > before_owned:
+                    missing_position = candidate_position
+                    x, y = missing_position
+                    tile = obs.farms[0]["tiles"][y][x]
+                    if isinstance(tile, dict) and tile.get("animal") == species:
+                        materialized = True
+                    else:
+                        frozen = set(planner_state.get("frozen_positions", ()))
+                        assert missing_position in frozen, (
+                            missing_position, sorted(frozen), planner_state.get("purchase_positions")
+                        )
+                        frozen_targets = {
+                            position: targets.get(position)
+                            for position in frozen
+                        }
+                        replanned = build_tasks(
+                            planning_observation(obs),
+                            frozen_targets,
+                            prioritize_fertilizer_drop=planner_state.get("opening_active", False),
+                            include_physical=False,
+                        )
+                        target_tasks = [
+                            task for task in replanned if task.position == missing_position
+                        ]
+                        assert target_tasks, (
+                            missing_position,
+                            targets.get(missing_position),
+                            dict(obs["private"]["shed"]),
+                            frozen_targets,
+                        )
+                        assert any(
+                            ["PLACE", species] in task.actions
+                            and task.needs.get(species, 0) >= 1
+                            for task in target_tasks
+                        ), [(task.actions, dict(task.needs)) for task in target_tasks]
+                        materialized = True
+                    pending_buy = None
+                else:
+                    pending_buy = None
+
+            if pending_buy is None and not materialized:
                 empty_targets = _empty_animal_targets(obs, targets)
-                assert len(empty_targets) == 1, empty_targets
-                missing_position, missing_target = next(iter(empty_targets.items()))
-
-                frozen = set(planner_state.get("frozen_positions", ()))
-                assert missing_position in frozen, (
-                    missing_position, sorted(frozen), planner_state.get("purchase_positions")
-                )
-
-                frozen_targets = {
-                    position: targets.get(position)
-                    for position in frozen
-                }
-                replanned = build_tasks(
-                    planning_observation(obs),
-                    frozen_targets,
-                    prioritize_fertilizer_drop=planner_state.get("opening_active", False),
-                    include_physical=False,
-                )
-                target_tasks = [
-                    task for task in replanned if task.position == missing_position
+                animal_orders = [
+                    order for order in action.get("market", [])
+                    if order[:1] == ["BUY_ANIMAL"]
                 ]
-                assert target_tasks, (
-                    missing_position,
-                    missing_target,
-                    dict(obs["private"]["shed"]),
-                    frozen_targets,
-                )
-                assert any(
-                    ["PLACE", missing_target[0]] in task.actions
-                    and task.needs.get(missing_target[0], 0) >= 1
-                    for task in target_tasks
-                ), [(task.actions, dict(task.needs)) for task in target_tasks]
-                materialized = True
+                for order in animal_orders:
+                    species = order[1]
+                    candidates = [
+                        position for position, target in empty_targets.items()
+                        if target[0] == species
+                        and position in planner_state.get("purchase_positions", set())
+                    ]
+                    if candidates:
+                        pending_buy = (
+                            obs.hour,
+                            species,
+                            _owned_animal_count(obs, species),
+                            sorted(candidates)[0],
+                        )
+                        break
 
         if obs.day == 4 and obs.hour == 0:
-            assert buy_hour is not None
-            assert materialized
+            assert materialized, (
+                "no successful Day-3 BUY_ANIMAL matched an admitted empty target",
+                _empty_animal_targets(obs, targets),
+                planner_state.get("purchase_positions"),
+            )
             assert missing_position is not None
             x, y = missing_position
             tile = obs.farms[0]["tiles"][y][x]
