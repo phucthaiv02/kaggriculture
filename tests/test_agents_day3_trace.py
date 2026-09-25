@@ -1,19 +1,15 @@
-"""Opening regression for an admitted animal dependency unlocked by BUY.
-
-A successful intraday BUY_ANIMAL must materialize PICKUP -> PLACE for the
-already-admitted target.  The target stays inside the frozen daily schedule
-while its market input is in transit; rolling execution may reroute it but may
-not silently forget it.
-"""
+"""Opening regressions for rolling animal dependencies and harvest safety."""
 
 from kaggle_environments import make
 from kaggle_environments.envs.kaggriculture import kaggriculture as official_game
 
 from agents.expansion_agent import make_agent
-from agents.farm_tasks import ANIMALS, build_tasks
+from agents.farm_tasks import ANIMALS, animal_output_at_risk, build_tasks
 from agents.rolling_scheduler import planning_observation
 from experiments.crop_schedules import pass_agent
 from tests.test_agents_integration import END_DAY, configuration
+
+MOVES = {"EAST": (1, 0), "WEST": (-1, 0), "SOUTH": (0, 1), "NORTH": (0, -1)}
 
 
 def _animal_targets(targets):
@@ -33,6 +29,27 @@ def _empty_animal_targets(obs, targets):
             == target[0]
         )
     }
+
+
+def _planned_action_owners(starts, current_ops, plans, action_name):
+    owners = {}
+    for worker, start in enumerate(starts):
+        x, y = start
+        operations = []
+        if worker < len(current_ops):
+            operations.append(current_ops[worker])
+        if worker < len(plans):
+            operations.extend(plans[worker].queue)
+        for operation in operations:
+            if not operation:
+                continue
+            op = operation[0]
+            if op in MOVES:
+                dx, dy = MOVES[op]
+                x, y = x + dx, y + dy
+            elif op == action_name:
+                owners.setdefault((x, y), []).append(worker)
+    return {position: tuple(workers) for position, workers in owners.items()}
 
 
 def test_intraday_animal_buy_materializes_admitted_place_dependency():
@@ -120,3 +137,107 @@ def test_intraday_animal_buy_materializes_admitted_place_dependency():
         state[0].observation.step = step + 1
 
     raise AssertionError("simulation ended before the opening animal regression completed")
+
+
+def test_trace_first_at_risk_animal_harvest_route():
+    """Expose where the first clipping-prevention HARVEST falls out of execution."""
+    env = make("kaggriculture", configuration=configuration(1), debug=False)
+    agent = make_agent(END_DAY, seed=1)
+    cells = {
+        name: cell.cell_contents
+        for name, cell in zip(agent.__code__.co_freevars, agent.__closure__)
+    }
+    planner_state = cells["state"]
+    targets = cells["targets"]
+    state = env.state
+    history = {}
+
+    for step in range(int(env.configuration.episodeSteps) - 1):
+        obs = state[0].observation
+        action = agent(obs)
+        farm = obs.farms[0]
+        starts = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
+        current_ops = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
+        planned_harvest = _planned_action_owners(
+            starts, current_ops, planner_state.get("plans", ()), "HARVEST"
+        )
+
+        if obs.day in (7, 8):
+            frozen = set(planner_state.get("frozen_positions", ()))
+            frozen_targets = {position: targets.get(position) for position in frozen}
+            generated = build_tasks(
+                planning_observation(obs),
+                frozen_targets,
+                prioritize_fertilizer_drop=planner_state.get("opening_active", False),
+                include_physical=False,
+            )
+            generated_by_position = {
+                task.position: (
+                    tuple(tuple(op) for op in task.actions),
+                    task.mandatory,
+                    dict(task.needs),
+                )
+                for task in generated
+            }
+            unassigned = {task.position for task in planner_state.get("unassigned", ())}
+            actual_ops = {
+                position: tuple(operation)
+                for position, operation in zip(starts, current_ops)
+                if operation != ["PASS"]
+            }
+            for y, row in enumerate(farm["tiles"]):
+                for x, tile in enumerate(row):
+                    if not (isinstance(tile, dict) and tile.get("animal")):
+                        continue
+                    position = (x, y)
+                    if not animal_output_at_risk(tile, obs.day):
+                        continue
+                    history.setdefault(position, []).append((
+                        obs.day,
+                        obs.hour,
+                        tile.get("animal"),
+                        tile.get("yield_units", 0),
+                        tile.get("pending_care_bonus", 0),
+                        bool(tile.get("fed_today")),
+                        tile.get("consecutive_unfed", 0),
+                        position in frozen,
+                        position in unassigned,
+                        generated_by_position.get(position),
+                        planned_harvest.get(position),
+                        actual_ops.get(position),
+                        tuple(len(plan.queue) for plan in planner_state.get("plans", ())),
+                        bool(planner_state.get("replan_needed")),
+                        bool(planner_state.get("route_invalidated")),
+                        len(farm["hands"]),
+                    ))
+
+        if obs.day == 8 and obs.hour == 23:
+            harvested = {
+                position for position, operation in zip(starts, current_ops)
+                if operation == ["HARVEST"]
+            }
+            missed = []
+            for y, row in enumerate(farm["tiles"]):
+                for x, tile in enumerate(row):
+                    if (
+                        isinstance(tile, dict)
+                        and tile.get("animal")
+                        and animal_output_at_risk(tile, obs.day)
+                        and (x, y) not in harvested
+                    ):
+                        missed.append((x, y))
+            assert not missed, {
+                "missed": missed,
+                "trace": {position: history.get(position, []) for position in missed},
+                "hand_target": planner_state.get("hand_target"),
+                "mandatory_hand_target": planner_state.get("mandatory_hand_target"),
+                "frozen": sorted(planner_state.get("frozen_positions", ())),
+            }
+            return
+
+        state[0].action = action
+        state[1].action = pass_agent(state[1].observation)
+        state = official_game.interpreter(state, env)
+        state[0].observation.step = step + 1
+
+    raise AssertionError("simulation ended before day eight animal risk trace completed")
