@@ -64,14 +64,17 @@ def _new_planting_actions(name, fertilize_commit, seeds_available, animals_avail
         return actions, Counter()
     build_step = [[BUILD[name]]] if needs_build else []
     actions = ([["DIG"]] if needs_dig else []) + build_step
-    # Building the structure does not require the animal or its feed. Do it
-    # immediately when a crop frees the target tile; PLACE can follow now if
-    # inputs are ready, or on a later day without rebuilding the pasture.
-    feed_on_placement = should_feed_animal(name, 0)
-    if not (animals_available and (wheat_available or not feed_on_placement)):
+    # Building the structure does not require the animal or its feed. Once the
+    # animal itself is available, however, keep the complete PLACE -> FEED ->
+    # CARE dependency in the admitted task even if WHEAT is not in the shed
+    # yet. The market/feed path can materialize that missing input later in the
+    # same day; dropping PLACE here made a successfully bought SHEEP disappear
+    # from the rolling task graph entirely.
+    if not animals_available:
         return (actions or None), Counter()
     actions += [["PLACE", name]]
     needs = Counter({name: 1})
+    feed_on_placement = should_feed_animal(name, 0)
     if feed_on_placement:
         actions.append(["FEED"])
         if should_care_animal(name, 0):
