@@ -94,15 +94,17 @@ def _strip_partial_animal_builds(tasks, opening_active=False):
     return cleaned
 
 
-# Successful operations already belong to the admitted queue and therefore
-# advance, rather than invalidate, that schedule. Repacking after every
-# HARVEST/DIG/PLANT/PICKUP/etc. repeatedly reset worker progress and could push
-# an unchanged mandatory task past the end of the day. A rolling rebuild is
-# needed only when execution actually no-ops/mismatches, when a market BUY may
-# materialize a previously unavailable dependency, or when all current queues
-# are exhausted and the admitted remainder must be reconstructed from live
-# state. The caller handles those conditions directly.
-ROLLING_REPLAN_OPS = frozenset()
+# These successful operations can change the executable dependency graph or
+# tile topology, so they request a rolling *candidate* rebuild from the next
+# observation. They do not automatically replace the admitted incumbent route:
+# _route_work / _should_keep_incumbent_route below retain current progress
+# unless the candidate actually exposes new semantic tile work. Ordinary
+# movement and maintenance therefore never cause route churn, while HARVEST can
+# still materialize its admitted PLANT -> WATER successor immediately.
+ROLLING_REPLAN_OPS = {
+    "PICKUP", "DROP", "HARVEST", "DIG", "PLANT", "PLACE",
+    "BUILD_COOP", "BUILD_PASTURE", "COLLECT_FERTILIZER",
+}
 
 
 def _needs_route_rebuild(operations):
@@ -835,13 +837,10 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
         market_dependency_may_change = any(
             order and order[0].startswith("BUY_") for order in market
         )
-        # A successful scheduled worker operation advances the incumbent queue;
-        # it does not invalidate or reopen that schedule. Rebuild only after a
-        # real execution mismatch/no-op, when a BUY may have materialized an
-        # admitted dependency, or once the current queues are exhausted. The
-        # rolling candidate is accepted only if it actually exposes new
-        # semantic tile work; repeated BUY attempts cannot reshuffle an
-        # unchanged admitted remainder.
+        # A successful scheduled worker operation advances the incumbent queue.
+        # Topology-changing operations above only request a candidate rebuild;
+        # the candidate-replacement guard keeps the current route unless live
+        # state actually exposes new semantic work. A BUY follows the same rule.
         state["route_invalidated"] = invalidated
         state["replan_needed"] = bool(
             invalidated
