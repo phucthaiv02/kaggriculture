@@ -590,33 +590,29 @@ def make_agent(end_day=SEASON_END_DAY, seed=0, decision_log=None):
             non_wheat_reservations = dict(reservations)
             non_wheat_reservations["WHEAT"] = obs["private"]["shed"].get("WHEAT", 0)
             non_wheat_sales = sell_orders(obs, non_wheat_reservations)
-            protected_hires = (
-                0 if state["opening_active"] else
-                max(0, mandatory_hand_target - len(farm["hands"]))
+            protected_hires = max(
+                0, mandatory_hand_target - len(farm["hands"])
             )
             reservations = _reserve_feed_for_affordable_animals(
                 obs, farm, purchase_targets, reservations,
                 non_wheat_sales, protected_hires,
             )
             sales = sell_orders(obs, reservations)
-            if not state["opening_active"]:
-                sales = sales[:max(0, 10 - protected_hires)]
+            sales = sales[:max(0, MARKET_ORDER_CAP - protected_hires)]
             orders = _hire_and_buy_orders(
                 obs, farm, purchase_targets, hand_target, pending_sales=sales,
                 replant_same_crop=True,
-                reserve_hire_budget=not state["opening_active"],
+                reserve_hire_budget=True,
                 mandatory_hand_target=mandatory_hand_target,
             )
             full_market = list(sales) + list(orders)
-            if not state["opening_active"]:
-                state["morning_market_queue"] = _market_remainder(full_market)
+            state["morning_market_queue"] = _market_remainder(full_market)
             return {
                 "farmer": ["PASS"], "hands": [["PASS"] for _ in farm["hands"]],
                 "market": full_market[:MARKET_ORDER_CAP],
             }
 
-        if (not state["opening_active"] and state["day"] == day
-                and state["morning_market_queue"]):
+        if state["day"] == day and state["morning_market_queue"]:
             return _dispatch_morning_market(farm)
 
         if state["day"] == day and not state["schedule_admitted"]:
