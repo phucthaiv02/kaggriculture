@@ -164,10 +164,9 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
     for step in range(int(env.configuration.episodeSteps) - 1):
         obs = state[0].observation
         before_day, before_hour = obs.day, obs.hour
-        before_tiles = obs.farms[0]["tiles"]
         before_snapshot = {
             (x, y): _tile_summary(tile)
-            for y, row in enumerate(before_tiles)
+            for y, row in enumerate(obs.farms[0]["tiles"])
             for x, tile in enumerate(row)
         }
         action = agent(obs)
@@ -179,7 +178,7 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
             ]
             worker_ops = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
             ops_by_position = {
-                position: operation
+                position: tuple(operation)
                 for position, operation in zip(worker_positions, worker_ops)
                 if operation != ["PASS"]
             }
@@ -192,7 +191,7 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
                 include_physical=False,
             )
             generated_by_position = {
-                task.position: _compact_task(task) for task in generated
+                task.position: tuple(op[0] for op in task.actions) for task in generated
             }
             unassigned_positions = {
                 task.position for task in planner_state.get("unassigned", ())
@@ -203,8 +202,10 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
                 history.setdefault(position, []).append((
                     before_day,
                     before_hour,
-                    tile,
-                    targets.get(position),
+                    tile.get("crop"),
+                    tile.get("yield_units", 0),
+                    bool(tile.get("watered_today")),
+                    tile.get("consecutive_unwatered", 0),
                     position in frozen,
                     position in unassigned_positions,
                     generated_by_position.get(position),
@@ -229,20 +230,21 @@ def test_no_opening_crop_turns_to_weed_through_day_five():
                     and after.get("kind") == "WEED"
                 ):
                     transitions.append(position)
-            assert not transitions, {
-                "transition_from": (before_day, before_hour),
-                "transition_to": (next_obs.day, next_obs.hour),
-                "positions": transitions,
-                "trace": {
-                    position: history.get(position, [])[-30:]
+            if transitions:
+                compact = {
+                    position: [
+                        event for event in history.get(position, [])
+                        if event[0] == before_day
+                    ]
                     for position in transitions
-                },
-                "hands": len(obs.farms[0]["hands"]),
-                "hand_target": planner_state.get("hand_target"),
-                "mandatory_hand_target": planner_state.get("mandatory_hand_target"),
-                "route_invalidated": planner_state.get("route_invalidated"),
-                "replan_needed": planner_state.get("replan_needed"),
-            }
+                }
+                raise AssertionError(
+                    f"transition={before_day}:{before_hour}->{next_obs.day}:{next_obs.hour}; "
+                    f"positions={transitions}; hands={len(obs.farms[0]['hands'])}; "
+                    f"hand_target={planner_state.get('hand_target')}; "
+                    f"mandatory_hand_target={planner_state.get('mandatory_hand_target')}; "
+                    f"trace={compact}"
+                )
 
         if next_obs.day > 5:
             return
