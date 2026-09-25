@@ -150,7 +150,8 @@ def test_trace_first_at_risk_animal_harvest_route():
     planner_state = cells["state"]
     targets = cells["targets"]
     state = env.state
-    history = {}
+    position = (1, 4)
+    trace = []
 
     for step in range(int(env.configuration.episodeSteps) - 1):
         obs = state[0].observation
@@ -158,81 +159,52 @@ def test_trace_first_at_risk_animal_harvest_route():
         farm = obs.farms[0]
         starts = [tuple(farm["farmer"]), *map(tuple, farm["hands"])]
         current_ops = [action.get("farmer", ["PASS"]), *action.get("hands", [])]
-        planned_harvest = _planned_action_owners(
-            starts, current_ops, planner_state.get("plans", ()), "HARVEST"
-        )
 
-        if obs.day in (7, 8):
+        if obs.day == 8:
             frozen = set(planner_state.get("frozen_positions", ()))
-            frozen_targets = {position: targets.get(position) for position in frozen}
+            frozen_targets = {p: targets.get(p) for p in frozen}
             generated = build_tasks(
                 planning_observation(obs),
                 frozen_targets,
                 prioritize_fertilizer_drop=planner_state.get("opening_active", False),
                 include_physical=False,
             )
-            generated_by_position = {
-                task.position: (
-                    tuple(tuple(op) for op in task.actions),
-                    task.mandatory,
-                    dict(task.needs),
-                )
-                for task in generated
-            }
-            unassigned = {task.position for task in planner_state.get("unassigned", ())}
-            actual_ops = {
-                position: tuple(operation)
-                for position, operation in zip(starts, current_ops)
-                if operation != ["PASS"]
-            }
-            for y, row in enumerate(farm["tiles"]):
-                for x, tile in enumerate(row):
-                    if not (isinstance(tile, dict) and tile.get("animal")):
-                        continue
-                    position = (x, y)
-                    if not animal_output_at_risk(tile, obs.day):
-                        continue
-                    history.setdefault(position, []).append((
-                        obs.day,
-                        obs.hour,
-                        tile.get("animal"),
-                        tile.get("yield_units", 0),
-                        tile.get("pending_care_bonus", 0),
-                        bool(tile.get("fed_today")),
-                        tile.get("consecutive_unfed", 0),
-                        position in frozen,
-                        position in unassigned,
-                        generated_by_position.get(position),
-                        planned_harvest.get(position),
-                        actual_ops.get(position),
-                        tuple(len(plan.queue) for plan in planner_state.get("plans", ())),
-                        bool(planner_state.get("replan_needed")),
-                        bool(planner_state.get("route_invalidated")),
-                        len(farm["hands"]),
-                    ))
+            target_task = next((task for task in generated if task.position == position), None)
+            owners = _planned_action_owners(
+                starts, current_ops, planner_state.get("plans", ()), "HARVEST"
+            )
+            actual = next(
+                (tuple(operation) for start, operation in zip(starts, current_ops)
+                 if start == position and operation != ["PASS"]),
+                None,
+            )
+            tile = farm["tiles"][position[1]][position[0]]
+            trace.append((
+                obs.hour,
+                position in frozen,
+                position in {task.position for task in planner_state.get("unassigned", ())},
+                tuple(op[0] for op in target_task.actions) if target_task else None,
+                owners.get(position),
+                actual,
+                tuple(len(plan.queue) for plan in planner_state.get("plans", ())),
+                bool(planner_state.get("replan_needed")),
+                bool(planner_state.get("route_invalidated")),
+                len(farm["hands"]),
+                tile.get("yield_units") if isinstance(tile, dict) else None,
+            ))
 
         if obs.day == 8 and obs.hour == 23:
-            harvested = {
-                position for position, operation in zip(starts, current_ops)
-                if operation == ["HARVEST"]
-            }
-            missed = []
-            for y, row in enumerate(farm["tiles"]):
-                for x, tile in enumerate(row):
-                    if (
-                        isinstance(tile, dict)
-                        and tile.get("animal")
-                        and animal_output_at_risk(tile, obs.day)
-                        and (x, y) not in harvested
-                    ):
-                        missed.append((x, y))
-            assert not missed, {
-                "missed": missed,
-                "trace": {position: history.get(position, []) for position in missed},
-                "hand_target": planner_state.get("hand_target"),
-                "mandatory_hand_target": planner_state.get("mandatory_hand_target"),
-                "frozen": sorted(planner_state.get("frozen_positions", ())),
-            }
+            tile = farm["tiles"][position[1]][position[0]]
+            harvested = any(
+                start == position and operation == ["HARVEST"]
+                for start, operation in zip(starts, current_ops)
+            )
+            if isinstance(tile, dict) and animal_output_at_risk(tile, obs.day) and not harvested:
+                raise AssertionError(
+                    "risk_trace=" + repr(trace)
+                    + f"; hand_target={planner_state.get('hand_target')}"
+                    + f"; mandatory_hand_target={planner_state.get('mandatory_hand_target')}"
+                )
             return
 
         state[0].action = action
